@@ -1,0 +1,13 @@
+numpy
+pandas
+scipy
+scikit-learn
+xgboost
+river
+ta
+requests
+aiohttp
+web3
+python-dotenv
+loguru
+cma>=3.3.0
