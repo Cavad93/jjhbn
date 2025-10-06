@@ -406,7 +406,7 @@ TREASURY_FEE = 0.03
 GUARD_SECONDS   = 30      # решаем судьбу ставки только в последние 15с до lock
 SEND_WIN_LOW    = 12      # «окно отправки»: нижняя граница (для реальной торговли; сейчас paper)
 SEND_WIN_HIGH   = 8       # верхняя граница (для реальной торговли; сейчас paper)
-DELTA_PROTECT   = 0.03    # δ — страховой зазор поверх EV-порога
+DELTA_PROTECT   = 0.06    # δ — страховой зазор поверх EV-порога
 USE_STRESS_R15  = True    # использовать стресс по медианному притоку за 15с
 
 
@@ -425,7 +425,7 @@ STABLE_W_MOM = 0.06
 STABLE_W_VWAP = 0.04
 
 # СТАВКА: жёсткий кэп на раунд
-MAX_STAKE_FRACTION = 0.03  # ≤3% капитала
+MAX_STAKE_FRACTION = 0.01  # ≤3% капитала
 
 TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TG_CHAT_ID", "").strip()
@@ -4668,6 +4668,28 @@ def main_loop():
                     continue
 
                 if epoch not in bets:
+                    # === COOLING PERIOD: пауза после серии проигрышей ===
+                    if epoch == cur and now < rd.lock_ts:
+                        try:
+                            df_recent = _read_csv_df(CSV_PATH).sort_values("settled_ts")
+                            if not df_recent.empty:
+                                recent_trades = df_recent[df_recent["outcome"].isin(["win", "loss"])].tail(3)
+                                if len(recent_trades) >= 3 and (recent_trades["outcome"] == "loss").all():
+                                    last_loss_ts = int(recent_trades.iloc[-1]["settled_ts"])
+                                    hours_since = (now - last_loss_ts) / 3600.0
+                                    COOLDOWN_HOURS = 2.0
+                                    
+                                    if hours_since < COOLDOWN_HOURS:
+                                        bets[epoch] = dict(skipped=True, reason="cooling_period", wait_polls=0, settled=False)
+                                        print(f"[cool] epoch={epoch} COOLING after 3 losses (wait {COOLDOWN_HOURS-hours_since:.1f}h more)")
+                                        send_round_snapshot(
+                                            prefix=f"🧊 <b>Cooling</b> epoch={epoch}",
+                                            extra_lines=[f"Пауза после 3 проигрышей подряд. Осталось {COOLDOWN_HOURS-hours_since:.1f}ч"]
+                                        )
+                                        continue
+                        except Exception as e:
+                            print(f"[cool] check failed: {e}")
+                    
                     # --- стадия принятия решения
                     if epoch == cur and now < rd.lock_ts:
                         # --- Guard: ждём до окна последних 15 секунд перед lock
@@ -4960,8 +4982,14 @@ def main_loop():
                         # --- выбор стороны
                         # --- выбор стороны
                         bet_up = P_up >= P_dn
-                        p_side = P_up if bet_up else P_dn
-                        side = "UP" if bet_up else "DOWN"  # ← добавлено: side нужен до compute_p_thr_no_r
+                        p_side_raw = P_up if bet_up else P_dn
+                        
+                        # === SHRINKAGE: подтягиваем к 0.5 для снижения overconfidence ===
+                        SHRINKAGE_STRENGTH = 0.20  # 20% подтяжка к центру
+                        p_side = 0.5 + (p_side_raw - 0.5) * (1.0 - SHRINKAGE_STRENGTH)
+                        print(f"[shrink] p_raw={p_side_raw:.4f} → p_conservative={p_side:.4f} (Δ={p_side-p_side_raw:+.4f})")
+                        
+                        side = "UP" if bet_up else "DOWN"
 
 
 
@@ -5023,21 +5051,23 @@ def main_loop():
                         except Exception:
                             _hour_utc = 0
 
-                        # 1) Основная оценка: EWMA по payout_ratio на стороне, без заглядывания (до текущего epoch)
-                        r_hat = r_ewma_by_side(
+                        
+                        # 1) КОНСЕРВАТИВНАЯ оценка: 30-й перцентиль вместо EWMA (пессимистичнее)
+                        r_hat = r_tod_percentile(
                             path=CSV_PATH,
                             side_up=bool(bet_up),
-                            alpha=0.25,
+                            hour_utc=_hour_utc,
+                            q=0.30,  # ИЗМЕНЕНО: 30-й перцентиль вместо 50-го (медианы)
                             max_epoch_exclusive=int(epoch)
                         )
+                        print(f"[r_hat] using q30 percentile: {r_hat:.4f}" if r_hat else "[r_hat] q30 failed")
 
-                        # 2) Бэкап по «дневным перцентилям» (час UTC)
+                        # 2) Бэкап: EWMA только если перцентиль не работает
                         if r_hat is None or not math.isfinite(float(r_hat)) or float(r_hat) <= 1.0:
-                            r_hat = r_tod_percentile(
+                            r_hat = r_ewma_by_side(
                                 path=CSV_PATH,
                                 side_up=bool(bet_up),
-                                hour_utc=_hour_utc,
-                                q=0.50,
+                                alpha=0.25,
                                 max_epoch_exclusive=int(epoch)
                             )
 
@@ -5124,21 +5154,28 @@ def main_loop():
                             f_vol = float(np.clip(sigma_star / sigma_realized, 0.5, 2.0))
 
                             # --- Kelly/8 + клипы + масштаб в просадке ---
-                            KELLY_DIVISOR = 8
+                            KELLY_DIVISOR = 32
 
                             f_eff = f_kelly_base * f_calib
-                            kelly_half = (1.0 / float(KELLY_DIVISOR)) * f_eff * f_vol  # «Kelly/8» для логов
+                            kelly_half = (1.0 / float(KELLY_DIVISOR)) * f_eff * f_vol  # «Kelly/32» для логов
 
-                            f_eff_scaled = f_eff * (2.0 / float(KELLY_DIVISOR))  # (историческая совместимость с логами)
+                            f_eff_scaled = f_eff * (2.0 / float(KELLY_DIVISOR))
+                            
+                            # === ЖЕСТКИЙ CAP: не более 0.3% на сделку ===
+                            f_eff_scaled = min(f_eff_scaled, 0.01)
+                            print(f"[kelly] f_base={f_kelly_base:.5f}, f_scaled={f_eff_scaled:.5f} (capped at 0.003)")
 
-                            frac  = float(np.clip(f_eff_scaled, 0.003, 0.03))
-                            frac *= f_vol   # мягко ещё раз
+                            frac  = float(np.clip(f_eff_scaled, 0.001, 0.01))  # ИЗМЕНЕНО: верхний лимит 0.003 вместо 0.03
+                            frac *= f_vol
 
-                            # масштаб в просадке
+                            # масштаб в просадке + ДОПОЛНИТЕЛЬНОЕ снижение на 50%
                             try:
-                                frac *= _dd_scale_factor(CSV_PATH)
+                                dd_scale = _dd_scale_factor(CSV_PATH)
+                                frac *= dd_scale
+                                frac *= 0.5  # === ДОПОЛНИТЕЛЬНЫЙ консервативный множитель ===
+                                print(f"[kelly] dd_scale={dd_scale:.3f}, final frac={frac:.5f}")
                             except Exception:
-                                pass
+                                frac *= 0.5  # на всякий случай всегда снижаем
 
                             stake = max(min_bet_bnb, frac * capital)
                             stake = min(stake, cap3)
@@ -5156,17 +5193,37 @@ def main_loop():
                             notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
                             continue
 
+
                         override_reasons = []
                         if bootstrap_phase:
                             override_reasons.append("bootstrap меньше чем 500")
                         if not has_recent:
                             override_reasons.append("idle≥1h")
                         if meta.mode != "ACTIVE":
-                            override_reasons.append("meta≠ACTIVE")    # ← добавим пояснение в источник порога/extra
+                            override_reasons.append("meta≠ACTIVE")
 
-                        # ЭФФЕКТИВНАЯ δ: ...
-                        # ЭФФЕКТИВНАЯ δ: ...
-                        delta_eff = float(DELTA_PROTECT) if (not bootstrap_phase and has_recent and meta.mode == "ACTIVE") else 0.0
+                        # === АДАПТИВНАЯ δ: увеличиваем при низком винрейте ===
+                        base_delta = float(DELTA_PROTECT)  # 0.06 из глобальных настроек
+                        
+                        if not bootstrap_phase and has_recent and meta.mode == "ACTIVE":
+                            # Проверяем винрейт последних 100 сделок
+                            recent_wr = rolling_winrate_laplace(CSV_PATH, n=100, max_epoch_exclusive=epoch)
+                            
+                            if recent_wr is not None:
+                                if recent_wr < 0.52:
+                                    delta_eff = base_delta * 1.5  # +50% при плохом винрейте
+                                    print(f"[delta] BOOSTED: {delta_eff:.3f} (wr={recent_wr:.2%} < 52%)")
+                                elif recent_wr < 0.54:
+                                    delta_eff = base_delta * 1.2  # +20% при посредственном
+                                    print(f"[delta] slightly increased: {delta_eff:.3f} (wr={recent_wr:.2%} < 54%)")
+                                else:
+                                    delta_eff = base_delta
+                                    print(f"[delta] normal: {delta_eff:.3f} (wr={recent_wr:.2%})")
+                            else:
+                                delta_eff = base_delta * 1.3  # если нет данных - консервативнее
+                                print(f"[delta] conservative (no wr data): {delta_eff:.3f}")
+                        else:
+                            delta_eff = 0.0
 
                         # устойчивее проверка override-условий (частичные совпадения)
                         critical_flags = ("bootstrap меньше чем 500", "idle≥1h")
