@@ -5209,25 +5209,49 @@ def main_loop():
                                 sigma_realized = 1e-6
                             f_vol = float(np.clip(sigma_star / sigma_realized, 0.5, 2.0))
 
-                            # === ОПТИМАЛЬНЫЙ Kelly/10 с адаптивным капом ===
+                            # ============================================
+                            # === Kelly/10 с адаптивным капом ===
+                            # ============================================
+                            
                             KELLY_DIVISOR = 10  # было 16
-
-                            f_eff_scaled = f_eff * (1.0 / float(KELLY_DIVISOR))  # убрали делитель 2.0
-
-                            # Адаптивный кап: зависит от уверенности и volatility
+                            
+                            # Вычисляем эффективный Kelly (base * calibration)
+                            f_eff = f_kelly_base * f_calib
+                            
+                            # Применяем делитель (Kelly/10)
+                            f_eff_scaled = f_eff * (1.0 / float(KELLY_DIVISOR))
+                            
+                            # Адаптивный кап: зависит от уверенности
                             edge = p_side - (1.0 / r_hat)
+                            
                             if edge > 0.08:  # высокая уверенность
                                 f_cap = 0.015  # 1.5%
                             elif edge > 0.05:  # средняя уверенность
                                 f_cap = 0.010  # 1.0%
                             else:
                                 f_cap = 0.006  # 0.6%
-
+                            
                             f_eff_scaled = min(f_eff_scaled, f_cap)
-
-                            frac = float(np.clip(f_eff_scaled, 0.001, 0.015))  # макс 1.5% вместо 1.0%
+                            
+                            # Применяем волатильность
+                            frac = float(np.clip(f_eff_scaled, 0.001, 0.015))  # макс 1.5%
                             frac *= f_vol
-
+                            
+                            # Масштаб в просадке (без дополнительного множителя 0.5)
+                            try:
+                                dd_scale = _dd_scale_factor(CSV_PATH)
+                                frac *= dd_scale
+                                print(f"[kelly] f_base={f_kelly_base:.5f}, f_eff={f_eff:.5f}, "
+                                      f"f_scaled={f_eff_scaled:.5f}, edge={edge:.4f}, "
+                                      f"dd_scale={dd_scale:.3f}, final frac={frac:.5f}")
+                            except Exception:
+                                print(f"[kelly] f_base={f_kelly_base:.5f}, f_eff={f_eff:.5f}, "
+                                      f"f_scaled={f_eff_scaled:.5f}, edge={edge:.4f}, "
+                                      f"final frac={frac:.5f}")
+                            
+                            # Kelly для информации (совместимость с остальным кодом)
+                            kelly_half = f_eff_scaled  # для логов
+                            
                             stake = max(min_bet_bnb, frac * capital)
                             stake = min(stake, cap3)
 
