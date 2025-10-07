@@ -5154,7 +5154,7 @@ def main_loop():
                             f_vol = float(np.clip(sigma_star / sigma_realized, 0.5, 2.0))
 
                             # --- Kelly/8 + клипы + масштаб в просадке ---
-                            KELLY_DIVISOR = 32
+                            KELLY_DIVISOR = 16
 
                             f_eff = f_kelly_base * f_calib
                             kelly_half = (1.0 / float(KELLY_DIVISOR)) * f_eff * f_vol  # «Kelly/32» для логов
