@@ -5069,7 +5069,8 @@ def main_loop():
                             csv_path=CSV_PATH,
                             kl_df=kl_df,
                             treasury_fee=TREASURY_FEE,
-                            use_stress_r15=USE_STRESS_R15
+                            use_stress_r15=USE_STRESS_R15,
+                            r2d=r2d
                         )
                         
                         print(f"[r_hat] {r_hat:.4f} from {r_hat_source}")
