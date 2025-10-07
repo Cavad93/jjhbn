@@ -413,7 +413,7 @@ TREASURY_FEE = 0.03
 GUARD_SECONDS   = 30      # решаем судьбу ставки только в последние 15с до lock
 SEND_WIN_LOW    = 12      # «окно отправки»: нижняя граница (для реальной торговли; сейчас paper)
 SEND_WIN_HIGH   = 8       # верхняя граница (для реальной торговли; сейчас paper)
-DELTA_PROTECT   = 0.06    # δ — страховой зазор поверх EV-порога
+DELTA_PROTECT   = 0.04    # δ — страховой зазор поверх EV-порога
 USE_STRESS_R15  = True    # использовать стресс по медианному притоку за 15с
 
 
@@ -4722,28 +4722,75 @@ def main_loop():
                             print(f"[rpc ] reconnect failed: {ee}")
                     continue
 
+                # ============= ЗАМЕНИТЬ БЛОК (строки ~975-995) =============
+
                 if epoch not in bets:
-                    # === COOLING PERIOD: пауза после серии проигрышей ===
+                    # === COOLING PERIOD: умная пауза после серии проигрышей ===
                     if epoch == cur and now < rd.lock_ts:
                         try:
                             df_recent = _read_csv_df(CSV_PATH).sort_values("settled_ts")
                             if not df_recent.empty:
-                                recent_trades = df_recent[df_recent["outcome"].isin(["win", "loss"])].tail(3)
-                                if len(recent_trades) >= 3 and (recent_trades["outcome"] == "loss").all():
-                                    last_loss_ts = int(recent_trades.iloc[-1]["settled_ts"])
-                                    hours_since = (now - last_loss_ts) / 3600.0
-                                    COOLDOWN_HOURS = 2.0
+                                # Смотрим на последние 5 сделок (вместо 3)
+                                recent_trades = df_recent[df_recent["outcome"].isin(["win", "loss"])].tail(5)
+                                
+                                if len(recent_trades) >= 5:
+                                    # Считаем количество проигрышей
+                                    losses = (recent_trades["outcome"] == "loss").sum()
                                     
-                                    if hours_since < COOLDOWN_HOURS:
-                                        bets[epoch] = dict(skipped=True, reason="cooling_period", wait_polls=0, settled=False)
-                                        print(f"[cool] epoch={epoch} COOLING after 3 losses (wait {COOLDOWN_HOURS-hours_since:.1f}h more)")
-                                        send_round_snapshot(
-                                            prefix=f"🧊 <b>Cooling</b> epoch={epoch}",
-                                            extra_lines=[f"Пауза после 3 проигрышей подряд. Осталось {COOLDOWN_HOURS-hours_since:.1f}ч"]
-                                        )
-                                        continue
+                                    # Анализируем КАЧЕСТВО проигрышей (edge_at_entry)
+                                    loss_rows = recent_trades[recent_trades["outcome"] == "loss"]
+                                    
+                                    # Безопасно извлекаем edge_at_entry
+                                    loss_edges = pd.to_numeric(
+                                        loss_rows.get("edge_at_entry", pd.Series(dtype=float)), 
+                                        errors="coerce"
+                                    ).dropna()
+                                    
+                                    avg_loss_edge = float(loss_edges.mean()) if len(loss_edges) > 0 else 0.0
+                                    
+                                    # === УСЛОВИЯ ДЛЯ COOLING ===
+                                    # 1) 3+ проигрыша из последних 5
+                                    # 2) Средний edge проигрышей >= 0.03 (не маргинальные ставки)
+                                    cooling_needed = (losses >= 3) and (avg_loss_edge >= 0.03)
+                                    
+                                    if cooling_needed:
+                                        last_loss_ts = int(recent_trades[recent_trades["outcome"] == "loss"].iloc[-1]["settled_ts"])
+                                        hours_since = (now - last_loss_ts) / 3600.0
+                                        COOLDOWN_HOURS = 1.0  # было 2.0
+                                        
+                                        if hours_since < COOLDOWN_HOURS:
+                                            bets[epoch] = dict(
+                                                skipped=True, 
+                                                reason="cooling_period", 
+                                                wait_polls=0, 
+                                                settled=False
+                                            )
+                                            
+                                            # Детальное сообщение
+                                            print(f"[cool] epoch={epoch} COOLING: {losses}/5 losses "
+                                                f"(avg_edge={avg_loss_edge:.3f}) | "
+                                                f"wait {COOLDOWN_HOURS-hours_since:.1f}h more")
+                                            
+                                            send_round_snapshot(
+                                                prefix=f"🧊 <b>Cooling</b> epoch={epoch}",
+                                                extra_lines=[
+                                                    f"Пауза после {losses}/5 проигрышей (последний час).",
+                                                    f"Средний edge проигрышей: {avg_loss_edge:.3f}",
+                                                    f"Осталось: {COOLDOWN_HOURS-hours_since:.1f}ч"
+                                                ]
+                                            )
+                                            
+                                            notify_ens_used(None, None, None, None, None, None, False, meta.mode)
+                                            continue
+                                    
+                                    # === DEBUG: если НЕ попали под cooling ===
+                                    elif losses >= 3:
+                                        print(f"[cool] NO cooling: {losses}/5 losses, "
+                                            f"but avg_edge={avg_loss_edge:.3f} < 0.03 (marginal bets)")
+                                
                         except Exception as e:
                             print(f"[cool] check failed: {e}")
+                            log_exception("[cool] Cooling period check error")  # для errors.log
                     
                     # --- стадия принятия решения
                     if epoch == cur and now < rd.lock_ts:
@@ -5040,9 +5087,18 @@ def main_loop():
                         p_side_raw = P_up if bet_up else P_dn
                         
                         # === SHRINKAGE: подтягиваем к 0.5 для снижения overconfidence ===
-                        SHRINKAGE_STRENGTH = 0.20  # 20% подтяжка к центру
-                        p_side = 0.5 + (p_side_raw - 0.5) * (1.0 - SHRINKAGE_STRENGTH)
-                        print(f"[shrink] p_raw={p_side_raw:.4f} → p_conservative={p_side:.4f} (Δ={p_side-p_side_raw:+.4f})")
+                        # === АДАПТИВНЫЙ Shrinkage: меньше для высокого края ===
+                        edge_est = abs(p_side_raw - 0.5)
+
+                        if edge_est > 0.10:  # очень уверенный прогноз
+                            shrinkage = 0.05  # 5% - почти не трогаем
+                        elif edge_est > 0.06:  # средняя уверенность
+                            shrinkage = 0.10  # 10%
+                        else:  # низкая уверенность
+                            shrinkage = 0.15  # 15%
+
+                        p_side = 0.5 + (p_side_raw - 0.5) * (1.0 - shrinkage)
+                        print(f"[shrink] p_raw={p_side_raw:.4f} → p_conservative={p_side:.4f} (Δ={p_side-p_side_raw:+.4f}, shrink={shrinkage:.2f})")
                         
                         side = "UP" if bet_up else "DOWN"
 
@@ -5153,29 +5209,24 @@ def main_loop():
                                 sigma_realized = 1e-6
                             f_vol = float(np.clip(sigma_star / sigma_realized, 0.5, 2.0))
 
-                            # --- Kelly/8 + клипы + масштаб в просадке ---
-                            KELLY_DIVISOR = 16
+                            # === ОПТИМАЛЬНЫЙ Kelly/10 с адаптивным капом ===
+                            KELLY_DIVISOR = 10  # было 16
 
-                            f_eff = f_kelly_base * f_calib
-                            kelly_half = (1.0 / float(KELLY_DIVISOR)) * f_eff * f_vol  # «Kelly/32» для логов
+                            f_eff_scaled = f_eff * (1.0 / float(KELLY_DIVISOR))  # убрали делитель 2.0
 
-                            f_eff_scaled = f_eff * (2.0 / float(KELLY_DIVISOR))
-                            
-                            # === ЖЕСТКИЙ CAP: не более 0.3% на сделку ===
-                            f_eff_scaled = min(f_eff_scaled, 0.01)
-                            print(f"[kelly] f_base={f_kelly_base:.5f}, f_scaled={f_eff_scaled:.5f} (capped at 0.003)")
+                            # Адаптивный кап: зависит от уверенности и volatility
+                            edge = p_side - (1.0 / r_hat)
+                            if edge > 0.08:  # высокая уверенность
+                                f_cap = 0.015  # 1.5%
+                            elif edge > 0.05:  # средняя уверенность
+                                f_cap = 0.010  # 1.0%
+                            else:
+                                f_cap = 0.006  # 0.6%
 
-                            frac  = float(np.clip(f_eff_scaled, 0.001, 0.01))  # ИЗМЕНЕНО: верхний лимит 0.003 вместо 0.03
+                            f_eff_scaled = min(f_eff_scaled, f_cap)
+
+                            frac = float(np.clip(f_eff_scaled, 0.001, 0.015))  # макс 1.5% вместо 1.0%
                             frac *= f_vol
-
-                            # масштаб в просадке + ДОПОЛНИТЕЛЬНОЕ снижение на 50%
-                            try:
-                                dd_scale = _dd_scale_factor(CSV_PATH)
-                                frac *= dd_scale
-                                frac *= 0.5  # === ДОПОЛНИТЕЛЬНЫЙ консервативный множитель ===
-                                print(f"[kelly] dd_scale={dd_scale:.3f}, final frac={frac:.5f}")
-                            except Exception:
-                                frac *= 0.5  # на всякий случай всегда снижаем
 
                             stake = max(min_bet_bnb, frac * capital)
                             stake = min(stake, cap3)
@@ -5210,11 +5261,11 @@ def main_loop():
                             recent_wr = rolling_winrate_laplace(CSV_PATH, n=100, max_epoch_exclusive=epoch)
                             
                             if recent_wr is not None:
-                                if recent_wr < 0.52:
-                                    delta_eff = base_delta * 1.5  # +50% при плохом винрейте
+                                if recent_wr < 0.50:
+                                    delta_eff = base_delta * 1.3  # +50% при плохом винрейте
                                     print(f"[delta] BOOSTED: {delta_eff:.3f} (wr={recent_wr:.2%} < 52%)")
-                                elif recent_wr < 0.54:
-                                    delta_eff = base_delta * 1.2  # +20% при посредственном
+                                elif recent_wr < 0.52:
+                                    delta_eff = base_delta * 1.15  # +20% при посредственном
                                     print(f"[delta] slightly increased: {delta_eff:.3f} (wr={recent_wr:.2%} < 54%)")
                                 else:
                                     delta_eff = base_delta
@@ -5231,129 +5282,223 @@ def main_loop():
                             override_reasons and any(flag in r for r in override_reasons for flag in critical_flags)
                         )
 
+                        # ============================================================
+                        # === EV-GATE: OR-логика с тремя путями прохождения фильтра ===
+                        # ============================================================
+                        
                         # Инициализируем переменные для всех веток
-                        q90_loss = None
+                        q70_loss = None
+                        q50_loss = None
                         margin_vs_market = None
+                        p_thr = None
+                        p_thr_ev = None
 
                         if has_critical_override:
+                            # === РЕЖИМ OVERRIDE: фиксированный порог ===
                             p_thr = 0.51
                             p_thr_src = f"fixed(0.51; {' & '.join(override_reasons)})"
-                        else:
-                            # Вычисляем только когда нужно
-                            q90_loss = float(loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.70))
-                            margin_vs_market = float(p_side - (1.0 / max(1e-9, float(r_hat))))
+                            
+                            # Простая проверка для override
+                            if p_side < p_thr:
+                                bets[epoch] = dict(
+                                    skipped=True, reason="ev_gate_override",
+                                    p_side=p_side, p_thr=p_thr, p_thr_src=p_thr_src,
+                                    r_hat=r_hat, r_hat_source=r_hat_source,
+                                    gb_hat=gb_hat, gc_hat=gc_hat, stake=stake,
+                                    delta15=(float(delta15) if (USE_STRESS_R15 and 'delta15' in locals()) else None),
+                                    wait_polls=0, settled=False,
+                                    p_meta_raw=float(p_meta_raw) if 'p_meta_raw' in locals() else float('nan'),
+                                    calib_src=str(calib_src) if 'calib_src' in locals() else "calib[off]"
+                                )
+                                
+                                side_txt = "UP" if bet_up else "DOWN"
+                                print(f"[skip] epoch={epoch} side={side_txt} override p={p_side:.4f} < p_thr={p_thr:.4f} [{p_thr_src}]")
+                                
+                                # === Telegram notification ===
+                                try:
+                                    notify_ev_decision(
+                                        title="⛔ Skip (override)",
+                                        epoch=epoch,
+                                        side_txt=side_txt,
+                                        p_side=p_side,
+                                        p_thr=p_thr,
+                                        p_thr_src=p_thr_src,
+                                        r_hat=r_hat,
+                                        gb_hat=gb_hat,
+                                        gc_hat=gc_hat,
+                                        stake=stake,
+                                        delta15=(delta15 if (USE_STRESS_R15 and 'delta15' in locals()) else None),
+                                        extra_lines=[],
+                                        delta_eff=0.0,
+                                    )
+                                except Exception as e:
+                                    print(f"[tg ] notify skip failed: {e}")
+                                
+                                # === Snapshot ===
+                                send_round_snapshot(
+                                    prefix=f"⛔ <b>Skip</b> epoch={epoch} (override)",
+                                    extra_lines=[
+                                        f"side=<b>{side_txt}</b>, p={p_side:.4f} < p_thr={p_thr:.4f}",
+                                        f"Причина: {' & '.join(override_reasons)}"
+                                    ]
+                                )
+                                
+                                notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
+                                continue
 
+                        else:
+                            # === РЕЖИМ ПОЛНОЦЕННОЙ ПРОВЕРКИ: OR-логика ===
+                            
+                            # Вычисляем ВСЕ метрики заранее
+                            q70_loss = float(loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.70))
+                            q50_loss = float(loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.50))
+                            margin_vs_market = float(p_side - (1.0 / max(1e-9, float(r_hat))))
+                            
                             p_thr_ev = p_thr_from_ev(
                                 r_hat=float(r_hat),
-                                stake=float(max(1e-9, stake)),   # stake уже рассчитан выше
+                                stake=float(max(1e-9, stake)),
                                 gb_hat=float(gb_hat),
                                 gc_hat=float(gc_hat),
                                 delta=float(delta_eff)
                             )
-                            # для совместимости с логикой (p_side < p_thr+δ) храним p_thr так, чтобы p_thr+δ = p_thr_ev
-                            p_thr = float(max(0.0, p_thr_ev - float(delta_eff)))
-                            p_thr_src = f"EV|δ+gas; q90(loss)={q90_loss:.4f}; r̂={float(r_hat):.3f}"
-
-
-                        # фильтр по «хорошим часам» (UTC) — отключён
-                        # неизменная проверка
-
-                        if p_side < (p_thr + delta_eff) or p_thr > 0.9999:
-                            # Сохраним всё нужное для последующего анализа/settle-уведов
-                            bets[epoch] = dict(
-                                skipped=True, reason="ev_gate",
-                                p_side=p_side, p_thr=p_thr, p_thr_src=p_thr_src,
-                                r_hat=r_hat, 
-                                r_hat_source=r_hat_source,
-                                gb_hat=gb_hat, gc_hat=gc_hat,
-                                stake=stake,
-                                delta15=(float(delta15) if (USE_STRESS_R15 and 'delta15' in locals()) else None),
-                                wait_polls=0, settled=False,
-                                # новенькое:
-                                p_meta_raw=float(p_meta_raw) if 'p_meta_raw' in locals() else float('nan'),
-                                calib_src=str(calib_src) if 'calib_src' in locals() else "calib[off]"
-                            )
-
-                            side_txt  = "UP" if bet_up else "DOWN"
-                            kelly_txt = ("—" if (kelly_half is None or not (isinstance(kelly_half, (int, float)) and math.isfinite(kelly_half)))
-                                         else f"{kelly_half:.3f}")
-
-
-                            # NEW: Telegram-уведомление с полным разбором порога
-                            try:
-                                notify_ev_decision(
-                                    title="⛔ Skip by EV gate",
-                                    epoch=epoch,
-                                    side_txt=side_txt,
-                                    p_side=p_side,
-                                    p_thr=p_thr,
-                                    p_thr_src=p_thr_src,
-                                    r_hat=r_hat,
-                                    gb_hat=gb_hat,
-                                    gc_hat=gc_hat,
-                                    stake=stake,
-                                    delta15=(delta15 if (USE_STRESS_R15 and 'delta15' in locals()) else None),
-                                    extra_lines=[f"Kelly/2:   {kelly_txt}"],
-                                    delta_eff=delta_eff,                         # ← ПЕРЕДАЁМ ЭФФЕКТИВНУЮ δ
-                                )
-                            except Exception as e:
-                                print(f"[tg ] notify skip failed: {e}")
-
-                            # Один список extra — используем и для snapshot, и для отладки
-                            _delta15_str = (f"Δ15_med={ (float(delta15)/1e18 if float(delta15) > 1e6 else float(delta15)) :.4f} BNB"
-                                            if (USE_STRESS_R15 and 'delta15' in locals()) else None)
-
-                            # при SKIP:
-                            extra = [
-                                f"p_ctx={p_side:.4f} vs p_thr_ev={(p_thr + delta_eff):.4f} [{p_thr_src}]",
-                                f"edge_EV={p_side - (p_thr + delta_eff):+.4f} | margin={margin_vs_market:+.4f} vs q90={q90_loss:.4f}",
-                                f"r̂={r_hat:.3f} [{r_hat_source}], S={stake:.6f}, gb̂={gb_hat:.8f}, gĉ={gc_hat:.8f}",
-                                _delta15_str,
-                                f"gas_bet≈{gas_bet_bnb_cur:.8f} BNB",
-                                (f"порог-оверрайды: {', '.join(override_reasons)}" if override_reasons else None),
-                                f"Kelly/8={kelly_txt}",
-                            ]
-
-                            extra = [x for x in extra if x is not None]
-
-                            # Консольный лог — тоже по p_thr+δ, чтобы не путаться
-                            print(f"[skip] epoch={epoch} side={side_txt} EV-gate p={p_side:.4f} < p_thr+δ={(p_thr + delta_eff):.4f} [{p_thr_src}] | "
-                                f"r̂={r_hat:.3f} gb̂={gb_hat:.8f} gĉ={gc_hat:.8f} S={stake:.6f} Kelly/2={kelly_txt}")
-
-                            send_round_snapshot(prefix=f"⛔ <b>Skip</b> epoch={epoch} (EV-gate)", extra_lines=extra)
-                            notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
-                            # --- ТЕНЕВОЙ ЛОГ ДЛЯ OFF-POLICY δ ---
-                            try:
-                                # безопасно определим цену газа в gwei для лога тени
-                                gas_gwei_for_log = float(gas_gwei_now) if 'gas_gwei_now' in locals() else float(get_gas_price_wei(w3)) / 1e9
-                                # используем те же stake/gas/вероятности, что считали выше
-                                append_shadow_row(CSV_SHADOW_PATH, {
-                                    "settled_ts": "",
-                                    "epoch": epoch,
-                                    "side": side_txt,
-                                    "p_up": float(p_side if side_txt == "UP" else 1.0 - p_side),
-
-                                    "p_thr_used": float(p_thr),
-                                    "p_thr_src":  str(p_thr_src),
-                                    "edge_at_entry": float("nan"),
-
-                                    "stake": float(stake),
-                                    "gas_bet_bnb": float(gas_bet_bnb_cur),
-                                    "gas_claim_bnb": float(gas_claim_bnb_cur),
-                                    "gas_price_bet_gwei": gas_gwei_for_log,
-                                    "gas_price_claim_gwei": gas_gwei_for_log,
-                                    "outcome": "", "pnl": "",
-                                    "capital_before": float(capital),
-                                    "capital_after": float(capital),
-                                    "lock_ts": "", "close_ts": "",
-                                    "lock_price": "", "close_price": "",
-                                    "payout_ratio": "",
-                                    "up_won": ""
-                                })
-                            except Exception as e:
-                                print(f"[shadow] append failed: {e}")                           
                             
-                            continue
+                            # p_thr для совместимости: p_thr + δ = p_thr_ev
+                            p_thr = float(max(0.0, p_thr_ev - float(delta_eff)))
+                            
+                            # Три пути прохождения фильтра (OR-логика):
+                            pass_ev_strong = (p_side >= (p_thr + delta_eff))
+                            pass_margin_q70 = (margin_vs_market >= q70_loss) and (p_side >= (p_thr + 0.5 * delta_eff))
+                            pass_margin_q50 = (margin_vs_market >= q50_loss) and (p_side >= (p_thr + delta_eff))
+                            
+                            # Определяем источник для логирования
+                            if pass_ev_strong:
+                                pass_reason = "EV_strong"
+                            elif pass_margin_q70:
+                                pass_reason = "margin_q70"
+                            elif pass_margin_q50:
+                                pass_reason = "margin_q50"
+                            else:
+                                pass_reason = "FAIL"
+                            
+                            p_thr_src = (f"EV|δ+gas; q70={q70_loss:.4f}, q50={q50_loss:.4f}; "
+                                         f"margin={margin_vs_market:+.4f}; r̂={float(r_hat):.3f}; "
+                                         f"pass={pass_reason}")
+                            
+                            # === ПРОВЕРКА: хотя бы одно условие должно пройти ===
+                            if not (pass_ev_strong or pass_margin_q70 or pass_margin_q50):
+                                # SKIP: все фильтры провалены
+                                
+                                bets[epoch] = dict(
+                                    skipped=True, reason="ev_gate",
+                                    p_side=p_side, p_thr=p_thr, p_thr_src=p_thr_src,
+                                    r_hat=r_hat, r_hat_source=r_hat_source,
+                                    gb_hat=gb_hat, gc_hat=gc_hat, stake=stake,
+                                    delta15=(float(delta15) if (USE_STRESS_R15 and 'delta15' in locals()) else None),
+                                    wait_polls=0, settled=False,
+                                    p_meta_raw=float(p_meta_raw) if 'p_meta_raw' in locals() else float('nan'),
+                                    calib_src=str(calib_src) if 'calib_src' in locals() else "calib[off]"
+                                )
+                                
+                                side_txt = "UP" if bet_up else "DOWN"
+                                kelly_txt = ("—" if (kelly_half is None or not (isinstance(kelly_half, (int, float)) and math.isfinite(kelly_half)))
+                                             else f"{kelly_half:.3f}")
+                                
+                                # === Telegram notification ===
+                                try:
+                                    notify_ev_decision(
+                                        title="⛔ Skip by EV gate",
+                                        epoch=epoch,
+                                        side_txt=side_txt,
+                                        p_side=p_side,
+                                        p_thr=p_thr,
+                                        p_thr_src=p_thr_src,
+                                        r_hat=r_hat,
+                                        gb_hat=gb_hat,
+                                        gc_hat=gc_hat,
+                                        stake=stake,
+                                        delta15=(delta15 if (USE_STRESS_R15 and 'delta15' in locals()) else None),
+                                        extra_lines=[
+                                            f"Kelly/2:   {kelly_txt}",
+                                            f"❌ EV strong: p={p_side:.4f} < p_thr+δ={(p_thr + delta_eff):.4f}",
+                                            f"❌ Margin q70: margin={margin_vs_market:+.4f} < q70={q70_loss:.4f}",
+                                            f"❌ Margin q50: margin={margin_vs_market:+.4f} < q50={q50_loss:.4f}",
+                                        ],
+                                        delta_eff=delta_eff,
+                                    )
+                                except Exception as e:
+                                    print(f"[tg ] notify skip failed: {e}")
+                                
+                                # === Console log ===
+                                print(f"[skip] epoch={epoch} side={side_txt} EV-gate ALL FAIL | "
+                                      f"p={p_side:.4f} p_thr+δ={(p_thr + delta_eff):.4f} | "
+                                      f"margin={margin_vs_market:+.4f} q70={q70_loss:.4f} q50={q50_loss:.4f} | "
+                                      f"r̂={r_hat:.3f} S={stake:.6f}")
+                                
+                                # === Snapshot ===
+                                _delta15_str = (f"Δ15_med={ (float(delta15)/1e18 if float(delta15) > 1e6 else float(delta15)) :.4f} BNB"
+                                                if (USE_STRESS_R15 and 'delta15' in locals()) else None)
+                                
+                                extra = [
+                                    f"p_ctx={p_side:.4f} vs p_thr_ev={(p_thr + delta_eff):.4f} [{p_thr_src}]",
+                                    f"❌ EV strong: {p_side:.4f} < {(p_thr + delta_eff):.4f}",
+                                    f"❌ Margin q70: {margin_vs_market:+.4f} < {q70_loss:.4f}",
+                                    f"❌ Margin q50: {margin_vs_market:+.4f} < {q50_loss:.4f}",
+                                    f"r̂={r_hat:.3f} [{r_hat_source}], S={stake:.6f}, gb̂={gb_hat:.8f}, gĉ={gc_hat:.8f}",
+                                    _delta15_str,
+                                    f"gas_bet≈{gas_bet_bnb_cur:.8f} BNB",
+                                    (f"порог-оверрайды: {', '.join(override_reasons)}" if override_reasons else None),
+                                    f"Kelly/8={kelly_txt}",
+                                ]
+                                
+                                extra = [x for x in extra if x is not None]
+                                
+                                send_round_snapshot(
+                                    prefix=f"⛔ <b>Skip</b> epoch={epoch} (EV-gate)",
+                                    extra_lines=extra
+                                )
+                                
+                                notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
+                                
+                                # === Теневой лог ===
+                                try:
+                                    gas_gwei_for_log = float(gas_gwei_now) if 'gas_gwei_now' in locals() else float(get_gas_price_wei(w3)) / 1e9
+                                    append_shadow_row(CSV_SHADOW_PATH, {
+                                        "settled_ts": "",
+                                        "epoch": epoch,
+                                        "side": side_txt,
+                                        "p_up": float(p_side if side_txt == "UP" else 1.0 - p_side),
+                                        "p_thr_used": float(p_thr),
+                                        "p_thr_src": str(p_thr_src),
+                                        "edge_at_entry": float("nan"),
+                                        "stake": float(stake),
+                                        "gas_bet_bnb": float(gas_bet_bnb_cur),
+                                        "gas_claim_bnb": float(gas_claim_bnb_cur),
+                                        "gas_price_bet_gwei": gas_gwei_for_log,
+                                        "gas_price_claim_gwei": gas_gwei_for_log,
+                                        "outcome": "", "pnl": "",
+                                        "capital_before": float(capital),
+                                        "capital_after": float(capital),
+                                        "lock_ts": "", "close_ts": "",
+                                        "lock_price": "", "close_price": "",
+                                        "payout_ratio": "", "up_won": ""
+                                    })
+                                except Exception as e:
+                                    print(f"[shadow] append failed: {e}")
+                                
+                                continue  # ← переход к следующему epoch
+
+                        # ============================================================
+                        # === ЕСЛИ ДОШЛИ СЮДА: ФИЛЬТР ПРОЙДЕН, РАЗМЕЩАЕМ СТАВКУ ===
+                        # ============================================================
+                        
+                        # --- считаем запас на входе
+                        edge_at_entry = float(p_side - (p_thr + delta_eff))
+                        
+                        print(f"[bet ] epoch={epoch} side={side} "
+                              f"✅ {pass_reason} passed | "
+                              f"p={p_side:.4f} margin={margin_vs_market:+.4f} | "
+                              f"edge@entry={edge_at_entry:+.4f} "
+                              f"Kelly/2={kelly_txt if 'kelly_txt' in locals() else '—'} r̂={r_hat:.3f} S={stake:.6f}")
 
 
                         # --- сохранить контекст ставки
