@@ -124,6 +124,13 @@ from futures_ctx import FuturesContext
 from pool_features import PoolFeaturesCtx
 from extra_features import realized_metrics, jump_flag_from_rv_bv_rq, amihud_illiq, kyle_lambda
 from extra_features import intraday_time_features, idio_features, GasHistory, pack_vector
+
+from r_hat_improved import (
+    estimate_r_hat_improved,
+    analyze_r_hat_accuracy,
+    adaptive_quantile
+)
+
 import requests
 
 
@@ -1235,12 +1242,13 @@ class ExtendedMLFeatures:
 # =============================
 CSV_COLUMNS = [
     "settled_ts","epoch","side","p_up",
-    "p_meta_raw","p_meta2_raw","p_blend","blend_w","calib_src",   # ← NEW
+    "p_meta_raw","p_meta2_raw","p_blend","blend_w","calib_src",
     "p_thr_used","p_thr_src","edge_at_entry",
     "stake","gas_bet_bnb","gas_claim_bnb",
     "gas_price_bet_gwei","gas_price_claim_gwei",
     "outcome","pnl","capital_before","capital_after",
-    "lock_ts","close_ts","lock_price","close_price","payout_ratio","up_won"
+    "lock_ts","close_ts","lock_price","close_price","payout_ratio","up_won",
+    "r_hat_used","r_hat_source","r_hat_error_pct"  # ← НОВОЕ
 ]
 
 
@@ -1273,7 +1281,10 @@ CSV_DTYPES = {
     "lock_price":           "float64",
     "close_price":          "float64",
     "payout_ratio":         "float64",
-    "up_won":               "boolean",   # ← важно: логический
+    "up_won":               "boolean",
+    "r_hat_used":           "float64",      # ← НОВОЕ
+    "r_hat_source":         "string",       # ← НОВОЕ
+    "r_hat_error_pct":      "float64",      # ← НОВОЕ   # ← важно: логический
 }
 
 # --- Порог для включения δ от тюнера ---
@@ -2009,20 +2020,34 @@ def build_stats_message(stats: Dict[str, Optional[float]]) -> str:
     losses = stats.get("losses", 0)
     total = stats.get("total", 0)
 
-    # 👇 добавим баланс резерва (лениво читаем из файла)
+    # Reserve balance
     try:
-        from reserve_fund import ReserveFund  # локальный импорт во избежание циклов
+        from reserve_fund import ReserveFund
         _reserve_path = os.path.join(os.path.dirname(__file__), "reserve_state.json")
         _rf = ReserveFund(path=_reserve_path)
         reserve_line = f"Reserve: <b>{_rf.balance:.6f} BNB</b>\n"
     except Exception:
         reserve_line = ""
+    
+    # ← НОВОЕ: анализ точности r̂ из модуля
+    r_hat_line = ""
+    try:
+        from r_hat_improved import analyze_r_hat_accuracy
+        acc = analyze_r_hat_accuracy(CSV_PATH, n=200)
+        if acc and acc.get("n_samples", 0) >= 20:
+            mae = acc["mae_pct"]
+            bias = acc["bias_pct"]
+            n = acc["n_samples"]
+            r_hat_line = f"r̂ accuracy: MAE={mae:.1f}%, bias={bias:+.1f}% (n={n})\n"
+    except Exception:
+        pass
 
     msg = (f"<b>Статистика</b>\n"
            f"Trades: {total} | Wins: {wins} | Losses: {losses}\n"
            f"Winrate: <b>{wr}</b>\n"
            f"ROI: 24h={r24} | 7d={r7} | 30d={r30}\n"
-           f"{reserve_line}")
+           f"{reserve_line}"
+           f"{r_hat_line}")
     return msg
 
 
@@ -4233,7 +4258,8 @@ def _prune_bets(bets: Dict[int, Dict], keep_settled_last: int = 500, keep_other_
 # =============================
 def main_loop():
     global DELTA_PROTECT  # будем менять модульную константу
-    # --- Фаза-гистерезис ---
+    # --- Фаза-гистерезис --
+    hours = None
     ml_cfg = MLConfig() 
     phase_filter = PhaseFilter(hysteresis_s=ml_cfg.phase_hysteresis_s)
     # (опционально можно загрузить last_phase/last_change_ts из JSON, если нужно переживать рестарт)
@@ -5013,100 +5039,44 @@ def main_loop():
                         gas_bet_bnb_cur = GAS_USED_BET * gas_price_wei / 1e18
                         gas_claim_bnb_cur = GAS_USED_CLAIM * gas_price_wei / 1e18
 
-                        # r̂ и газ — НОВОЕ: 2D-квантиль по (t_rem×pool), фоллбэк EWMA(side)/часовые перцентили
+                        # =============================
+                        # УЛУЧШЕННАЯ ОЦЕНКА r̂
+                        # =============================
+                        
+                        # Подготовка: обновить 2D-таблицу и газовые оценки
                         r_med, gb_med, gc_med = last3_ev_estimates(CSV_PATH)
-
-                        # подхватить уже завершённые — обновить 2D-таблицу
+                        
                         try:
                             r2d.ingest_settled(CSV_PATH)
                         except Exception:
                             pass
-
-                        # текущие признаки для r̂: t_rem и размер пула
-                        _now_ts   = int(time.time())
-                        t_rem_s   = max(0, int(getattr(rd, "lock_ts", _now_ts) - _now_ts))
-                        pool_tot  = float(getattr(rd, "bull_amount", 0.0) + getattr(rd, "bear_amount", 0.0))
+                        
+                        _now_ts = int(time.time())
+                        t_rem_s = max(0, int(getattr(rd, "lock_ts", _now_ts) - _now_ts))
+                        pool_tot = float(getattr(rd, "bull_amount", 0.0) + getattr(rd, "bear_amount", 0.0))
+                        
                         try:
-                            # записать pending-снапшот (будет сопоставлен с фактом после settle)
                             r2d.observe_epoch(epoch=int(epoch), t_rem_s=int(t_rem_s), pool_total_bnb=float(pool_tot))
                         except Exception:
                             pass
-
-                        # подсказки индексов корзин для оценки
-                        try:
-                            _i = int(np.searchsorted(r2d.t_edges, float(t_rem_s), side="right") - 1)
-                            _i = max(0, min(_i, len(r2d.t_edges)-2))
-                            _j = int(np.searchsorted(r2d.pool_log_edges, math.log10(max(1e-12, float(pool_tot))), side="right") - 1)
-                            _j = max(0, min(_j, len(r2d.pool_log_edges)-2))
-                        except Exception:
-                            _i, _j = (None, None)
-
-                        # оценка r̂ — ОСНОВНОЕ: EWMA(λ=0.25) по прошлым r на стороне + часовые перцентили (UTC)
-                        try:
-                            _lock_ts_cur = int(getattr(rd, "lock_ts", _now_ts))
-                        except Exception:
-                            _lock_ts_cur = int(_now_ts)
-                        try:
-                            _hour_utc = int(pd.to_datetime(_lock_ts_cur, unit="s", utc=True).hour)
-                        except Exception:
-                            _hour_utc = 0
-
                         
-                        # 1) КОНСЕРВАТИВНАЯ оценка: 30-й перцентиль вместо EWMA (пессимистичнее)
-                        r_hat = r_tod_percentile(
-                            path=CSV_PATH,
-                            side_up=bool(bet_up),
-                            hour_utc=_hour_utc,
-                            q=0.30,  # ИЗМЕНЕНО: 30-й перцентиль вместо 50-го (медианы)
-                            max_epoch_exclusive=int(epoch)
+                        # НОВАЯ ФУНКЦИЯ из модуля: приоритет IMPLIED → историческим методам
+                        r_hat, r_hat_source = estimate_r_hat_improved(
+                            rd=rd,
+                            bet_up=bet_up,
+                            epoch=epoch,
+                            pool=pool,
+                            csv_path=CSV_PATH,
+                            kl_df=kl_df,
+                            treasury_fee=TREASURY_FEE,
+                            use_stress_r15=USE_STRESS_R15
                         )
-                        print(f"[r_hat] using q30 percentile: {r_hat:.4f}" if r_hat else "[r_hat] q30 failed")
-
-                        # 2) Бэкап: EWMA только если перцентиль не работает
-                        if r_hat is None or not math.isfinite(float(r_hat)) or float(r_hat) <= 1.0:
-                            r_hat = r_ewma_by_side(
-                                path=CSV_PATH,
-                                side_up=bool(bet_up),
-                                alpha=0.25,
-                                max_epoch_exclusive=int(epoch)
-                            )
-
-                        # 3) Вторичный бэкап: 2D-квантильная таблица (t_rem × pool), если уже наобучена
-                        if r_hat is None or not math.isfinite(float(r_hat)) or float(r_hat) <= 1.0:
-                            try:
-                                r_hat = r2d.estimate(
-                                    side=("UP" if bet_up else "DOWN"),
-                                    lock_ts=int(getattr(rd, "lock_ts", _now_ts)),
-                                    csv_path=CSV_PATH,
-                                    i_hint=_i, j_hint=_j
-                                )
-                            except Exception:
-                                r_hat = None
-
-                        # 4) Фоллбэки старого порядка: медиана последних 3 и implied из пула
-                        if r_hat is None or not math.isfinite(float(r_hat)) or float(r_hat) <= 1.0:
-                            r_hat = r_med
-                        if r_hat is None or not math.isfinite(float(r_hat)) or float(r_hat) <= 1.0:
-                            r_imp = implied_payout_ratio(bet_up, rd, TREASURY_FEE)  # (Total/Side)*(1-0.03)
-                            r_hat = r_imp if (r_imp is not None and math.isfinite(r_imp) and r_imp > 1.0) else 1.90
-
-                        r_hat = float(r_hat)
-
+                        
+                        print(f"[r_hat] {r_hat:.4f} from {r_hat_source}")
+                        
+                        # Газовые оценки (без изменений)
                         gb_hat = gb_med if (gb_med is not None and math.isfinite(gb_med)) else gas_bet_bnb_cur
                         gc_hat = gc_med if (gc_med is not None and math.isfinite(gc_med)) else gas_claim_bnb_cur
-
-
-                        # --- Новое: стресс по «поздним деньгам» (медианный приток за последние 15с до lock)
-                        if USE_STRESS_R15:
-                            delta15 = float(pool.late_delta_quantile(q=0.5) or 0.0)  # BNB
-                            total_now = float(rd.bull_amount + rd.bear_amount)
-                            side_now  = float(rd.bull_amount if bet_up else rd.bear_amount)
-                            # Наихудший сценарий: весь поздний приток идёт на НАШУ сторону
-                            total_w  = total_now + max(0.0, delta15)
-                            side_w   = side_now  + max(0.0, delta15)
-                            r_worst  = (total_w / max(1e-12, side_w)) * (1.0 - TREASURY_FEE)
-                            # Используем стрессовую выплату для EV-порога
-                            r_hat    = min(r_hat, r_worst)
 
 
                         total_settled = settled_trades_count(CSV_PATH)
@@ -5231,14 +5201,17 @@ def main_loop():
                             override_reasons and any(flag in r for r in override_reasons for flag in critical_flags)
                         )
 
-# GGG/bnbusdrt6.py — ФРАГМЕНТ «СТАЛО» (наглядный фикс: вычисляем q90_loss и margin_vs_market ЗАРАНЕЕ для обеих веток)
-# вычисляем заранее, чтобы эти переменные были доступны в ЛЮБОМ ветвлении (исправляет UnboundLocalError)
-                        q90_loss = float(loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.70))
-                        margin_vs_market = float(p_side - (1.0 / max(1e-9, float(r_hat))))
+                        # Инициализируем переменные для всех веток
+                        q90_loss = None
+                        margin_vs_market = None
 
                         if has_critical_override:
                             p_thr = 0.51
                             p_thr_src = f"fixed(0.51; {' & '.join(override_reasons)})"
+                        else:
+                            # Вычисляем только когда нужно
+                            q90_loss = float(loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.70))
+                            margin_vs_market = float(p_side - (1.0 / max(1e-9, float(r_hat))))
                         else:
                             p_thr_ev = p_thr_from_ev(
                                 r_hat=float(r_hat),
@@ -5253,7 +5226,6 @@ def main_loop():
 
 
                         # фильтр по «хорошим часам» (UTC) — отключён
-                        ok_hours, hours_reason = (True, "hours_filter:removed")
                         # неизменная проверка
 
                         if p_side < (p_thr + delta_eff) or p_thr > 0.9999:
@@ -5261,7 +5233,9 @@ def main_loop():
                             bets[epoch] = dict(
                                 skipped=True, reason="ev_gate",
                                 p_side=p_side, p_thr=p_thr, p_thr_src=p_thr_src,
-                                r_hat=r_hat, gb_hat=gb_hat, gc_hat=gc_hat,
+                                r_hat=r_hat, 
+                                r_hat_source=r_hat_source,
+                                gb_hat=gb_hat, gc_hat=gc_hat,
                                 stake=stake,
                                 delta15=(float(delta15) if (USE_STRESS_R15 and 'delta15' in locals()) else None),
                                 wait_polls=0, settled=False,
@@ -5303,7 +5277,7 @@ def main_loop():
                             extra = [
                                 f"p_ctx={p_side:.4f} vs p_thr_ev={(p_thr + delta_eff):.4f} [{p_thr_src}]",
                                 f"edge_EV={p_side - (p_thr + delta_eff):+.4f} | margin={margin_vs_market:+.4f} vs q90={q90_loss:.4f}",
-                                f"r̂={r_hat:.3f}, S={stake:.6f}, gb̂={gb_hat:.8f}, gĉ={gc_hat:.8f}",
+                                f"r̂={r_hat:.3f} [{r_hat_source}], S={stake:.6f}, gb̂={gb_hat:.8f}, gĉ={gc_hat:.8f}",
                                 _delta15_str,
                                 f"gas_bet≈{gas_bet_bnb_cur:.8f} BNB",
                                 (f"порог-оверрайды: {', '.join(override_reasons)}" if override_reasons else None),
@@ -5378,7 +5352,9 @@ def main_loop():
                             time=now, t_lock=rd.lock_ts,
                             bet_up=bet_up, p_up=P_up, p_side=p_side, p_thr=p_thr,
                             p_thr_src=p_thr_src,                     # ✳️ сохраняем источник порога
-                            r_hat=r_hat, gb_hat=gb_hat, gc_hat=gc_hat,
+                            r_hat=r_hat,
+                            r_hat_source=r_hat_source,
+                            gb_hat=gb_hat, gc_hat=gc_hat,
                             kelly_half=(None if bootstrap_phase else kelly_half), stake=stake,
                             p_meta_raw=float(p_meta_raw) if 'p_meta_raw' in locals() else float('nan'),
                             p_meta2_raw=float(p_meta2_raw) if 'p_meta2_raw' in locals() and p_meta2_raw is not None else float('nan'),  # ← NEW
@@ -5701,8 +5677,23 @@ def main_loop():
                         "lock_price": rd.lock_price,
                         "close_price": rd.close_price,
                         "payout_ratio": rd.payout_ratio if rd.payout_ratio else float('nan'),
-                        "up_won": bool(up_won)
+                        "up_won": bool(up_won),
+                        "r_hat_used": float(b.get("r_hat", float('nan'))),              # ← НОВОЕ
+                        "r_hat_source": str(b.get("r_hat_source", "")),                 # ← НОВОЕ
+                        "r_hat_error_pct": float('nan')                                 # ← заполним ниже
                     }
+                    
+                    # Рассчитываем ошибку оценки r̂
+                    try:
+                        if rd.payout_ratio and b.get("r_hat"):
+                            r_actual = float(rd.payout_ratio)
+                            r_pred = float(b["r_hat"])
+                            if math.isfinite(r_actual) and math.isfinite(r_pred) and r_actual > 0:
+                                error_pct = abs(r_actual - r_pred) / r_actual * 100.0
+                                row["r_hat_error_pct"] = float(error_pct)
+                    except Exception:
+                        pass
+
                     append_trade_row(CSV_PATH, row)
                     # дублируем капитал в отдельный state-файл (на случай удаления CSV)
                     try:
@@ -5983,8 +5974,24 @@ def main_loop():
                             "lock_price": lock_price_est if rd.lock_price == 0 else rd.lock_price,
                             "close_price": close_price_est,
                             "payout_ratio": ratio_use,
-                            "up_won": bool(up_won)
+                            "payout_ratio": ratio_use,
+                            "up_won": bool(up_won),
+                            "r_hat_used": float(b.get("r_hat", float('nan'))),
+                            "r_hat_source": str(b.get("r_hat_source", "")),
+                            "r_hat_error_pct": float('nan')
                         }
+                        
+                        # Ошибка для forced settlement
+                        try:
+                            if ratio_use and b.get("r_hat"):
+                                r_actual = float(ratio_use)
+                                r_pred = float(b["r_hat"])
+                                if math.isfinite(r_actual) and math.isfinite(r_pred) and r_actual > 0:
+                                    error_pct = abs(r_actual - r_pred) / r_actual * 100.0
+                                    row["r_hat_error_pct"] = float(error_pct)
+                        except Exception:
+                            pass
+
                         append_trade_row(CSV_PATH, row)
                         # дублируем капитал в отдельный state-файл (на случай удаления CSV)
                         try:
