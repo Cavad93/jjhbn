@@ -26,9 +26,17 @@ def estimate_late_money_direction(pool, rd, our_side_up: bool) -> float:
         0.0 = все против нас, 0.5 = нейтрально, 1.0 = все за нас
     """
     try:
+        # Проверка наличия атрибута
+        if not hasattr(pool, 'history') or not pool.history:
+            return 0.5
+        
         # Получаем историю последних 30 раундов с "поздними деньгами"
         history = []
         for epoch_data in list(pool.history.values())[-30:]:
+            # Защита от разных структур
+            if not isinstance(epoch_data, dict):
+                continue
+            
             snapshots = epoch_data.get("snapshots", [])
             if len(snapshots) < 2:
                 continue
@@ -160,7 +168,8 @@ def estimate_r_hat_improved(
     csv_path: str,
     kl_df: pd.DataFrame,
     treasury_fee: float = 0.03,
-    use_stress_r15: bool = True
+    use_stress_r15: bool = True,
+    r2d = None  # ← ДОБАВЛЕНО: опциональный параметр для 2D-таблицы
 ) -> Tuple[float, str]:
     """
     Улучшенная оценка r̂ с приоритетом на IMPLIED из текущего пула.
@@ -174,6 +183,7 @@ def estimate_r_hat_improved(
         kl_df: DataFrame с OHLCV для расчёта волатильности
         treasury_fee: Комиссия протокола (0.03 = 3%)
         use_stress_r15: Использовать корректировку на поздние деньги
+        r2d: RHat2D объект для 2D-оценки (опционально)
     
     Returns:
         (r_hat, source_description)
@@ -195,7 +205,7 @@ def estimate_r_hat_improved(
         source_parts.append(f"implied={r_implied:.3f}")
         
         # ШАГ 2: Корректировка на "поздние деньги" (умнее!)
-        if use_stress_r15:
+        if use_stress_r15 and hasattr(pool, 'late_delta_quantile'):  # ← ДОБАВЛЕНА ПРОВЕРКА
             try:
                 delta15 = float(pool.late_delta_quantile(q=0.5) or 0.0)
                 
@@ -282,22 +292,18 @@ def estimate_r_hat_improved(
         if r_hat and math.isfinite(r_hat) and r_hat > 1.0:
             return float(r_hat), f"ewma={r_hat:.3f}"
         
-        # 3) 2D-таблица (если доступна)
-        try:
-            import sys
-            if 'bnbusdrt6' in sys.modules:
-                bnb_module = sys.modules['bnbusdrt6']
-                if hasattr(bnb_module, 'r2d'):
-                    r2d = bnb_module.r2d
-                    r_hat = r2d.estimate(
-                        side=("UP" if bet_up else "DOWN"),
-                        lock_ts=int(getattr(rd, "lock_ts", int(time.time()))),
-                        csv_path=csv_path
-                    )
-                    if r_hat and math.isfinite(r_hat) and r_hat > 1.0:
-                        return float(r_hat), f"r2d={r_hat:.3f}"
-        except Exception:
-            pass
+        # 3) 2D-таблица (если передана как параметр) ← ИСПРАВЛЕНО
+        if r2d is not None:
+            try:
+                r_hat = r2d.estimate(
+                    side=("UP" if bet_up else "DOWN"),
+                    lock_ts=int(getattr(rd, "lock_ts", int(time.time()))),
+                    csv_path=csv_path
+                )
+                if r_hat and math.isfinite(r_hat) and r_hat > 1.0:
+                    return float(r_hat), f"r2d={r_hat:.3f}"
+            except Exception:
+                pass
         
         # 4) Медиана последних 3
         r_med, _, _ = last3_ev_estimates(csv_path)
@@ -326,7 +332,7 @@ def analyze_r_hat_accuracy(csv_path: str, n: int = 200) -> Optional[Dict[str, fl
     
     Returns:
         dict с метриками: mae, mae_pct, rmse, bias, bias_pct, n_samples
-        или None если данных недостаточно
+        або None если данных недостаточно
     """
     try:
         # Импорт из основного модуля
