@@ -5213,7 +5213,6 @@ def main_loop():
                             # Вычисляем только когда нужно
                             q90_loss = float(loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.70))
                             margin_vs_market = float(p_side - (1.0 / max(1e-9, float(r_hat))))
-                        else:
                             p_thr_ev = p_thr_from_ev(
                                 r_hat=float(r_hat),
                                 stake=float(max(1e-9, stake)),   # stake уже рассчитан выше
