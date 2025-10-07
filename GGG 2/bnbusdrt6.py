@@ -1312,24 +1312,40 @@ def _settled_trades_count(path: str) -> int:
 
 def _coerce_csv_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     """Нормализуем типы столбцов согласно CSV_DTYPES (мягко, без падений)."""
+    
+    # ✅ Заменяем pd.NA на пустую строку для строковых колонок
     obj_like = list(df.select_dtypes(include=["object", "string"]).columns)
     if obj_like:
-        df[obj_like] = df[obj_like].where(~df[obj_like].isna(), "")
+        df[obj_like] = df[obj_like].fillna("")  # безопаснее чем .where()
+    
     for col, dtype in CSV_DTYPES.items():
         if col not in df.columns:
-            # создадим пустую колонку нужного типа
-            df[col] = pd.Series(pd.NA, dtype=dtype)
+            # ✅ Используем np.nan вместо pd.NA
+            if dtype in ("float64", "Int64"):
+                df[col] = np.nan
+            elif dtype == "boolean":
+                df[col] = pd.Series(dtype="boolean")
+            else:
+                df[col] = ""
             continue
+        
         try:
             if dtype in ("float64",):
-                df[col] = pd.to_numeric(df[col], errors="coerce").astype(dtype)
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+                df[col] = df[col].fillna(np.nan).astype(dtype)
             elif dtype in ("Int64",):
-                df[col] = pd.to_numeric(df[col], errors="coerce").astype(dtype)
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+                # ✅ Int64 поддерживает pd.NA, но безопаснее через astype
+                df[col] = df[col].astype("Int64")
+            elif dtype == "boolean":
+                # ✅ boolean тоже поддерживает pd.NA, но лучше явно
+                df[col] = df[col].astype("boolean")
             else:
                 df[col] = df[col].astype(dtype)
-        except Exception:
-            # на всякий случай: если что-то пошло не так, оставим как есть
+        except Exception as e:
+            print(f"[warn] failed to coerce {col} to {dtype}: {e}")
             pass
+    
     return df
 
 def ensure_csv_header(path: str):
@@ -1387,10 +1403,15 @@ def try_settle_shadow_rows(path: str, w3: Web3, c, cur_epoch: int) -> None:
         try:
             # --- Безопасные геттеры чисел ---
             def _sf(x, default=0.0):
+                """Безопасно конвертирует в float с обработкой pd.NA"""
                 try:
+                    # ✅ Явная проверка на pd.NA (для pandas < 2.0)
+                    if pd.isna(x):  # работает и для pd.NA, и для np.nan
+                        return default
+                    
                     v = float(pd.to_numeric(x, errors="coerce"))
                     return v if math.isfinite(v) else default
-                except Exception:
+                except (TypeError, ValueError):
                     return default
 
             epoch = int(pd.to_numeric(row.get("epoch"), errors="coerce"))
@@ -1475,11 +1496,19 @@ def try_settle_shadow_rows(path: str, w3: Web3, c, cur_epoch: int) -> None:
 
 def _read_csv_df(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
-        empty = pd.DataFrame({c: pd.Series(pd.NA, dtype=CSV_DTYPES.get(c, "string")) for c in CSV_COLUMNS})
+        empty = pd.DataFrame({c: pd.Series(np.nan, dtype=CSV_DTYPES.get(c, "string")) for c in CSV_COLUMNS})
         return empty
+    
+    # ✅ Читаем БЕЗ dtype="string" и сразу заменяем pd.NA
     df = pd.read_csv(path, keep_default_na=True, encoding="utf-8-sig")
-    # ключевая защита от float(pd.NA)
-    df = df.replace({pd.NA: np.nan})
+    
+    # ✅ КРИТИЧНО: заменить pd.NA на np.nan ДО любых операций
+    df = df.fillna(np.nan)  # более надёжно чем .replace()
+    
+    # Дополнительная зачистка
+    for col in df.select_dtypes(include=["object"]).columns:
+        df[col] = df[col].replace({"<NA>": np.nan, "NaN": np.nan, "nan": np.nan, "None": np.nan, "": np.nan})
+    
     return _coerce_csv_dtypes(df)
 
 
@@ -5213,6 +5242,7 @@ def main_loop():
                             # Вычисляем только когда нужно
                             q90_loss = float(loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.70))
                             margin_vs_market = float(p_side - (1.0 / max(1e-9, float(r_hat))))
+
                             p_thr_ev = p_thr_from_ev(
                                 r_hat=float(r_hat),
                                 stake=float(max(1e-9, stake)),   # stake уже рассчитан выше
@@ -6079,18 +6109,29 @@ def main_loop():
 
 
 def _normalize_existing_csvs():
-    # аккуратно привести оба файла к нужной схеме
+    """Аккуратно привести оба файла к нужной схеме"""
     for _p in (CSV_PATH, CSV_SHADOW_PATH):
         if os.path.exists(_p):
             try:
-                # читаем как строки, чтобы не поймать float(pd.NA) в сторонних преобразованиях
-                raw = pd.read_csv(_p, encoding="utf-8-sig", dtype="string", keep_default_na=True)
-                # нормализуем маркеры пропусков
-                raw = raw.replace({pd.NA: np.nan, "<NA>": np.nan, "NaN": np.nan, "nan": np.nan, "None": np.nan})
-                # мягко приводим типы к целевой схеме
+                # ✅ Убрали dtype="string" - читаем с автоопределением типов
+                raw = pd.read_csv(_p, encoding="utf-8-sig", keep_default_na=True)
+                
+                # ✅ Сразу заменяем все варианты NA на np.nan
+                raw = raw.fillna(np.nan)
+                
+                # Дополнительная зачистка строковых представлений
+                for col in raw.select_dtypes(include=["object"]).columns:
+                    raw[col] = raw[col].replace({
+                        "<NA>": np.nan, "NaN": np.nan, "nan": np.nan, 
+                        "None": np.nan, "": np.nan
+                    })
+                
+                # Мягко приводим типы к целевой схеме
                 _df = _coerce_csv_dtypes(raw)
-                # финальная зачистка
-                _df = _df.replace({pd.NA: np.nan})
+                
+                # Финальная зачистка перед сохранением
+                _df = _df.fillna(np.nan)
+                
                 _df.to_csv(_p, index=False, encoding="utf-8-sig")
             except Exception as e:
                 print(f"[warn] CSV normalize failed for {_p}: {e!r}")
