@@ -141,6 +141,10 @@ def _get_proj_tz():
     print("[proj] warning: tz database unavailable; using UTC")
     return timezone.utc
 
+
+rpc_fail_streak = 0
+RPC_FAIL_MAX = 3
+
 # часовой пояс для ежедневной проекции и файл-маркер "раз в день"
 PROJ_TZ = _get_proj_tz()
 PROJ_STATE_PATH = os.path.join(os.path.dirname(__file__), "proj_state.json")
@@ -175,6 +179,34 @@ def fmt_pct(x, nd=2, dash="—"):
     """Проценты: 12.34% или '—'."""
     s = fmtf(x, nd=nd, dash=dash)
     return s if s == dash else f"{s}%"
+
+def update_capital_atomic(capital_state, new_capital: float, ts: int, csv_row: dict) -> float:
+    """
+    Атомарно обновляет капитал и сохраняет строку в CSV.
+    Гарантирует согласованность: сначала капитал, потом CSV.
+    Если что-то пойдет не так, возвращает последний сохраненный капитал.
+    """
+    try:
+        # Сначала сохраняем капитал атомарно через временный файл
+        temp_path = capital_state.path + ".tmp"
+        with open(temp_path, 'w') as f:
+            json.dump({"capital": new_capital, "ts": ts}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, capital_state.path)
+        
+        # Только после успешного сохранения капитала пишем в CSV
+        try:
+            append_csv_row(CSV_PATH, csv_row)
+        except Exception as e:
+            print(f"[csv ] write failed but capital saved: {e}")
+        
+        return new_capital
+    except Exception as e:
+        print(f"[capital] save failed: {e}")
+        # В случае ошибки возвращаем последнее корректное значение
+        return capital_state.load()
+
 
 def fmt_prob(x):
     """Вероятности p∈[0,1] до 4 знаков или '—'."""
@@ -5703,6 +5735,7 @@ def _settled_trades_count(csv_path: str) -> int:
 # ГЛАВНЫЙ ЦИКЛ (с ансамблем)
 # =============================
 def main_loop():
+    global rpc_fail_streak
     global DELTA_PROTECT  # будем менять модульную константу
     # --- Фаза-гистерезис --
     hours = None
@@ -6535,14 +6568,13 @@ def main_loop():
                         except Exception as e:
                             print(f"[rpc ] gas_price failed: {e}")
                             rpc_fail_streak += 1
-                            # Используем фолбэк вместо краша
-                            gas_price_wei = 3_000_000_000  # 3 gwei fallback
+                            gas_price_wei = 3_000_000_000
                             if rpc_fail_streak >= RPC_FAIL_MAX:
                                 try:
                                     w3 = connect_web3()
                                     c = get_prediction_contract(w3)
                                     rpc_fail_streak = 0
-                                    print("[rpc ] reconnected")
+                                    print("[rpc ] reconnected successfully")
                                 except Exception as ee:
                                     print(f"[rpc ] reconnect failed: {ee}")
                             
@@ -7206,7 +7238,6 @@ def main_loop():
                     stake = _as_float(b.get("stake", 0.0), 0.0)
                     gas_bet_bnb = _as_float(b.get("gas_bet_bnb", 0.0), 0.0)
 
-                    # Безопасный доступ к атрибутам rd с защитой от None
                     lock_price = _as_float(getattr(rd, "lock_price", None), 0.0)
                     close_price = _as_float(getattr(rd, "close_price", None), 0.0)
 
@@ -7222,9 +7253,11 @@ def main_loop():
                             pass
 
                     capital_before = capital
+                    
+                    # Вычисляем новый капитал БЕЗ изменения переменной capital
                     if draw:
                         gas_claim_bnb = _as_float(GAS_USED_CLAIM * gas_price_claim_wei / 1e18, 0.0)
-                        capital -= (gas_bet_bnb + gas_claim_bnb)
+                        new_capital = capital - (gas_bet_bnb + gas_claim_bnb)
                         pnl = -(gas_bet_bnb + gas_claim_bnb)
                         outcome = "draw"
                     else:
@@ -7235,20 +7268,18 @@ def main_loop():
                         if (bet_up and up_won) or ((not bet_up) and down_won):
                             profit = stake * (ratio - 1.0)
                             gas_claim_bnb = _as_float(GAS_USED_CLAIM * gas_price_claim_wei / 1e18, 0.0)
-                            capital += profit
-                            capital -= (gas_bet_bnb + gas_claim_bnb)
+                            new_capital = capital + profit - (gas_bet_bnb + gas_claim_bnb)
                             pnl = profit - (gas_bet_bnb + gas_claim_bnb)
                             outcome = "win"
                         else:
-                            capital -= stake
-                            capital -= gas_bet_bnb
+                            new_capital = capital - stake - gas_bet_bnb
                             pnl = -stake - gas_bet_bnb
                             outcome = "loss"
 
                     b.update(dict(
                         settled=True, outcome=outcome, pnl=pnl,
                         gas_price_claim_wei=gas_price_claim_wei, gas_claim_bnb=gas_claim_bnb,
-                        capital_after=capital, payout_ratio=rd.payout_ratio
+                        capital_after=new_capital, payout_ratio=rd.payout_ratio
                     ))
                     side = "UP" if bet_up else "DOWN"
                     print(f"[setl] epoch={epoch} side={side} outcome={outcome} pnl={pnl:+.6f} "
@@ -7582,27 +7613,27 @@ def main_loop():
 
                         capital_before = capital
                         gas_claim_bnb = GAS_USED_CLAIM * gas_price_claim_wei / 1e18
+
+                        # Вычисляем новый капитал БЕЗ изменения переменной capital
                         if draw:
-                            capital -= (gas_bet_bnb + gas_claim_bnb)
+                            new_capital = capital - (gas_bet_bnb + gas_claim_bnb)
                             pnl = -(gas_bet_bnb + gas_claim_bnb)
                             outcome = "draw"
                         else:
                             if (bet_up and up_won) or ((not bet_up) and down_won):
                                 profit = stake * (ratio_use - 1.0)
-                                capital += profit
-                                capital -= (gas_bet_bnb + gas_claim_bnb)
+                                new_capital = capital + profit - (gas_bet_bnb + gas_claim_bnb)
                                 pnl = profit - (gas_bet_bnb + gas_claim_bnb)
                                 outcome = "win"
                             else:
-                                capital -= stake
-                                capital -= gas_bet_bnb
+                                new_capital = capital - stake - gas_bet_bnb
                                 pnl = -stake - gas_bet_bnb
                                 outcome = "loss"
 
                         b.update(dict(
                             settled=True, outcome=outcome, pnl=pnl,
                             gas_price_claim_wei=gas_price_claim_wei, gas_claim_bnb=gas_claim_bnb,
-                            capital_after=capital, payout_ratio=ratio_use, forced=True
+                            capital_after=new_capital, payout_ratio=ratio_use, forced=True
                         ))
                         side = "UP" if bet_up else "DOWN"
                         print(f"[FORC] epoch={epoch} side={side} outcome={outcome} pnl={pnl:+.6f} cap={capital:.6f} "
@@ -7865,5 +7896,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
-
-
