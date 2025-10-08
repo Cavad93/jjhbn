@@ -2493,18 +2493,52 @@ class XGBExpert(_BaseExpert):
         yg = np.array(self.y[-n:], dtype=np.int32)
         return Xg, yg
 
+    def _get_past_phases_tail(self, ph: int, n: int) -> Tuple[np.ndarray, np.ndarray]:
+        # Берет последние n записей только из фаз 0..ph (включительно)
+        # Исключает данные из будущих фаз → нет утечки
+        if n <= 0:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        
+        # Собираем все данные из фаз 0..ph
+        X_past = []
+        y_past = []
+        for p in range(min(ph + 1, self.P)):
+            if self.X_ph.get(p):
+                X_past.extend(self.X_ph[p])
+                y_past.extend(self.y_ph[p])
+        
+        if not X_past:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        
+        # Берем последние n записей
+        X_past = X_past[-n:]
+        y_past = y_past[-n:]
+        
+        return np.array(X_past, dtype=np.float32), np.array(y_past, dtype=np.int32)
+
+
     def _get_phase_train(self, ph: int) -> Tuple[np.ndarray, np.ndarray]:
+        # X_phase
         Xp = np.array(self.X_ph[ph], dtype=np.float32) if self.X_ph[ph] else np.empty((0, self.n_feats or 0), dtype=np.float32)
-        yp = np.array(self.y_ph[ph], dtype=np.int32) if self.y_ph[ph] else np.empty((0,), dtype=np.int32)
+        yp = np.array(self.y_ph[ph], dtype=np.int32)   if self.y_ph[ph]  else np.empty((0,), dtype=np.int32)
+
         if len(Xp) >= int(self.cfg.phase_min_ready):
             return Xp, yp
-        # иначе смешиваем с глобальным хвостом (~70/30)
+
+        # иначе смешиваем X_phase ∪ X_past_phases_tail (70/30 по умолчанию)
+        # ИСПРАВЛЕНИЕ: используем только прошлые фазы (0..ph), а не весь глобальный хвост
         share = float(self.cfg.phase_mix_global_share)  # 0.30
         need_g = int(round(len(Xp) * share / max(1e-9, (1.0 - share))))
-        need_g = max(min(need_g, len(self.X)), min(int(self.cfg.phase_min_ready) - len(Xp), len(self.X)))
-        Xg, yg = self._get_global_tail(need_g)
+        need_g = max(need_g, int(self.cfg.phase_min_ready) - len(Xp))   # не менее, чтобы достичь порога
+        
+        # Считаем сколько доступно в фазах 0..ph
+        available_past = sum(len(self.X_ph.get(p, [])) for p in range(min(ph + 1, self.P)))
+        need_g = min(need_g, available_past)  # не больше, чем доступно в прошлых фазах
+        
+        Xg, yg = self._get_past_phases_tail(ph, need_g)
         if len(Xg) == 0:
             return Xp, yp
+
         X = np.concatenate([Xp, Xg], axis=0)
         y = np.concatenate([yp, yg], axis=0)
         return X, y
@@ -2742,6 +2776,29 @@ class RFCalibratedExpert(_BaseExpert):
         yg = np.array(self.y[-n:], dtype=np.int32)
         return Xg, yg
 
+    def _get_past_phases_tail(self, ph: int, n: int) -> Tuple[np.ndarray, np.ndarray]:
+        # Берет последние n записей только из фаз 0..ph (включительно)
+        # Исключает данные из будущих фаз → нет утечки
+        if n <= 0:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        
+        # Собираем все данные из фаз 0..ph
+        X_past = []
+        y_past = []
+        for p in range(min(ph + 1, self.P)):
+            if self.X_ph.get(p):
+                X_past.extend(self.X_ph[p])
+                y_past.extend(self.y_ph[p])
+        
+        if not X_past:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        
+        # Берем последние n записей
+        X_past = X_past[-n:]
+        y_past = y_past[-n:]
+        
+        return np.array(X_past, dtype=np.float32), np.array(y_past, dtype=np.int32)
+
     def _get_phase_train(self, ph: int) -> Tuple[np.ndarray, np.ndarray]:
         # X_phase
         Xp = np.array(self.X_ph[ph], dtype=np.float32) if self.X_ph[ph] else np.empty((0, self.n_feats or 0), dtype=np.float32)
@@ -2750,12 +2807,17 @@ class RFCalibratedExpert(_BaseExpert):
         if len(Xp) >= int(self.cfg.phase_min_ready):
             return Xp, yp
 
-        # иначе смешиваем X_phase ∪ X_global_tail (70/30 по умолчанию)
+        # иначе смешиваем X_phase ∪ X_past_phases_tail (70/30 по умолчанию)
+        # ИСПРАВЛЕНИЕ: используем только прошлые фазы (0..ph), а не весь глобальный хвост
         share = float(self.cfg.phase_mix_global_share)  # 0.30
         need_g = int(round(len(Xp) * share / max(1e-9, (1.0 - share))))
         need_g = max(need_g, int(self.cfg.phase_min_ready) - len(Xp))   # не менее, чтобы достичь порога
-        need_g = min(need_g, len(self.X))  # не больше, чем доступно
-        Xg, yg = self._get_global_tail(need_g)
+        
+        # Считаем сколько доступно в фазах 0..ph
+        available_past = sum(len(self.X_ph.get(p, [])) for p in range(min(ph + 1, self.P)))
+        need_g = min(need_g, available_past)  # не больше, чем доступно в прошлых фазах
+        
+        Xg, yg = self._get_past_phases_tail(ph, need_g)
         if len(Xg) == 0:
             return Xp, yp
 
@@ -2764,7 +2826,7 @@ class RFCalibratedExpert(_BaseExpert):
         return X, y
 
     def _maybe_train_phase(self, ph: int) -> None:
-        # тренируем ровно по фазе ph (с подмешиванием глобального хвоста при нехватке)
+        # тренируем ровно по фазе ph (с подмешиванием прошлых фаз 0..ph при нехватке)
         if self.n_feats is None or not self.enabled:
             return
         if self.new_since_train_ph.get(ph, 0) < int(self.cfg.retrain_every):
@@ -3524,21 +3586,51 @@ class NNExpert(_BaseExpert):
         yg = np.array(self.y[-n:], dtype=np.int32)
         return Xg, yg
 
+    def _get_past_phases_tail(self, ph: int, n: int) -> Tuple[np.ndarray, np.ndarray]:
+        # Берет последние n записей только из фаз 0..ph (включительно)
+        # Исключает данные из будущих фаз → нет утечки
+        if n <= 0:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        
+        # Собираем все данные из фаз 0..ph
+        X_past = []
+        y_past = []
+        for p in range(min(ph + 1, self.P)):
+            if self.X_ph.get(p):
+                X_past.extend(self.X_ph[p])
+                y_past.extend(self.y_ph[p])
+        
+        if not X_past:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        
+        # Берем последние n записей
+        X_past = X_past[-n:]
+        y_past = y_past[-n:]
+        
+        return np.array(X_past, dtype=np.float32), np.array(y_past, dtype=np.int32)
+
     def _get_phase_train(self, ph: int) -> Tuple[np.ndarray, np.ndarray]:
+        # X_phase
         Xp = np.array(self.X_ph[ph], dtype=np.float32) if self.X_ph[ph] else np.empty((0, self.n_feats or 0), dtype=np.float32)
         yp = np.array(self.y_ph[ph], dtype=np.int32)   if self.y_ph[ph]  else np.empty((0,), dtype=np.int32)
 
-        if len(Xp) >= int(getattr(self.cfg, "phase_min_ready", 80)):
+        if len(Xp) >= int(self.cfg.phase_min_ready):
             return Xp, yp
 
-        # смешиваем X_phase ∪ X_global_tail (70/30 по умолчанию)
-        share = float(getattr(self.cfg, "phase_mix_global_share", 0.30))
-        need_g = int(round(len(Xp) * share / max(1e-9, 1.0 - share)))
-        need_g = max(need_g, int(getattr(self.cfg, "phase_min_ready", 80)) - len(Xp))
-        need_g = min(need_g, len(self.X))
-        Xg, yg = self._get_global_tail(need_g)
+        # иначе смешиваем X_phase ∪ X_past_phases_tail (70/30 по умолчанию)
+        # ИСПРАВЛЕНИЕ: используем только прошлые фазы (0..ph), а не весь глобальный хвост
+        share = float(self.cfg.phase_mix_global_share)  # 0.30
+        need_g = int(round(len(Xp) * share / max(1e-9, (1.0 - share))))
+        need_g = max(need_g, int(self.cfg.phase_min_ready) - len(Xp))   # не менее, чтобы достичь порога
+        
+        # Считаем сколько доступно в фазах 0..ph
+        available_past = sum(len(self.X_ph.get(p, [])) for p in range(min(ph + 1, self.P)))
+        need_g = min(need_g, available_past)  # не больше, чем доступно в прошлых фазах
+        
+        Xg, yg = self._get_past_phases_tail(ph, need_g)
         if len(Xg) == 0:
             return Xp, yp
+
         X = np.concatenate([Xp, Xg], axis=0)
         y = np.concatenate([yp, yg], axis=0)
         return X, y
