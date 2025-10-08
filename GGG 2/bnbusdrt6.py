@@ -145,6 +145,9 @@ def _get_proj_tz():
 rpc_fail_streak = 0
 RPC_FAIL_MAX = 3
 
+gas_price_history = []
+MAX_GAS_HISTORY = 20
+
 # часовой пояс для ежедневной проекции и файл-маркер "раз в день"
 PROJ_TZ = _get_proj_tz()
 PROJ_STATE_PATH = os.path.join(os.path.dirname(__file__), "proj_state.json")
@@ -206,6 +209,21 @@ def update_capital_atomic(capital_state, new_capital: float, ts: int, csv_row: d
         print(f"[capital] save failed: {e}")
         # В случае ошибки возвращаем последнее корректное значение
         return capital_state.load()
+
+def get_gas_price_with_fallback(w3: Web3) -> int:
+    global gas_price_history
+    try:
+        price = w3.eth.gas_price
+        gas_price_history.append(price)
+        if len(gas_price_history) > MAX_GAS_HISTORY:
+            gas_price_history.pop(0)
+        return price
+    except Exception:
+        if gas_price_history:
+            median_price = int(np.median(gas_price_history))
+            multiplier = 1.2
+            return int(median_price * multiplier)
+        return 5_000_000_000
 
 
 def fmt_prob(x):
@@ -492,8 +510,6 @@ SEND_WIN_LOW    = 12      # «окно отправки»: нижняя гран
 SEND_WIN_HIGH   = 8       # верхняя граница (для реальной торговли; сейчас paper)
 DELTA_PROTECT   = 0.04    # δ — страховой зазор поверх EV-порога
 USE_STRESS_R15  = True    # использовать стресс по медианному притоку за 15с
-
-
 
 
 
@@ -6062,7 +6078,7 @@ def main_loop():
                     if evt and evt.get("changed"):
                         capital = float(evt["capital"])
                         try:
-                            capital_state.save(capital, ts=now)  # сохраняем новый рабочий капитал
+                            capital = update_capital_atomic(capital_state, new_capital, now, csv_row)  # сохраняем новый рабочий капитал
                         except Exception as e:
                             print(f"[warn] capital_state save failed: {e}")
                         # информируем в TG (тихо игнорим сбои)
@@ -6568,7 +6584,7 @@ def main_loop():
                         except Exception as e:
                             print(f"[rpc ] gas_price failed: {e}")
                             rpc_fail_streak += 1
-                            gas_price_wei = 3_000_000_000
+                            gas_price_wei = get_gas_price_with_fallback(w3)
                             if rpc_fail_streak >= RPC_FAIL_MAX:
                                 try:
                                     w3 = connect_web3()
@@ -7896,3 +7912,5 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
+
+
