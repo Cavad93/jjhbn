@@ -50,10 +50,18 @@ def _is_finite_num(x) -> bool:
         return False
 
 def _as_float(x, default=float("nan")):
+    """Безопасная конвертация в float с обработкой None, pd.NA, np.nan"""
     try:
+        # Явная проверка на None и pd.NA
+        if x is None:
+            return default
+        # Проверка на pandas NA (для совместимости с pandas < 2.0)
+        if hasattr(x, '__class__') and x.__class__.__name__ == 'NAType':
+            return default
+        
         v = float(x)
         return v if math.isfinite(v) else default
-    except Exception:
+    except (TypeError, ValueError):
         return default
 
 
@@ -2006,38 +2014,49 @@ def notify_ev_decision(title: str,
                        stake: float,
                        delta15: float = None,
                        extra_lines: list = None,
-                       delta_eff: float | None = None):   # ← НОВОЕ
+                       delta_eff: float | None = None):
     """
     Отправляет компактное уведомление с полным разбором порога.
     """
-    d = float(DELTA_PROTECT) if (delta_eff is None) else float(delta_eff)   # ← НОВОЕ
+    try:
+        # Безопасная конвертация всех параметров
+        d = _as_float(DELTA_PROTECT if (delta_eff is None) else delta_eff, 0.0)
+        p_side = _as_float(p_side, 0.5)
+        p_thr = _as_float(p_thr, 0.5)
+        r_hat = _as_float(r_hat, 1.9)
+        gb_hat = _as_float(gb_hat, 0.0)
+        gc_hat = _as_float(gc_hat, 0.0)
+        stake = _as_float(stake, 0.0)
 
-    head = f"<b>{_tg_html_escape(title)}</b> — epoch <code>{epoch}</code>\n"
-    lines = [
-        f"side:       {side_txt}",
-        f"p_side:     {p_side:.4f}",
-        f"p_thr:      {p_thr:.4f}  [{p_thr_src}]",
-        f"p_thr+δ:    {(p_thr + d):.4f}  (δ={d:.2f})",                      # ← ИСПОЛЬЗУЕМ d
-        f"edge:       {p_side - (p_thr + d):+.4f}",                         # ← ИСПОЛЬЗУЕМ d
-        f"r_hat:      {r_hat:.6f}",
-        f"gb_hat:     {gb_hat:.8f}  (BNB)",
-        f"gc_hat:     {gc_hat:.8f}  (BNB)",
-        f"S (stake):  {stake:.6f}    (BNB)",
-    ]
-    if USE_STRESS_R15 and delta15 is not None:
-        _d = float(delta15)
-        # Авто-детект: если «похоже на wei» — приводим в BNB
-        if _d > 1e6:
-            _d /= 1e18
-        lines.append(f"Δ15_med:   {_d:.6f}  (BNB)")
+        head = f"<b>{_tg_html_escape(str(title))}</b> — epoch <code>{int(epoch)}</code>\n"
+        lines = [
+            f"side:       {str(side_txt)}",
+            f"p_side:     {p_side:.4f}",
+            f"p_thr:      {p_thr:.4f}  [{str(p_thr_src)}]",
+            f"p_thr+δ:    {(p_thr + d):.4f}  (δ={d:.2f})",
+            f"edge:       {p_side - (p_thr + d):+.4f}",
+            f"r_hat:      {r_hat:.6f}",
+            f"gb_hat:     {gb_hat:.8f}  (BNB)",
+            f"gc_hat:     {gc_hat:.8f}  (BNB)",
+            f"S (stake):  {stake:.6f}    (BNB)",
+        ]
+        
+        if USE_STRESS_R15 and delta15 is not None:
+            _d = _as_float(delta15, 0.0)
+            if _d > 1e6:
+                _d /= 1e18
+            if math.isfinite(_d):
+                lines.append(f"Δ15_med:   {_d:.6f}  (BNB)")
 
-    if extra_lines:
-        for x in extra_lines:
-            if x:
-                lines.append(str(x))
+        if extra_lines:
+            for x in extra_lines:
+                if x:
+                    lines.append(str(x))
 
-    block = "<pre><code>" + _tg_html_escape("\n".join(lines)) + "</code></pre>"
-    tg_send_chunks(head + block, parse_mode="HTML")
+        block = "<pre><code>" + _tg_html_escape("\n".join(lines)) + "</code></pre>"
+        tg_send_chunks(head + block, parse_mode="HTML")
+    except Exception as e:
+        print(f"[tg ] notify_ev_decision failed: {e}")
 
 
 def _fmt_pct(x: Optional[float]) -> str:
@@ -5155,12 +5174,16 @@ def main_loop():
 
 
                         # gas now
+                        # gas now
+                        gas_price_wei = 0
                         try:
                             gas_price_wei = get_gas_price_wei(w3)
                             rpc_fail_streak = 0
                         except Exception as e:
                             print(f"[rpc ] gas_price failed: {e}")
                             rpc_fail_streak += 1
+                            # Используем фолбэк вместо краша
+                            gas_price_wei = 3_000_000_000  # 3 gwei fallback
                             if rpc_fail_streak >= RPC_FAIL_MAX:
                                 try:
                                     w3 = connect_web3()
@@ -5169,10 +5192,9 @@ def main_loop():
                                     print("[rpc ] reconnected")
                                 except Exception as ee:
                                     print(f"[rpc ] reconnect failed: {ee}")
-                                    continue
-                            continue
-                        gas_bet_bnb_cur = GAS_USED_BET * gas_price_wei / 1e18
-                        gas_claim_bnb_cur = GAS_USED_CLAIM * gas_price_wei / 1e18
+                            
+                        gas_bet_bnb_cur = _as_float(GAS_USED_BET * gas_price_wei / 1e18, 0.0)
+                        gas_claim_bnb_cur = _as_float(GAS_USED_CLAIM * gas_price_wei / 1e18, 0.0)
 
                         # =============================
                         # УЛУЧШЕННАЯ ОЦЕНКА r̂
@@ -5180,6 +5202,9 @@ def main_loop():
                         
                         # Подготовка: обновить 2D-таблицу и газовые оценки
                         r_med, gb_med, gc_med = last3_ev_estimates(CSV_PATH)
+                        r_med = _as_float(r_med, None)
+                        gb_med = _as_float(gb_med, None)
+                        gc_med = _as_float(gc_med, None)
                         
                         try:
                             r2d.ingest_settled(CSV_PATH)
@@ -5187,13 +5212,13 @@ def main_loop():
                             pass
                         
                         _now_ts = int(time.time())
-                        t_rem_s = max(0, int(getattr(rd, "lock_ts", _now_ts) - _now_ts))
+                        t_rem_s = max(0, int(_as_float(getattr(rd, "lock_ts", _now_ts), _now_ts) - _now_ts))
                         if t_rem_s <= 2:
                             bets[epoch] = dict(skipped=True, reason="late", wait_polls=0, settled=False)
                             print(f"[late] epoch={epoch} missed betting window")
                             notify_ens_used(None, None, None, None, None, None, False, meta.mode)
                             continue
-                        pool_tot = float(getattr(rd, "bull_amount", 0.0) + getattr(rd, "bear_amount", 0.0))
+                        pool_tot = _as_float(getattr(rd, "bull_amount", 0.0), 0.0) + _as_float(getattr(rd, "bear_amount", 0.0), 0.0)
                         
                         try:
                             r2d.observe_epoch(epoch=int(epoch), t_rem_s=int(t_rem_s), pool_total_bnb=float(pool_tot))
@@ -5201,23 +5226,31 @@ def main_loop():
                             pass
                         
                         # НОВАЯ ФУНКЦИЯ из модуля: приоритет IMPLIED → историческим методам
-                        r_hat, r_hat_source = estimate_r_hat_improved(
-                            rd=rd,
-                            bet_up=bet_up,
-                            epoch=epoch,
-                            pool=pool,
-                            csv_path=CSV_PATH,
-                            kl_df=kl_df,
-                            treasury_fee=TREASURY_FEE,
-                            use_stress_r15=USE_STRESS_R15,
-                            r2d=r2d
-                        )
+                        # НОВАЯ ФУНКЦИЯ из модуля: приоритет IMPLIED → историческим методам
+                        try:
+                            r_hat, r_hat_source = estimate_r_hat_improved(
+                                rd=rd,
+                                bet_up=bet_up,
+                                epoch=epoch,
+                                pool=pool,
+                                csv_path=CSV_PATH,
+                                kl_df=kl_df,
+                                treasury_fee=TREASURY_FEE,
+                                use_stress_r15=USE_STRESS_R15,
+                                r2d=r2d
+                            )
+                            r_hat = _as_float(r_hat, 1.90)
+                            r_hat_source = str(r_hat_source) if r_hat_source else "unknown"
+                        except Exception as e:
+                            print(f"[r_hat] estimate_r_hat_improved failed: {e}")
+                            r_hat = 1.90
+                            r_hat_source = "fallback_after_error"
                         
                         print(f"[r_hat] {r_hat:.4f} from {r_hat_source}")
                         
                         # Газовые оценки (без изменений)
-                        gb_hat = gb_med if (gb_med is not None and math.isfinite(gb_med)) else gas_bet_bnb_cur
-                        gc_hat = gc_med if (gc_med is not None and math.isfinite(gc_med)) else gas_claim_bnb_cur
+                        gb_hat = _as_float(gb_med if (gb_med is not None and math.isfinite(_as_float(gb_med))) else gas_bet_bnb_cur, 0.0)
+                        gc_hat = _as_float(gc_med if (gc_med is not None and math.isfinite(_as_float(gc_med))) else gas_claim_bnb_cur, 0.0)
 
 
                         total_settled = settled_trades_count(CSV_PATH)
@@ -5438,17 +5471,36 @@ def main_loop():
                             # === РЕЖИМ ПОЛНОЦЕННОЙ ПРОВЕРКИ: OR-логика ===
                             
                             # Вычисляем ВСЕ метрики заранее
-                            q70_loss = float(loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.70))
-                            q50_loss = float(loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.50))
-                            margin_vs_market = float(p_side - (1.0 / max(1e-9, float(r_hat))))
+                            # Вычисляем ВСЕ метрики заранее (с защитой от None)
+                            try:
+                                q70_loss = loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.70)
+                                q70_loss = _as_float(q70_loss, 0.0)
+                            except Exception:
+                                q70_loss = 0.0
                             
-                            p_thr_ev = p_thr_from_ev(
-                                r_hat=float(r_hat),
-                                stake=float(max(1e-9, stake)),
-                                gb_hat=float(gb_hat),
-                                gc_hat=float(gc_hat),
-                                delta=float(delta_eff)
-                            )
+                            try:
+                                q50_loss = loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.50)
+                                q50_loss = _as_float(q50_loss, 0.0)
+                            except Exception:
+                                q50_loss = 0.0
+                            
+                            try:
+                                margin_vs_market = _as_float(p_side, 0.5) - (1.0 / max(1e-9, _as_float(r_hat, 1.9)))
+                            except Exception:
+                                margin_vs_market = 0.0
+                            
+                            try:
+                                p_thr_ev = p_thr_from_ev(
+                                    r_hat=_as_float(r_hat, 1.9),
+                                    stake=max(1e-9, _as_float(stake, 0.001)),
+                                    gb_hat=_as_float(gb_hat, 0.0),
+                                    gc_hat=_as_float(gc_hat, 0.0),
+                                    delta=_as_float(delta_eff, 0.0)
+                                )
+                                p_thr_ev = _as_float(p_thr_ev, 0.51)
+                            except Exception as e:
+                                print(f"[ev_gate] p_thr_from_ev failed: {e}")
+                                p_thr_ev = 0.51
                             
                             # p_thr для совместимости: p_thr + δ = p_thr_ev
                             p_thr = float(max(0.0, p_thr_ev - float(delta_eff)))
@@ -5793,12 +5845,16 @@ def main_loop():
                     gas_claim_bnb = 0.0
 
                     bet_up = bool(b.get("bet_up", False))
-                    stake = float(b.get("stake", 0.0))
-                    gas_bet_bnb = float(b.get("gas_bet_bnb", 0.0))
+                    stake = _as_float(b.get("stake", 0.0), 0.0)
+                    gas_bet_bnb = _as_float(b.get("gas_bet_bnb", 0.0), 0.0)
 
-                    up_won = rd.close_price > rd.lock_price
-                    down_won = rd.close_price < rd.lock_price
-                    draw = rd.close_price == rd.lock_price
+                    # Безопасный доступ к атрибутам rd с защитой от None
+                    lock_price = _as_float(getattr(rd, "lock_price", None), 0.0)
+                    close_price = _as_float(getattr(rd, "close_price", None), 0.0)
+
+                    up_won = close_price > lock_price
+                    down_won = close_price < lock_price
+                    draw = close_price == lock_price
 
                     if NN_USE and logreg is not None and (not draw) and ("phi" in b):
                         try:
@@ -5809,15 +5865,18 @@ def main_loop():
 
                     capital_before = capital
                     if draw:
-                        gas_claim_bnb = GAS_USED_CLAIM * gas_price_claim_wei / 1e18
+                        gas_claim_bnb = _as_float(GAS_USED_CLAIM * gas_price_claim_wei / 1e18, 0.0)
                         capital -= (gas_bet_bnb + gas_claim_bnb)
                         pnl = -(gas_bet_bnb + gas_claim_bnb)
                         outcome = "draw"
                     else:
-                        ratio = rd.payout_ratio if rd.payout_ratio else 1.9
+                        ratio = _as_float(getattr(rd, "payout_ratio", None), 1.9)
+                        if ratio <= 1.0:
+                            ratio = 1.9
+                        
                         if (bet_up and up_won) or ((not bet_up) and down_won):
                             profit = stake * (ratio - 1.0)
-                            gas_claim_bnb = GAS_USED_CLAIM * gas_price_claim_wei / 1e18
+                            gas_claim_bnb = _as_float(GAS_USED_CLAIM * gas_price_claim_wei / 1e18, 0.0)
                             capital += profit
                             capital -= (gas_bet_bnb + gas_claim_bnb)
                             pnl = profit - (gas_bet_bnb + gas_claim_bnb)
