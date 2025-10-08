@@ -377,7 +377,7 @@ BINANCE_LIMIT = 1000
 CSV_PATH = "trades_prediction.csv"
 DELTA_STATE_PATH = "delta_state.json"   # ← новое
 CSV_SHADOW_PATH = "trades_shadow.csv"   # ← добавили здесь (нужно при init DeltaDaily)
-
+MIN_TRADES_FOR_DELTA = 50  # Минимум сделок для расчета delta
 
 # Анти-спам/таймаут ожидания oracleCalled
 MAX_WAIT_POLLS = 20
@@ -5667,6 +5667,21 @@ def _prune_bets(bets: Dict[int, Dict], keep_settled_last: int = 500, keep_other_
     for e in to_drop2:
         bets.pop(e, None)
 
+def _settled_trades_count(csv_path: str) -> int:
+    """Подсчет количества завершенных сделок в CSV."""
+    try:
+        if not os.path.exists(csv_path):
+            return 0
+        df = pd.read_csv(csv_path)
+        # Считаем только сделки с результатом (settled=1 или has payout_ratio)
+        if "settled" in df.columns:
+            return int(df[df["settled"] == 1].shape[0])
+        elif "payout_ratio" in df.columns:
+            return int(df[df["payout_ratio"].notna()].shape[0])
+        else:
+            return len(df)
+    except Exception:
+        return 0
 
 # =============================
 # ГЛАВНЫЙ ЦИКЛ (с ансамблем)
@@ -5689,13 +5704,17 @@ def main_loop():
         pass
         # === δ: суточный подбор по последним 100 сделкам ===
     try:
+        # Проверяем количество доступных сделок
+        n_trades = _settled_trades_count(CSV_PATH)
+        
         delta_daily = DeltaDaily(csv_path=CSV_PATH, state_path=DELTA_STATE_PATH,
-                                n_last=100, grid_start=0.000, grid_stop=0.100, grid_step=0.005,
+                                n_last=min(100, n_trades),  # Не больше чем есть сделок
+                                grid_start=0.000, grid_stop=0.100, grid_step=0.005,
                                 csv_shadow_path=CSV_SHADOW_PATH,
                                 window_hours=24,
                                 opt_mode="dr_lcb")  # ✳️ анализируем последние 24 часа
         st = delta_daily.load_or_recompute_every_hours(period_hours=4)
-        n_trades = _settled_trades_count(CSV_PATH)
+        
         if st and isinstance(st.get("delta"), (int, float)):
             if n_trades < MIN_TRADES_FOR_DELTA:
                 DELTA_PROTECT = 0.0
@@ -5708,11 +5727,19 @@ def main_loop():
                 DELTA_PROTECT = float(st["delta"])
                 method = str(st.get("method","?")).lower()
                 if method == "dr_lcb":
+                    # Проверяем наличие lcb15 в правильном формате
+                    lcb_value = st.get('lcb15', 0.0)
+                    # Защита от -1e9 при выводе
+                    if lcb_value < -1000:
+                        lcb_str = "N/A"
+                    else:
+                        lcb_str = f"{lcb_value:.6f}"
+                    
                     print(
                         "[delta] startup(4h/24h): "
                         f"δ={DELTA_PROTECT:.3f} | method=DR-LCB | p_opt={st.get('p_thr_opt', float('nan')):.4f} | "
                         f"N={st.get('sample_size','?')}, picked={st.get('selected_n','?')} | "
-                        f"LCB15={st.get('lcb15', st.get('lcb5', float('nan'))):.6f} | window={st.get('window_hours','?')}h"
+                        f"LCB15={lcb_str} | window={st.get('window_hours','?')}h"
                     )
                 elif method == "grid_pnl":
                     print(
@@ -6167,15 +6194,9 @@ def main_loop():
                                             
                                             notify_ens_used(None, None, None, None, None, None, False, meta.mode)
                                             continue
-                                    
-                                    # === DEBUG: если НЕ попали под cooling ===
-                                    elif losses >= 3:
-                                        print(f"[cool] NO cooling: {losses}/5 losses, "
-                                            f"but avg_edge={avg_loss_edge:.3f} < 0.03 (marginal bets)")
                                 
                         except Exception as e:
                             print(f"[cool] check failed: {e}")
-                            log_exception("[cool] Cooling period check error")  # для errors.log
                     
                     # --- стадия принятия решения
                     if epoch == cur and now < rd.lock_ts:
