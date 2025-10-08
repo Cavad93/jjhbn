@@ -3865,6 +3865,22 @@ class RiverARFExpert(_BaseExpert):
 
         self._load_all()
 
+    def _ensure_dim(self, x_raw: np.ndarray):
+        """Проверяет и обновляет размерность признаков при необходимости"""
+        d = int(x_raw.reshape(1, -1).shape[1])
+        if self.n_feats is None:
+            self.n_feats = d
+        elif self.n_feats != d:
+            # смена размерности - сбрасываем модель
+            self.n_feats = d
+            self.clf = None
+            if self.enabled:
+                try:
+                    self.clf = river_forest.ARFClassifier(n_models=self.cfg.arf_n_models, seed=42)
+                except Exception:
+                    self.clf = None
+                    self.enabled = False
+
     def _load_all(self):
         try:
             if os.path.exists(self.cfg.arf_state_path):
