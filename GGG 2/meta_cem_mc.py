@@ -78,11 +78,11 @@ except Exception:
         os.replace(tmp, path)
 
 # Извлечение фазы из контекста
+# фазы/контекст
 try:
     from meta_ctx import phase_from_ctx
 except Exception:
     def phase_from_ctx(ctx: Optional[dict]) -> int:
-        """Fallback: извлекаем фазу из контекста или возвращаем 0"""
         return int(ctx.get("phase", 0) if isinstance(ctx, dict) else 0)
 
 # River ADWIN для drift detection
