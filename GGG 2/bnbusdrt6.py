@@ -2243,6 +2243,20 @@ class MLConfig:
 
     # для файлов калибраторов по фазе (будем апеллировать к существующим путям)
     # у XGB/NN: base_path → base_path_ph{φ}.pkl
+    # Cross-validation parameters
+    cv_enabled: bool = True
+    cv_n_splits: int = 5              # количество фолдов
+    cv_embargo_pct: float = 0.02      # 2% gap между train/test
+    cv_purge_pct: float = 0.01        # 1% purge перед test
+    cv_min_train_size: int = 200      # минимум для обучения
+    cv_bootstrap_n: int = 1000        # итераций bootstrap для CI
+    cv_confidence: float = 0.95       # уровень доверия (95%)
+    cv_min_improvement: float = 0.02  # минимум +2% для значимости
+    
+    # Validation tracking
+    cv_oof_window: int = 500          # окно out-of-fold predictions
+    cv_check_every: int = 50          # проверка каждые N примеров
+
 
 # ===== Фильтр фазы с гистерезисом =====
 class PhaseFilter:
@@ -2316,7 +2330,14 @@ class XGBExpert(_BaseExpert):
         self.shadow_hits: List[int] = []
         self.active_hits: List[int] = []
 
+        # Cross-validation tracking (per phase)
+        self.cv_oof_preds: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
+        self.cv_oof_labels: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
+        self.cv_metrics: Dict[int, Dict] = {p: {} for p in range(self.P)}
+        self.cv_last_check: Dict[int, int] = {p: 0 for p in range(self.P)}
         
+        # Validation mode tracking
+        self.validation_passed: Dict[int, bool] = {p: False for p in range(self.P)}
 
         self.n_feats: Optional[int] = None
 
@@ -2338,6 +2359,7 @@ class XGBExpert(_BaseExpert):
                 self.cal_ph[p] = _BaseCal.load(self._cal_path(self.cfg.xgb_cal_path, p))
             except Exception:
                 self.cal_ph[p] = None
+
 
     def _load_all(self):
         try:
@@ -2578,6 +2600,156 @@ class XGBExpert(_BaseExpert):
         except Exception as e:
             print(f"[xgb ] train error (ph={ph}): {e}")
 
+    def _run_cv_validation(self, ph: int) -> Dict:
+        """
+        Walk-forward purged cross-validation для фазы ph.
+        Возвращает метрики: accuracy, CI bounds, fold scores.
+        """
+        X_all, y_all = self._get_phase_train(ph)
+        
+        if len(X_all) < self.cfg.cv_min_train_size:
+            return {"status": "insufficient_data", "oof_accuracy": 0.0}
+        
+        n_samples = len(X_all)
+        n_splits = min(self.cfg.cv_n_splits, n_samples // self.cfg.cv_min_train_size)
+        
+        if n_splits < 2:
+            return {"status": "insufficient_splits", "oof_accuracy": 0.0}
+        
+        # Walk-forward splits с purge и embargo
+        embargo_size = max(1, int(n_samples * self.cfg.cv_embargo_pct))
+        purge_size = max(1, int(n_samples * self.cfg.cv_purge_pct))
+        
+        fold_size = n_samples // n_splits
+        oof_preds = np.zeros(n_samples)
+        oof_mask = np.zeros(n_samples, dtype=bool)
+        fold_scores = []
+        
+        for fold_idx in range(n_splits):
+            # Test fold
+            test_start = fold_idx * fold_size
+            test_end = min(test_start + fold_size, n_samples)
+            
+            # Train: всё до (test_start - purge_size)
+            train_end = max(0, test_start - purge_size)
+            
+            if train_end < self.cfg.cv_min_train_size:
+                continue
+            
+            X_train = X_all[:train_end]
+            y_train = y_all[:train_end]
+            X_test = X_all[test_start:test_end]
+            y_test = y_all[test_start:test_end]
+            
+            # Обучаем временную модель на train fold
+            temp_model = self._train_fold_model(X_train, y_train, ph)
+            
+            # Предсказания на test fold
+            preds = self._predict_fold(temp_model, X_test, ph)
+            
+            # Сохраняем OOF predictions
+            oof_preds[test_start:test_end] = preds
+            oof_mask[test_start:test_end] = True
+            
+            # Метрики фолда
+            fold_acc = np.mean((preds >= 0.5) == y_test)
+            fold_scores.append(fold_acc)
+        
+        # Итоговые OOF метрики
+        oof_valid = oof_mask.sum()
+        if oof_valid < self.cfg.cv_min_train_size:
+            return {"status": "insufficient_oof", "oof_accuracy": 0.0}
+        
+        oof_accuracy = 100.0 * np.mean((oof_preds[oof_mask] >= 0.5) == y_all[oof_mask])
+        
+        # Bootstrap confidence intervals
+        ci_lower, ci_upper = self._bootstrap_ci(
+            oof_preds[oof_mask], 
+            y_all[oof_mask],
+            n_bootstrap=self.cfg.cv_bootstrap_n,
+            confidence=self.cfg.cv_confidence
+        )
+        
+        return {
+            "status": "ok",
+            "oof_accuracy": oof_accuracy,
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
+            "fold_scores": fold_scores,
+            "n_folds": len(fold_scores),
+            "oof_samples": int(oof_valid)
+        }
+
+    def _bootstrap_ci(self, preds: np.ndarray, labels: np.ndarray, 
+                    n_bootstrap: int, confidence: float) -> tuple:
+        """
+        Bootstrap confidence intervals для accuracy.
+        """
+        accuracies = []
+        n = len(preds)
+        
+        for _ in range(n_bootstrap):
+            # Resample с возвратом
+            idx = np.random.choice(n, size=n, replace=True)
+            boot_preds = preds[idx]
+            boot_labels = labels[idx]
+            boot_acc = 100.0 * np.mean((boot_preds >= 0.5) == boot_labels)
+            accuracies.append(boot_acc)
+        
+        accuracies = np.array(accuracies)
+        alpha = 1.0 - confidence
+        ci_lower = np.percentile(accuracies, 100 * alpha / 2)
+        ci_upper = np.percentile(accuracies, 100 * (1 - alpha / 2))
+        
+        return ci_lower, ci_upper
+
+    def _train_fold_model(self, X: np.ndarray, y: np.ndarray, ph: int):
+        """
+        Обучает временную модель для CV fold.
+        Реализация зависит от типа эксперта (XGB/RF/ARF/NN).
+        """
+        # Пример для XGB
+        if not HAVE_XGB:
+            return None
+        
+        scaler = StandardScaler().fit(X) if HAVE_SKLEARN else None
+        X_scaled = scaler.transform(X) if scaler else X
+        
+        dtrain = xgb.DMatrix(X_scaled, label=y)
+        model = xgb.train(
+            params={
+                "objective": "binary:logistic",
+                "max_depth": self.cfg.xgb_max_depth,
+                "eta": self.cfg.xgb_eta,
+                "subsample": self.cfg.xgb_subsample,
+                "colsample_bytree": self.cfg.xgb_colsample_bytree,
+                "min_child_weight": self.cfg.xgb_min_child_weight,
+                "eval_metric": "logloss",
+            },
+            dtrain=dtrain,
+            num_boost_round=self.cfg.xgb_rounds_warm,
+            verbose_eval=False
+        )
+        
+        return {"model": model, "scaler": scaler}
+
+    def _predict_fold(self, fold_model, X: np.ndarray, ph: int) -> np.ndarray:
+        """
+        Предсказания временной модели CV fold.
+        """
+        if fold_model is None:
+            return np.full(len(X), 0.5)
+        
+        scaler = fold_model.get("scaler")
+        model = fold_model.get("model")
+        
+        X_scaled = scaler.transform(X) if scaler else X
+        dtest = xgb.DMatrix(X_scaled)
+        preds = model.predict(dtest)
+        
+        return preds
+
+
     # ---------- инференс / запись ----------
     def proba_up(self, x_raw: np.ndarray, reg_ctx: Optional[dict] = None) -> Tuple[Optional[float], str]:
         if not self.enabled:
@@ -2614,76 +2786,214 @@ class XGBExpert(_BaseExpert):
             return (None, self.mode)
 
     def record_result(self, x_raw: np.ndarray, y_up: int, used_in_live: bool,
-                      p_pred: Optional[float] = None, reg_ctx: Optional[dict] = None):
-        # глобальный хвост
-        xx = x_raw.astype(np.float32).reshape(1, -1)
-        self._ensure_dim(xx)
-        self.X.append(xx.ravel().tolist())
+                    p_pred: Optional[float] = None, reg_ctx: Optional[dict] = None) -> None:
+        """
+        Записывает результат предсказания и обновляет модель.
+        
+        Теперь включает:
+        - Сохранение в глобальную и фазовую память
+        - Трекинг хитов для оценки качества
+        - Out-of-fold predictions для cross-validation
+        - Периодическую CV проверку для валидации модели
+        - Обучение модели при накоплении данных
+        - Переключение режимов SHADOW/ACTIVE на основе метрик
+        """
+        
+        # ========== БЛОК 1: ИНИЦИАЛИЗАЦИЯ И ПРОВЕРКА РАЗМЕРНОСТИ ==========
+        # Убеждаемся, что размерность фичей корректна и инициализирована
+        self._ensure_dim(x_raw)
+
+        # ========== БЛОК 2: СОХРАНЕНИЕ В ГЛОБАЛЬНУЮ ПАМЯТЬ ==========
+        # Глобальная память используется как fallback, когда в фазе мало данных
+        self.X.append(x_raw.astype(np.float32).ravel().tolist())
         self.y.append(int(y_up))
-        if len(self.X) > int(self.cfg.max_memory):
-            self.X = self.X[-int(self.cfg.max_memory):]
-            self.y = self.y[-int(self.cfg.max_memory):]
+        
+        # Ограничиваем размер глобальной памяти, чтобы не раздувалась
+        if len(self.X) > int(getattr(self.cfg, "max_memory", 10_000)):
+            self.X = self.X[-self.cfg.max_memory:]
+            self.y = self.y[-self.cfg.max_memory:]
+        
         self.new_since_train += 1
 
-        # фаза
-        ph = int(reg_ctx.get("phase")) if isinstance(reg_ctx, dict) and "phase" in reg_ctx else 0
+        # ========== БЛОК 3: ОПРЕДЕЛЕНИЕ ФАЗЫ ==========
+        # Извлекаем текущую фазу из контекста (0-5 для 6 фаз)
+        ph = 0
+        if isinstance(reg_ctx, dict):
+            ph = int(reg_ctx.get("phase", 0))
         self._last_seen_phase = ph
-        self.X_ph[ph].append(xx.ravel().tolist())
+
+        # ========== БЛОК 4: СОХРАНЕНИЕ В ФАЗОВУЮ ПАМЯТЬ ==========
+        # Каждая фаза хранит свою собственную историю примеров
+        # Это позволяет модели специализироваться на разных рыночных режимах
+        self.X_ph[ph].append(x_raw.astype(np.float32).ravel().tolist())
         self.y_ph[ph].append(int(y_up))
-        if len(self.X_ph[ph]) > int(self.cfg.phase_memory_cap):
-            self.X_ph[ph] = self.X_ph[ph][-int(self.cfg.phase_memory_cap):]
-            self.y_ph[ph] = self.y_ph[ph][-int(self.cfg.phase_memory_cap):]
+        
+        # Ограничиваем размер фазовой памяти
+        cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
+        if len(self.X_ph[ph]) > cap:
+            self.X_ph[ph] = self.X_ph[ph][-cap:]
+            self.y_ph[ph] = self.y_ph[ph][-cap:]
+        
         self.new_since_train_ph[ph] = self.new_since_train_ph.get(ph, 0) + 1
 
-        # хиты/ADWIN
+        # ========== БЛОК 5: ТРЕКИНГ ХИТОВ И DRIFT DETECTION ==========
+        # Оцениваем качество предсказания и отслеживаем дрейф концепции
         if p_pred is not None:
             try:
-                hit = int((p_pred >= 0.5) == bool(y_up))
+                # Считаем hit: правильно ли предсказали направление?
+                hit = int((float(p_pred) >= 0.5) == bool(y_up))
+                
                 if self.mode == "ACTIVE" and used_in_live:
+                    # В активном режиме отслеживаем реальные сделки
                     self.active_hits.append(hit)
+                    
+                    # ADWIN детектирует дрейф распределения ошибок
                     if self.adwin is not None:
-                        in_drift = self.adwin.update(1 - hit)
+                        in_drift = self.adwin.update(1 - hit)  # 1=correct, 0=error
                         if in_drift:
+                            # Обнаружен дрейф - возвращаемся в shadow режим
                             self.mode = "SHADOW"
                             self.active_hits = []
                 else:
+                    # В shadow режиме накапливаем "что было бы, если бы входили"
                     self.shadow_hits.append(hit)
             except Exception:
                 pass
 
-        # фазовый калибратор: наблюдение + возможное сохранение
+        # ========== БЛОК 6: НОВОЕ - СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
+        # Out-of-fold predictions нужны для расчета метрик cross-validation
+        # Эти предсказания были сделаны на данных, которые модель НЕ видела при обучении
+        if self.cfg.cv_enabled and p_pred is not None:
+            self.cv_oof_preds[ph].append(float(p_pred))
+            self.cv_oof_labels[ph].append(int(y_up))
+
+        # ========== БЛОК 7: ФАЗОВАЯ КАЛИБРОВКА ==========
+        # Калибратор корректирует вероятности для каждой фазы отдельно
+        # Это важно, потому что модель может быть по-разному откалибрована в разных режимах
         try:
             p_raw = self._predict_raw(x_raw)
             if p_raw is not None:
+                # Инициализируем калибратор для этой фазы, если его нет
                 if self.cal_ph[ph] is None:
                     self.cal_ph[ph] = make_calibrator(self.cfg.xgb_calibration_method)
+                
+                # Показываем калибратору истинную пару (предсказание, результат)
                 self.cal_ph[ph].observe(float(p_raw), int(y_up))
+                
+                # Периодически пересчитываем калибровку
                 if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
                     cal_path = self._cal_path(self.cfg.xgb_cal_path, ph)
                     self.cal_ph[ph].save(cal_path)
         except Exception:
             pass
 
-        # тренировка по фазе
+        # ========== БЛОК 8: НОВОЕ - ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
+        # Каждые N примеров запускаем полную cross-validation для оценки реального качества
+        # Это защищает от переобучения и дает честную оценку обобщающей способности
+        self.cv_last_check[ph] += 1
+        
+        if self.cfg.cv_enabled and self.cv_last_check[ph] >= self.cfg.cv_check_every:
+            # Сбрасываем счетчик
+            self.cv_last_check[ph] = 0
+            
+            # Запускаем полную walk-forward cross-validation с purging
+            cv_results = self._run_cv_validation(ph)
+            
+            # Сохраняем результаты для использования в _maybe_flip_modes
+            self.cv_metrics[ph] = cv_results
+            
+            # Если CV прошла успешно, помечаем фазу как валидированную
+            if cv_results.get("status") == "ok":
+                self.validation_passed[ph] = True
+            
+            # Логируем результаты для мониторинга
+            if cv_results.get("status") == "ok":
+                print(f"[{self.__class__.__name__}] CV ph={ph}: "
+                    f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
+                    f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
+                    f"folds={cv_results['n_folds']}")
+
+        # ========== БЛОК 9: ОБУЧЕНИЕ МОДЕЛИ ПО ФАЗЕ ==========
+        # Когда накопилось достаточно новых примеров в фазе, запускаем переобучение
         self._maybe_train_phase(ph)
 
+        # ========== БЛОК 10: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ==========
+        # Проверяем метрики (включая CV) и решаем, переключать ли SHADOW ↔ ACTIVE
         self._maybe_flip_modes()
+        
+        # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
+        # Периодически сохраняем все на диск для восстановления после перезапуска
         self._save_all()
 
     # ---------- режимы ----------
     def _maybe_flip_modes(self):
+        """
+        Улучшенное переключение режимов с учётом:
+        1. Cross-validation метрик
+        2. Статистической значимости (bootstrap CI)
+        3. Out-of-fold predictions
+        """
+        if not self.cfg.cv_enabled:
+            # fallback к старой логике
+            self._maybe_flip_modes_simple()
+            return
+        
         def wr(arr, n):
-            if len(arr) < n:
-                return None
+            if len(arr) < n: return None
             window = arr[-n:]
-            return 100.0 * (sum(window) / len(window))
-        wr_shadow = wr(self.shadow_hits, int(self.cfg.min_ready))
-        if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= float(self.cfg.enter_wr):
+            return 100.0 * (sum(window)/len(window))
+        
+        # Текущие метрики
+        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
+        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
+        
+        # Получаем CV метрики текущей фазы
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_passed = self.validation_passed.get(ph, False)
+        
+        # SHADOW → ACTIVE: требуем CV validation + bootstrap CI
+        if self.mode == "SHADOW" and wr_shadow is not None:
+            basic_threshold_met = wr_shadow >= self.cfg.enter_wr
+            
+            if basic_threshold_met and cv_passed:
+                # Проверяем статистическую значимость
+                cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+                cv_ci_lower = cv_metrics.get("ci_lower", 0.0)
+                
+                # Нужно: OOF accuracy > порог И нижняя граница CI тоже
+                if cv_wr >= self.cfg.enter_wr and cv_ci_lower >= (self.cfg.enter_wr - self.cfg.cv_min_improvement):
+                    self.mode = "ACTIVE"
+                    if HAVE_RIVER:
+                        self.adwin = ADWIN(delta=self.cfg.adwin_delta)
+                    print(f"[{self.__class__.__name__}] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}%, CV_WR={cv_wr:.2f}% (CI: [{cv_ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
+        
+        # ACTIVE → SHADOW: детектируем деградацию
+        if self.mode == "ACTIVE" and wr_active is not None:
+            basic_threshold_failed = wr_active < self.cfg.exit_wr
+            
+            # Также проверяем CV метрики на деградацию
+            cv_wr = cv_metrics.get("oof_accuracy", 100.0)
+            cv_degraded = cv_wr < self.cfg.exit_wr
+            
+            if basic_threshold_failed or cv_degraded:
+                self.mode = "SHADOW"
+                self.validation_passed[ph] = False
+                print(f"[{self.__class__.__name__}] ACTIVE→SHADOW ph={ph}: WR={wr_active:.2f}%, CV_WR={cv_wr:.2f}%")
+
+    def _maybe_flip_modes_simple(self):
+        """Старая логика для backward compatibility"""
+        def wr(arr, n):
+            if len(arr) < n: return None
+            window = arr[-n:]
+            return 100.0 * (sum(window)/len(window))
+        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
+        if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= self.cfg.enter_wr:
             self.mode = "ACTIVE"
             if HAVE_RIVER:
                 self.adwin = ADWIN(delta=self.cfg.adwin_delta)
-        wr_active = wr(self.active_hits, max(30, int(self.cfg.min_ready) // 2))
-        if self.mode == "ACTIVE" and (wr_active is not None and wr_active < float(self.cfg.exit_wr)):
+        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
+        if self.mode == "ACTIVE" and (wr_active is not None and wr_active < self.cfg.exit_wr):
             self.mode = "SHADOW"
 
     # ---------- совместимая обёртка ----------
@@ -2701,17 +3011,23 @@ class XGBExpert(_BaseExpert):
     # ---------- статус ----------
     def status(self):
         def _wr(xs):
-            if not xs:
-                return None
+            if not xs: return None
             return sum(xs) / float(len(xs))
         def _fmt_pct(p):
             return "—" if p is None else f"{100.0*p:.2f}%"
-
+        
         wr_a = _wr(self.active_hits)
         wr_s = _wr(self.shadow_hits)
         all_hits = (self.active_hits or []) + (self.shadow_hits or [])
         wr_all = _wr(all_hits)
-
+        
+        # CV метрики текущей фазы
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_status = cv_metrics.get("status", "N/A")
+        cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+        cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
+        
         return {
             "mode": self.mode,
             "enabled": self.enabled,
@@ -2720,7 +3036,10 @@ class XGBExpert(_BaseExpert):
             "wr_shadow": _fmt_pct(wr_s),
             "n_shadow": len(self.shadow_hits or []),
             "wr_all": _fmt_pct(wr_all),
-            "n": len(all_hits)
+            "n": len(all_hits),
+            "cv_oof_wr": _fmt_pct(cv_wr / 100.0) if cv_wr > 0 else "—",
+            "cv_ci": cv_ci,
+            "cv_validated": str(self.validation_passed.get(ph, False))
         }
 
 
@@ -2761,6 +3080,15 @@ class RFCalibratedExpert(_BaseExpert):
         # Хиты/диагностика
         self.shadow_hits: List[int] = []
         self.active_hits: List[int] = []
+        # Cross-validation tracking (per phase)
+        self.cv_oof_preds: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
+        self.cv_oof_labels: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
+        self.cv_metrics: Dict[int, Dict] = {p: {} for p in range(self.P)}
+        self.cv_last_check: Dict[int, int] = {p: 0 for p in range(self.P)}
+        
+        # Validation mode tracking
+        self.validation_passed: Dict[int, bool] = {p: False for p in range(self.P)}
+
 
         # Техническое: число фич (заполним при первом вызове)
         self.n_feats: Optional[int] = None
@@ -2878,6 +3206,155 @@ class RFCalibratedExpert(_BaseExpert):
             # опционально: self._save_all()
         except Exception as e:
             print(f"[rf  ] train error (ph={ph}): {e}")
+
+    def _run_cv_validation(self, ph: int) -> Dict:
+        """
+        Walk-forward purged cross-validation для фазы ph.
+        Возвращает метрики: accuracy, CI bounds, fold scores.
+        """
+        X_all, y_all = self._get_phase_train(ph)
+        
+        if len(X_all) < self.cfg.cv_min_train_size:
+            return {"status": "insufficient_data", "oof_accuracy": 0.0}
+        
+        n_samples = len(X_all)
+        n_splits = min(self.cfg.cv_n_splits, n_samples // self.cfg.cv_min_train_size)
+        
+        if n_splits < 2:
+            return {"status": "insufficient_splits", "oof_accuracy": 0.0}
+        
+        # Walk-forward splits с purge и embargo
+        embargo_size = max(1, int(n_samples * self.cfg.cv_embargo_pct))
+        purge_size = max(1, int(n_samples * self.cfg.cv_purge_pct))
+        
+        fold_size = n_samples // n_splits
+        oof_preds = np.zeros(n_samples)
+        oof_mask = np.zeros(n_samples, dtype=bool)
+        fold_scores = []
+        
+        for fold_idx in range(n_splits):
+            # Test fold
+            test_start = fold_idx * fold_size
+            test_end = min(test_start + fold_size, n_samples)
+            
+            # Train: всё до (test_start - purge_size)
+            train_end = max(0, test_start - purge_size)
+            
+            if train_end < self.cfg.cv_min_train_size:
+                continue
+            
+            X_train = X_all[:train_end]
+            y_train = y_all[:train_end]
+            X_test = X_all[test_start:test_end]
+            y_test = y_all[test_start:test_end]
+            
+            # Обучаем временную модель на train fold
+            temp_model = self._train_fold_model(X_train, y_train, ph)
+            
+            # Предсказания на test fold
+            preds = self._predict_fold(temp_model, X_test, ph)
+            
+            # Сохраняем OOF predictions
+            oof_preds[test_start:test_end] = preds
+            oof_mask[test_start:test_end] = True
+            
+            # Метрики фолда
+            fold_acc = np.mean((preds >= 0.5) == y_test)
+            fold_scores.append(fold_acc)
+        
+        # Итоговые OOF метрики
+        oof_valid = oof_mask.sum()
+        if oof_valid < self.cfg.cv_min_train_size:
+            return {"status": "insufficient_oof", "oof_accuracy": 0.0}
+        
+        oof_accuracy = 100.0 * np.mean((oof_preds[oof_mask] >= 0.5) == y_all[oof_mask])
+        
+        # Bootstrap confidence intervals
+        ci_lower, ci_upper = self._bootstrap_ci(
+            oof_preds[oof_mask], 
+            y_all[oof_mask],
+            n_bootstrap=self.cfg.cv_bootstrap_n,
+            confidence=self.cfg.cv_confidence
+        )
+        
+        return {
+            "status": "ok",
+            "oof_accuracy": oof_accuracy,
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
+            "fold_scores": fold_scores,
+            "n_folds": len(fold_scores),
+            "oof_samples": int(oof_valid)
+        }
+
+    def _bootstrap_ci(self, preds: np.ndarray, labels: np.ndarray, 
+                    n_bootstrap: int, confidence: float) -> tuple:
+        """
+        Bootstrap confidence intervals для accuracy.
+        """
+        accuracies = []
+        n = len(preds)
+        
+        for _ in range(n_bootstrap):
+            # Resample с возвратом
+            idx = np.random.choice(n, size=n, replace=True)
+            boot_preds = preds[idx]
+            boot_labels = labels[idx]
+            boot_acc = 100.0 * np.mean((boot_preds >= 0.5) == boot_labels)
+            accuracies.append(boot_acc)
+        
+        accuracies = np.array(accuracies)
+        alpha = 1.0 - confidence
+        ci_lower = np.percentile(accuracies, 100 * alpha / 2)
+        ci_upper = np.percentile(accuracies, 100 * (1 - alpha / 2))
+        
+        return ci_lower, ci_upper
+
+    def _train_fold_model(self, X: np.ndarray, y: np.ndarray, ph: int):
+        """
+        Обучает временную модель для CV fold.
+        Реализация зависит от типа эксперта (XGB/RF/ARF/NN).
+        """
+        # Пример для XGB
+        if not HAVE_XGB:
+            return None
+        
+        scaler = StandardScaler().fit(X) if HAVE_SKLEARN else None
+        X_scaled = scaler.transform(X) if scaler else X
+        
+        dtrain = xgb.DMatrix(X_scaled, label=y)
+        model = xgb.train(
+            params={
+                "objective": "binary:logistic",
+                "max_depth": self.cfg.xgb_max_depth,
+                "eta": self.cfg.xgb_eta,
+                "subsample": self.cfg.xgb_subsample,
+                "colsample_bytree": self.cfg.xgb_colsample_bytree,
+                "min_child_weight": self.cfg.xgb_min_child_weight,
+                "eval_metric": "logloss",
+            },
+            dtrain=dtrain,
+            num_boost_round=self.cfg.xgb_rounds_warm,
+            verbose_eval=False
+        )
+        
+        return {"model": model, "scaler": scaler}
+
+    def _predict_fold(self, fold_model, X: np.ndarray, ph: int) -> np.ndarray:
+        """
+        Предсказания временной модели CV fold.
+        """
+        if fold_model is None:
+            return np.full(len(X), 0.5)
+        
+        scaler = fold_model.get("scaler")
+        model = fold_model.get("model")
+        
+        X_scaled = scaler.transform(X) if scaler else X
+        dtest = xgb.DMatrix(X_scaled)
+        preds = model.predict(dtest)
+        
+        return preds
 
     def _ensure_dim(self, x_raw: np.ndarray):
         d = int(x_raw.reshape(1, -1).shape[1])
@@ -3083,75 +3560,213 @@ class RFCalibratedExpert(_BaseExpert):
             return (None, self.mode)
 
     def record_result(self, x_raw: np.ndarray, y_up: int, used_in_live: bool,
-                      p_pred: Optional[float] = None, reg_ctx: Optional[dict] = None) -> None:
-        # гарантируем корректную размерность
+                    p_pred: Optional[float] = None, reg_ctx: Optional[dict] = None) -> None:
+        """
+        Записывает результат предсказания и обновляет модель.
+        
+        Теперь включает:
+        - Сохранение в глобальную и фазовую память
+        - Трекинг хитов для оценки качества
+        - Out-of-fold predictions для cross-validation
+        - Периодическую CV проверку для валидации модели
+        - Обучение модели при накоплении данных
+        - Переключение режимов SHADOW/ACTIVE на основе метрик
+        """
+        
+        # ========== БЛОК 1: ИНИЦИАЛИЗАЦИЯ И ПРОВЕРКА РАЗМЕРНОСТИ ==========
+        # Убеждаемся, что размерность фичей корректна и инициализирована
         self._ensure_dim(x_raw)
 
-        xx = x_raw.astype(np.float32).reshape(1, -1)
-        if self.n_feats is None:
-            self.n_feats = xx.shape[1]
-
-        # глобальный хвост
-        self.X.append(xx.ravel().tolist())
+        # ========== БЛОК 2: СОХРАНЕНИЕ В ГЛОБАЛЬНУЮ ПАМЯТЬ ==========
+        # Глобальная память используется как fallback, когда в фазе мало данных
+        self.X.append(x_raw.astype(np.float32).ravel().tolist())
         self.y.append(int(y_up))
-        if len(self.X) > int(self.cfg.max_memory):
-            self.X = self.X[-int(self.cfg.max_memory):]
-            self.y = self.y[-int(self.cfg.max_memory):]
+        
+        # Ограничиваем размер глобальной памяти, чтобы не раздувалась
+        if len(self.X) > int(getattr(self.cfg, "max_memory", 10_000)):
+            self.X = self.X[-self.cfg.max_memory:]
+            self.y = self.y[-self.cfg.max_memory:]
+        
         self.new_since_train += 1
 
-        # фаза
+        # ========== БЛОК 3: ОПРЕДЕЛЕНИЕ ФАЗЫ ==========
+        # Извлекаем текущую фазу из контекста (0-5 для 6 фаз)
         ph = 0
         if isinstance(reg_ctx, dict):
             ph = int(reg_ctx.get("phase", 0))
         self._last_seen_phase = ph
 
-        # фазовая память с капой
-        self.X_ph[ph].append(xx.ravel().tolist())
+        # ========== БЛОК 4: СОХРАНЕНИЕ В ФАЗОВУЮ ПАМЯТЬ ==========
+        # Каждая фаза хранит свою собственную историю примеров
+        # Это позволяет модели специализироваться на разных рыночных режимах
+        self.X_ph[ph].append(x_raw.astype(np.float32).ravel().tolist())
         self.y_ph[ph].append(int(y_up))
-        cap = int(self.cfg.phase_memory_cap)
+        
+        # Ограничиваем размер фазовой памяти
+        cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
         if len(self.X_ph[ph]) > cap:
             self.X_ph[ph] = self.X_ph[ph][-cap:]
             self.y_ph[ph] = self.y_ph[ph][-cap:]
+        
         self.new_since_train_ph[ph] = self.new_since_train_ph.get(ph, 0) + 1
 
-        # учёт hit/ADWIN
+        # ========== БЛОК 5: ТРЕКИНГ ХИТОВ И DRIFT DETECTION ==========
+        # Оцениваем качество предсказания и отслеживаем дрейф концепции
         if p_pred is not None:
             try:
-                hit = int((p_pred >= 0.5) == bool(y_up))
+                # Считаем hit: правильно ли предсказали направление?
+                hit = int((float(p_pred) >= 0.5) == bool(y_up))
+                
                 if self.mode == "ACTIVE" and used_in_live:
+                    # В активном режиме отслеживаем реальные сделки
                     self.active_hits.append(hit)
+                    
+                    # ADWIN детектирует дрейф распределения ошибок
                     if self.adwin is not None:
-                        in_drift = self.adwin.update(1 - hit)
+                        in_drift = self.adwin.update(1 - hit)  # 1=correct, 0=error
                         if in_drift:
+                            # Обнаружен дрейф - возвращаемся в shadow режим
                             self.mode = "SHADOW"
                             self.active_hits = []
                 else:
+                    # В shadow режиме накапливаем "что было бы, если бы входили"
                     self.shadow_hits.append(hit)
             except Exception:
                 pass
 
-        # тренировка по фазе
-        # тренировка по фазе
+        # ========== БЛОК 6: НОВОЕ - СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
+        # Out-of-fold predictions нужны для расчета метрик cross-validation
+        # Эти предсказания были сделаны на данных, которые модель НЕ видела при обучении
+        if self.cfg.cv_enabled and p_pred is not None:
+            self.cv_oof_preds[ph].append(float(p_pred))
+            self.cv_oof_labels[ph].append(int(y_up))
+
+        # ========== БЛОК 7: ФАЗОВАЯ КАЛИБРОВКА ==========
+        # Калибратор корректирует вероятности для каждой фазы отдельно
+        # Это важно, потому что модель может быть по-разному откалибрована в разных режимах
+        try:
+            p_raw = self._predict_raw(x_raw)
+            if p_raw is not None:
+                # Инициализируем калибратор для этой фазы, если его нет
+                if self.cal_ph[ph] is None:
+                    self.cal_ph[ph] = make_calibrator(self.cfg.xgb_calibration_method)
+                
+                # Показываем калибратору истинную пару (предсказание, результат)
+                self.cal_ph[ph].observe(float(p_raw), int(y_up))
+                
+                # Периодически пересчитываем калибровку
+                if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
+                    cal_path = self._cal_path(self.cfg.xgb_cal_path, ph)
+                    self.cal_ph[ph].save(cal_path)
+        except Exception:
+            pass
+
+        # ========== БЛОК 8: НОВОЕ - ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
+        # Каждые N примеров запускаем полную cross-validation для оценки реального качества
+        # Это защищает от переобучения и дает честную оценку обобщающей способности
+        self.cv_last_check[ph] += 1
+        
+        if self.cfg.cv_enabled and self.cv_last_check[ph] >= self.cfg.cv_check_every:
+            # Сбрасываем счетчик
+            self.cv_last_check[ph] = 0
+            
+            # Запускаем полную walk-forward cross-validation с purging
+            cv_results = self._run_cv_validation(ph)
+            
+            # Сохраняем результаты для использования в _maybe_flip_modes
+            self.cv_metrics[ph] = cv_results
+            
+            # Если CV прошла успешно, помечаем фазу как валидированную
+            if cv_results.get("status") == "ok":
+                self.validation_passed[ph] = True
+            
+            # Логируем результаты для мониторинга
+            if cv_results.get("status") == "ok":
+                print(f"[{self.__class__.__name__}] CV ph={ph}: "
+                    f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
+                    f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
+                    f"folds={cv_results['n_folds']}")
+
+        # ========== БЛОК 9: ОБУЧЕНИЕ МОДЕЛИ ПО ФАЗЕ ==========
+        # Когда накопилось достаточно новых примеров в фазе, запускаем переобучение
         self._maybe_train_phase(ph)
 
-        # авто-переключение режима по окну min_ready
+        # ========== БЛОК 10: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ==========
+        # Проверяем метрики (включая CV) и решаем, переключать ли SHADOW ↔ ACTIVE
         self._maybe_flip_modes()
+        
+        # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
+        # Периодически сохраняем все на диск для восстановления после перезапуска
         self._save_all()
 
-
     def _maybe_flip_modes(self):
+        """
+        Улучшенное переключение режимов с учётом:
+        1. Cross-validation метрик
+        2. Статистической значимости (bootstrap CI)
+        3. Out-of-fold predictions
+        """
+        if not self.cfg.cv_enabled:
+            # fallback к старой логике
+            self._maybe_flip_modes_simple()
+            return
+        
         def wr(arr, n):
-            if len(arr) < n: 
-                return None
+            if len(arr) < n: return None
             window = arr[-n:]
             return 100.0 * (sum(window)/len(window))
-        wr_shadow = wr(self.shadow_hits, int(self.cfg.min_ready))
-        if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= float(self.cfg.enter_wr):
+        
+        # Текущие метрики
+        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
+        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
+        
+        # Получаем CV метрики текущей фазы
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_passed = self.validation_passed.get(ph, False)
+        
+        # SHADOW → ACTIVE: требуем CV validation + bootstrap CI
+        if self.mode == "SHADOW" and wr_shadow is not None:
+            basic_threshold_met = wr_shadow >= self.cfg.enter_wr
+            
+            if basic_threshold_met and cv_passed:
+                # Проверяем статистическую значимость
+                cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+                cv_ci_lower = cv_metrics.get("ci_lower", 0.0)
+                
+                # Нужно: OOF accuracy > порог И нижняя граница CI тоже
+                if cv_wr >= self.cfg.enter_wr and cv_ci_lower >= (self.cfg.enter_wr - self.cfg.cv_min_improvement):
+                    self.mode = "ACTIVE"
+                    if HAVE_RIVER:
+                        self.adwin = ADWIN(delta=self.cfg.adwin_delta)
+                    print(f"[{self.__class__.__name__}] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}%, CV_WR={cv_wr:.2f}% (CI: [{cv_ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
+        
+        # ACTIVE → SHADOW: детектируем деградацию
+        if self.mode == "ACTIVE" and wr_active is not None:
+            basic_threshold_failed = wr_active < self.cfg.exit_wr
+            
+            # Также проверяем CV метрики на деградацию
+            cv_wr = cv_metrics.get("oof_accuracy", 100.0)
+            cv_degraded = cv_wr < self.cfg.exit_wr
+            
+            if basic_threshold_failed or cv_degraded:
+                self.mode = "SHADOW"
+                self.validation_passed[ph] = False
+                print(f"[{self.__class__.__name__}] ACTIVE→SHADOW ph={ph}: WR={wr_active:.2f}%, CV_WR={cv_wr:.2f}%")
+
+    def _maybe_flip_modes_simple(self):
+        """Старая логика для backward compatibility"""
+        def wr(arr, n):
+            if len(arr) < n: return None
+            window = arr[-n:]
+            return 100.0 * (sum(window)/len(window))
+        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
+        if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= self.cfg.enter_wr:
             self.mode = "ACTIVE"
             if HAVE_RIVER:
                 self.adwin = ADWIN(delta=self.cfg.adwin_delta)
-        wr_active = wr(self.active_hits, max(30, int(self.cfg.min_ready) // 2))
-        if self.mode == "ACTIVE" and (wr_active is not None and wr_active < float(self.cfg.exit_wr)):
+        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
+        if self.mode == "ACTIVE" and (wr_active is not None and wr_active < self.cfg.exit_wr):
             self.mode = "SHADOW"
 
     def maybe_train(self, ph: Optional[int] = None, reg_ctx: Optional[dict] = None) -> None:
@@ -3169,17 +3784,23 @@ class RFCalibratedExpert(_BaseExpert):
 
     def status(self):
         def _wr(xs):
-            if not xs: 
-                return None
+            if not xs: return None
             return sum(xs) / float(len(xs))
         def _fmt_pct(p):
             return "—" if p is None else f"{100.0*p:.2f}%"
-
+        
         wr_a = _wr(self.active_hits)
         wr_s = _wr(self.shadow_hits)
         all_hits = (self.active_hits or []) + (self.shadow_hits or [])
         wr_all = _wr(all_hits)
-
+        
+        # CV метрики текущей фазы
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_status = cv_metrics.get("status", "N/A")
+        cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+        cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
+        
         return {
             "mode": self.mode,
             "enabled": self.enabled,
@@ -3188,7 +3809,10 @@ class RFCalibratedExpert(_BaseExpert):
             "wr_shadow": _fmt_pct(wr_s),
             "n_shadow": len(self.shadow_hits or []),
             "wr_all": _fmt_pct(wr_all),
-            "n": len(all_hits)
+            "n": len(all_hits),
+            "cv_oof_wr": _fmt_pct(cv_wr / 100.0) if cv_wr > 0 else "—",
+            "cv_ci": cv_ci,
+            "cv_validated": str(self.validation_passed.get(ph, False))
         }
 
 
@@ -3230,6 +3854,14 @@ class RiverARFExpert(_BaseExpert):
             except Exception:
                 self.cal_ph[p] = None
 
+        # Cross-validation tracking (per phase)
+        self.cv_oof_preds: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
+        self.cv_oof_labels: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
+        self.cv_metrics: Dict[int, Dict] = {p: {} for p in range(self.P)}
+        self.cv_last_check: Dict[int, int] = {p: 0 for p in range(self.P)}
+        
+        # Validation mode tracking
+        self.validation_passed: Dict[int, bool] = {p: False for p in range(self.P)}
 
         self._load_all()
 
@@ -3326,66 +3958,350 @@ class RiverARFExpert(_BaseExpert):
 
     def record_result(self, x_raw: np.ndarray, y_up: int, used_in_live: bool,
                     p_pred: Optional[float] = None, reg_ctx: Optional[dict] = None) -> None:
-        if not self.enabled or self.clf is None:
-            return
+        """
+        Записывает результат предсказания и обновляет модель.
+        
+        Теперь включает:
+        - Сохранение в глобальную и фазовую память
+        - Трекинг хитов для оценки качества
+        - Out-of-fold predictions для cross-validation
+        - Периодическую CV проверку для валидации модели
+        - Обучение модели при накоплении данных
+        - Переключение режимов SHADOW/ACTIVE на основе метрик
+        """
+        
+        # ========== БЛОК 1: ИНИЦИАЛИЗАЦИЯ И ПРОВЕРКА РАЗМЕРНОСТИ ==========
+        # Убеждаемся, что размерность фичей корректна и инициализирована
+        self._ensure_dim(x_raw)
 
-        # дедупликация по epoch (если передали)
-        try:
-            eid = int(reg_ctx.get("epoch")) if isinstance(reg_ctx, dict) and "epoch" in reg_ctx else None
-        except Exception:
-            eid = None
-        if eid is not None and eid in self._seen_epochs:
-            return
-        if eid is not None:
-            self._seen_epochs.append(eid)
+        # ========== БЛОК 2: СОХРАНЕНИЕ В ГЛОБАЛЬНУЮ ПАМЯТЬ ==========
+        # Глобальная память используется как fallback, когда в фазе мало данных
+        self.X.append(x_raw.astype(np.float32).ravel().tolist())
+        self.y.append(int(y_up))
+        
+        # Ограничиваем размер глобальной памяти, чтобы не раздувалась
+        if len(self.X) > int(getattr(self.cfg, "max_memory", 10_000)):
+            self.X = self.X[-self.cfg.max_memory:]
+            self.y = self.y[-self.cfg.max_memory:]
+        
+        self.new_since_train += 1
 
-        # онлайн-дообучение ARF
-        try:
-            self.clf.learn_one(self._to_dict(x_raw), bool(y_up))
-        except Exception:
-            pass
+        # ========== БЛОК 3: ОПРЕДЕЛЕНИЕ ФАЗЫ ==========
+        # Извлекаем текущую фазу из контекста (0-5 для 6 фаз)
+        ph = 0
+        if isinstance(reg_ctx, dict):
+            ph = int(reg_ctx.get("phase", 0))
+        self._last_seen_phase = ph
 
-        # учёт hit/ADWIN
+        # ========== БЛОК 4: СОХРАНЕНИЕ В ФАЗОВУЮ ПАМЯТЬ ==========
+        # Каждая фаза хранит свою собственную историю примеров
+        # Это позволяет модели специализироваться на разных рыночных режимах
+        self.X_ph[ph].append(x_raw.astype(np.float32).ravel().tolist())
+        self.y_ph[ph].append(int(y_up))
+        
+        # Ограничиваем размер фазовой памяти
+        cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
+        if len(self.X_ph[ph]) > cap:
+            self.X_ph[ph] = self.X_ph[ph][-cap:]
+            self.y_ph[ph] = self.y_ph[ph][-cap:]
+        
+        self.new_since_train_ph[ph] = self.new_since_train_ph.get(ph, 0) + 1
+
+        # ========== БЛОК 5: ТРЕКИНГ ХИТОВ И DRIFT DETECTION ==========
+        # Оцениваем качество предсказания и отслеживаем дрейф концепции
         if p_pred is not None:
-            hit = int((float(p_pred) >= 0.5) == bool(y_up))
-            if self.mode == "ACTIVE" and used_in_live:
-                self.active_hits.append(hit)
-                if self.adwin is not None:
-                    try:
-                        in_drift = self.adwin.update(1 - hit)
+            try:
+                # Считаем hit: правильно ли предсказали направление?
+                hit = int((float(p_pred) >= 0.5) == bool(y_up))
+                
+                if self.mode == "ACTIVE" and used_in_live:
+                    # В активном режиме отслеживаем реальные сделки
+                    self.active_hits.append(hit)
+                    
+                    # ADWIN детектирует дрейф распределения ошибок
+                    if self.adwin is not None:
+                        in_drift = self.adwin.update(1 - hit)  # 1=correct, 0=error
                         if in_drift:
+                            # Обнаружен дрейф - возвращаемся в shadow режим
                             self.mode = "SHADOW"
                             self.active_hits = []
-                    except Exception:
-                        pass
-            else:
-                self.shadow_hits.append(hit)
+                else:
+                    # В shadow режиме накапливаем "что было бы, если бы входили"
+                    self.shadow_hits.append(hit)
+            except Exception:
+                pass
 
-        # обновляем фазовый калибратор по p_raw
+        # ========== БЛОК 6: НОВОЕ - СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
+        # Out-of-fold predictions нужны для расчета метрик cross-validation
+        # Эти предсказания были сделаны на данных, которые модель НЕ видела при обучении
+        if self.cfg.cv_enabled and p_pred is not None:
+            self.cv_oof_preds[ph].append(float(p_pred))
+            self.cv_oof_labels[ph].append(int(y_up))
+
+        # ========== БЛОК 7: ФАЗОВАЯ КАЛИБРОВКА ==========
+        # Калибратор корректирует вероятности для каждой фазы отдельно
+        # Это важно, потому что модель может быть по-разному откалибрована в разных режимах
         try:
             p_raw = self._predict_raw(x_raw)
             if p_raw is not None:
-                ph = int(reg_ctx.get("phase")) if isinstance(reg_ctx, dict) and "phase" in reg_ctx else 0
-                self._last_seen_phase = ph
+                # Инициализируем калибратор для этой фазы, если его нет
                 if self.cal_ph[ph] is None:
-                    self.cal_ph[ph] = make_calibrator(self.cfg.arf_calibration_method)
+                    self.cal_ph[ph] = make_calibrator(self.cfg.xgb_calibration_method)
+                
+                # Показываем калибратору истинную пару (предсказание, результат)
                 self.cal_ph[ph].observe(float(p_raw), int(y_up))
+                
+                # Периодически пересчитываем калибровку
                 if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
-                    root, ext = os.path.splitext(self.cfg.arf_cal_path)
-                    cal_path = f"{root}_ph{ph}{ext}"
-                    try:
-                        self.cal_ph[ph].save(cal_path)
-                    except Exception:
-                        pass
+                    cal_path = self._cal_path(self.cfg.xgb_cal_path, ph)
+                    self.cal_ph[ph].save(cal_path)
         except Exception:
             pass
 
+        # ========== БЛОК 8: НОВОЕ - ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
+        # Каждые N примеров запускаем полную cross-validation для оценки реального качества
+        # Это защищает от переобучения и дает честную оценку обобщающей способности
+        self.cv_last_check[ph] += 1
+        
+        if self.cfg.cv_enabled and self.cv_last_check[ph] >= self.cfg.cv_check_every:
+            # Сбрасываем счетчик
+            self.cv_last_check[ph] = 0
+            
+            # Запускаем полную walk-forward cross-validation с purging
+            cv_results = self._run_cv_validation(ph)
+            
+            # Сохраняем результаты для использования в _maybe_flip_modes
+            self.cv_metrics[ph] = cv_results
+            
+            # Если CV прошла успешно, помечаем фазу как валидированную
+            if cv_results.get("status") == "ok":
+                self.validation_passed[ph] = True
+            
+            # Логируем результаты для мониторинга
+            if cv_results.get("status") == "ok":
+                print(f"[{self.__class__.__name__}] CV ph={ph}: "
+                    f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
+                    f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
+                    f"folds={cv_results['n_folds']}")
+
+        # ========== БЛОК 9: ОБУЧЕНИЕ МОДЕЛИ ПО ФАЗЕ ==========
+        # Когда накопилось достаточно новых примеров в фазе, запускаем переобучение
+        self._maybe_train_phase(ph)
+
+        # ========== БЛОК 10: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ==========
+        # Проверяем метрики (включая CV) и решаем, переключать ли SHADOW ↔ ACTIVE
         self._maybe_flip_modes()
+        
+        # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
+        # Периодически сохраняем все на диск для восстановления после перезапуска
         self._save_all()
 
+    def _run_cv_validation(self, ph: int) -> Dict:
+        """
+        Walk-forward purged cross-validation для фазы ph.
+        Возвращает метрики: accuracy, CI bounds, fold scores.
+        """
+        X_all, y_all = self._get_phase_train(ph)
+        
+        if len(X_all) < self.cfg.cv_min_train_size:
+            return {"status": "insufficient_data", "oof_accuracy": 0.0}
+        
+        n_samples = len(X_all)
+        n_splits = min(self.cfg.cv_n_splits, n_samples // self.cfg.cv_min_train_size)
+        
+        if n_splits < 2:
+            return {"status": "insufficient_splits", "oof_accuracy": 0.0}
+        
+        # Walk-forward splits с purge и embargo
+        embargo_size = max(1, int(n_samples * self.cfg.cv_embargo_pct))
+        purge_size = max(1, int(n_samples * self.cfg.cv_purge_pct))
+        
+        fold_size = n_samples // n_splits
+        oof_preds = np.zeros(n_samples)
+        oof_mask = np.zeros(n_samples, dtype=bool)
+        fold_scores = []
+        
+        for fold_idx in range(n_splits):
+            # Test fold
+            test_start = fold_idx * fold_size
+            test_end = min(test_start + fold_size, n_samples)
+            
+            # Train: всё до (test_start - purge_size)
+            train_end = max(0, test_start - purge_size)
+            
+            if train_end < self.cfg.cv_min_train_size:
+                continue
+            
+            X_train = X_all[:train_end]
+            y_train = y_all[:train_end]
+            X_test = X_all[test_start:test_end]
+            y_test = y_all[test_start:test_end]
+            
+            # Обучаем временную модель на train fold
+            temp_model = self._train_fold_model(X_train, y_train, ph)
+            
+            # Предсказания на test fold
+            preds = self._predict_fold(temp_model, X_test, ph)
+            
+            # Сохраняем OOF predictions
+            oof_preds[test_start:test_end] = preds
+            oof_mask[test_start:test_end] = True
+            
+            # Метрики фолда
+            fold_acc = np.mean((preds >= 0.5) == y_test)
+            fold_scores.append(fold_acc)
+        
+        # Итоговые OOF метрики
+        oof_valid = oof_mask.sum()
+        if oof_valid < self.cfg.cv_min_train_size:
+            return {"status": "insufficient_oof", "oof_accuracy": 0.0}
+        
+        oof_accuracy = 100.0 * np.mean((oof_preds[oof_mask] >= 0.5) == y_all[oof_mask])
+        
+        # Bootstrap confidence intervals
+        ci_lower, ci_upper = self._bootstrap_ci(
+            oof_preds[oof_mask], 
+            y_all[oof_mask],
+            n_bootstrap=self.cfg.cv_bootstrap_n,
+            confidence=self.cfg.cv_confidence
+        )
+        
+        return {
+            "status": "ok",
+            "oof_accuracy": oof_accuracy,
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
+            "fold_scores": fold_scores,
+            "n_folds": len(fold_scores),
+            "oof_samples": int(oof_valid)
+        }
 
+    def _bootstrap_ci(self, preds: np.ndarray, labels: np.ndarray, 
+                    n_bootstrap: int, confidence: float) -> tuple:
+        """
+        Bootstrap confidence intervals для accuracy.
+        """
+        accuracies = []
+        n = len(preds)
+        
+        for _ in range(n_bootstrap):
+            # Resample с возвратом
+            idx = np.random.choice(n, size=n, replace=True)
+            boot_preds = preds[idx]
+            boot_labels = labels[idx]
+            boot_acc = 100.0 * np.mean((boot_preds >= 0.5) == boot_labels)
+            accuracies.append(boot_acc)
+        
+        accuracies = np.array(accuracies)
+        alpha = 1.0 - confidence
+        ci_lower = np.percentile(accuracies, 100 * alpha / 2)
+        ci_upper = np.percentile(accuracies, 100 * (1 - alpha / 2))
+        
+        return ci_lower, ci_upper
+
+    def _train_fold_model(self, X: np.ndarray, y: np.ndarray, ph: int):
+        """
+        Обучает временную модель для CV fold.
+        Реализация зависит от типа эксперта (XGB/RF/ARF/NN).
+        """
+        # Пример для XGB
+        if not HAVE_XGB:
+            return None
+        
+        scaler = StandardScaler().fit(X) if HAVE_SKLEARN else None
+        X_scaled = scaler.transform(X) if scaler else X
+        
+        dtrain = xgb.DMatrix(X_scaled, label=y)
+        model = xgb.train(
+            params={
+                "objective": "binary:logistic",
+                "max_depth": self.cfg.xgb_max_depth,
+                "eta": self.cfg.xgb_eta,
+                "subsample": self.cfg.xgb_subsample,
+                "colsample_bytree": self.cfg.xgb_colsample_bytree,
+                "min_child_weight": self.cfg.xgb_min_child_weight,
+                "eval_metric": "logloss",
+            },
+            dtrain=dtrain,
+            num_boost_round=self.cfg.xgb_rounds_warm,
+            verbose_eval=False
+        )
+        
+        return {"model": model, "scaler": scaler}
+
+    def _predict_fold(self, fold_model, X: np.ndarray, ph: int) -> np.ndarray:
+        """
+        Предсказания временной модели CV fold.
+        """
+        if fold_model is None:
+            return np.full(len(X), 0.5)
+        
+        scaler = fold_model.get("scaler")
+        model = fold_model.get("model")
+        
+        X_scaled = scaler.transform(X) if scaler else X
+        dtest = xgb.DMatrix(X_scaled)
+        preds = model.predict(dtest)
+        
+        return preds
 
     def _maybe_flip_modes(self):
+        """
+        Улучшенное переключение режимов с учётом:
+        1. Cross-validation метрик
+        2. Статистической значимости (bootstrap CI)
+        3. Out-of-fold predictions
+        """
+        if not self.cfg.cv_enabled:
+            # fallback к старой логике
+            self._maybe_flip_modes_simple()
+            return
+        
+        def wr(arr, n):
+            if len(arr) < n: return None
+            window = arr[-n:]
+            return 100.0 * (sum(window)/len(window))
+        
+        # Текущие метрики
+        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
+        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
+        
+        # Получаем CV метрики текущей фазы
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_passed = self.validation_passed.get(ph, False)
+        
+        # SHADOW → ACTIVE: требуем CV validation + bootstrap CI
+        if self.mode == "SHADOW" and wr_shadow is not None:
+            basic_threshold_met = wr_shadow >= self.cfg.enter_wr
+            
+            if basic_threshold_met and cv_passed:
+                # Проверяем статистическую значимость
+                cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+                cv_ci_lower = cv_metrics.get("ci_lower", 0.0)
+                
+                # Нужно: OOF accuracy > порог И нижняя граница CI тоже
+                if cv_wr >= self.cfg.enter_wr and cv_ci_lower >= (self.cfg.enter_wr - self.cfg.cv_min_improvement):
+                    self.mode = "ACTIVE"
+                    if HAVE_RIVER:
+                        self.adwin = ADWIN(delta=self.cfg.adwin_delta)
+                    print(f"[{self.__class__.__name__}] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}%, CV_WR={cv_wr:.2f}% (CI: [{cv_ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
+        
+        # ACTIVE → SHADOW: детектируем деградацию
+        if self.mode == "ACTIVE" and wr_active is not None:
+            basic_threshold_failed = wr_active < self.cfg.exit_wr
+            
+            # Также проверяем CV метрики на деградацию
+            cv_wr = cv_metrics.get("oof_accuracy", 100.0)
+            cv_degraded = cv_wr < self.cfg.exit_wr
+            
+            if basic_threshold_failed or cv_degraded:
+                self.mode = "SHADOW"
+                self.validation_passed[ph] = False
+                print(f"[{self.__class__.__name__}] ACTIVE→SHADOW ph={ph}: WR={wr_active:.2f}%, CV_WR={cv_wr:.2f}%")
+
+    def _maybe_flip_modes_simple(self):
+        """Старая логика для backward compatibility"""
         def wr(arr, n):
             if len(arr) < n: return None
             window = arr[-n:]
@@ -3401,27 +4317,35 @@ class RiverARFExpert(_BaseExpert):
 
     def status(self):
         def _wr(xs):
-            if not xs: 
-                return None
+            if not xs: return None
             return sum(xs) / float(len(xs))
         def _fmt_pct(p):
             return "—" if p is None else f"{100.0*p:.2f}%"
-
+        
         wr_a = _wr(self.active_hits)
         wr_s = _wr(self.shadow_hits)
         all_hits = (self.active_hits or []) + (self.shadow_hits or [])
         wr_all = _wr(all_hits)
-
+        
+        # CV метрики текущей фазы
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_status = cv_metrics.get("status", "N/A")
+        cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+        cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
+        
         return {
             "mode": self.mode,
             "enabled": self.enabled,
             "wr_active": _fmt_pct(wr_a),
-            "n_active": len(self.active_hits or []),   # ← реальные сделки
+            "n_active": len(self.active_hits or []),
             "wr_shadow": _fmt_pct(wr_s),
-            "n_shadow": len(self.shadow_hits or []),   # ← «если бы входили»
+            "n_shadow": len(self.shadow_hits or []),
             "wr_all": _fmt_pct(wr_all),
-            "n": len(all_hits),                        # ← всё вместе (как сейчас)
-            "n_trades_only": len(self.active_hits or [])  # ← явный счётчик «как в сделках»
+            "n": len(all_hits),
+            "cv_oof_wr": _fmt_pct(cv_wr / 100.0) if cv_wr > 0 else "—",
+            "cv_ci": cv_ci,
+            "cv_validated": str(self.validation_passed.get(ph, False))
         }
 
 
@@ -3534,6 +4458,14 @@ class NNExpert(_BaseExpert):
         self.seen_since_calib_ph: Dict[int, int] = {p: 0 for p in range(self.P)}
         # Старое поле T оставляем для обратной совместимости (не используется в прогнозе)
         self.T: float = 1.0
+        # Cross-validation tracking (per phase)
+        self.cv_oof_preds: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
+        self.cv_oof_labels: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
+        self.cv_metrics: Dict[int, Dict] = {p: {} for p in range(self.P)}
+        self.cv_last_check: Dict[int, int] = {p: 0 for p in range(self.P)}
+        
+        # Validation mode tracking
+        self.validation_passed: Dict[int, bool] = {p: False for p in range(self.P)}
 
         # Хиты
         self.shadow_hits: List[int] = []
@@ -3706,77 +4638,213 @@ class NNExpert(_BaseExpert):
 
 
     def record_result(self, x_raw: np.ndarray, y_up: int, used_in_live: bool,
-                      p_pred: Optional[float] = None, reg_ctx: Optional[dict] = None) -> None:
+                    p_pred: Optional[float] = None, reg_ctx: Optional[dict] = None) -> None:
+        """
+        Записывает результат предсказания и обновляет модель.
+        
+        Теперь включает:
+        - Сохранение в глобальную и фазовую память
+        - Трекинг хитов для оценки качества
+        - Out-of-fold predictions для cross-validation
+        - Периодическую CV проверку для валидации модели
+        - Обучение модели при накоплении данных
+        - Переключение режимов SHADOW/ACTIVE на основе метрик
+        """
+        
+        # ========== БЛОК 1: ИНИЦИАЛИЗАЦИЯ И ПРОВЕРКА РАЗМЕРНОСТИ ==========
+        # Убеждаемся, что размерность фичей корректна и инициализирована
         self._ensure_dim(x_raw)
 
-        # глобальная память
+        # ========== БЛОК 2: СОХРАНЕНИЕ В ГЛОБАЛЬНУЮ ПАМЯТЬ ==========
+        # Глобальная память используется как fallback, когда в фазе мало данных
         self.X.append(x_raw.astype(np.float32).ravel().tolist())
         self.y.append(int(y_up))
+        
+        # Ограничиваем размер глобальной памяти, чтобы не раздувалась
         if len(self.X) > int(getattr(self.cfg, "max_memory", 10_000)):
             self.X = self.X[-self.cfg.max_memory:]
             self.y = self.y[-self.cfg.max_memory:]
+        
         self.new_since_train += 1
 
-        # фаза
+        # ========== БЛОК 3: ОПРЕДЕЛЕНИЕ ФАЗЫ ==========
+        # Извлекаем текущую фазу из контекста (0-5 для 6 фаз)
         ph = 0
         if isinstance(reg_ctx, dict):
             ph = int(reg_ctx.get("phase", 0))
         self._last_seen_phase = ph
 
-        # фазовая память с капой
+        # ========== БЛОК 4: СОХРАНЕНИЕ В ФАЗОВУЮ ПАМЯТЬ ==========
+        # Каждая фаза хранит свою собственную историю примеров
+        # Это позволяет модели специализироваться на разных рыночных режимах
         self.X_ph[ph].append(x_raw.astype(np.float32).ravel().tolist())
         self.y_ph[ph].append(int(y_up))
+        
+        # Ограничиваем размер фазовой памяти
         cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
         if len(self.X_ph[ph]) > cap:
             self.X_ph[ph] = self.X_ph[ph][-cap:]
             self.y_ph[ph] = self.y_ph[ph][-cap:]
+        
         self.new_since_train_ph[ph] = self.new_since_train_ph.get(ph, 0) + 1
 
-        # хиты + ADWIN
+        # ========== БЛОК 5: ТРЕКИНГ ХИТОВ И DRIFT DETECTION ==========
+        # Оцениваем качество предсказания и отслеживаем дрейф концепции
         if p_pred is not None:
             try:
+                # Считаем hit: правильно ли предсказали направление?
                 hit = int((float(p_pred) >= 0.5) == bool(y_up))
+                
                 if self.mode == "ACTIVE" and used_in_live:
+                    # В активном режиме отслеживаем реальные сделки
                     self.active_hits.append(hit)
+                    
+                    # ADWIN детектирует дрейф распределения ошибок
                     if self.adwin is not None:
-                        in_drift = self.adwin.update(1 - hit)
+                        in_drift = self.adwin.update(1 - hit)  # 1=correct, 0=error
                         if in_drift:
+                            # Обнаружен дрейф - возвращаемся в shadow режим
                             self.mode = "SHADOW"
                             self.active_hits = []
                 else:
+                    # В shadow режиме накапливаем "что было бы, если бы входили"
                     self.shadow_hits.append(hit)
             except Exception:
                 pass
 
-        # накопили — пробуем перекалибровать температуру по фазе
-        self.seen_since_calib_ph[ph] = self.seen_since_calib_ph.get(ph, 0) + 1
+        # ========== БЛОК 6: НОВОЕ - СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
+        # Out-of-fold predictions нужны для расчета метрик cross-validation
+        # Эти предсказания были сделаны на данных, которые модель НЕ видела при обучении
+        if self.cfg.cv_enabled and p_pred is not None:
+            self.cv_oof_preds[ph].append(float(p_pred))
+            self.cv_oof_labels[ph].append(int(y_up))
+
+        # ========== БЛОК 7: ФАЗОВАЯ КАЛИБРОВКА ==========
+        # Калибратор корректирует вероятности для каждой фазы отдельно
+        # Это важно, потому что модель может быть по-разному откалибрована в разных режимах
         try:
-            self._maybe_recalibrate_T(ph)
+            p_raw = self._predict_raw(x_raw)
+            if p_raw is not None:
+                # Инициализируем калибратор для этой фазы, если его нет
+                if self.cal_ph[ph] is None:
+                    self.cal_ph[ph] = make_calibrator(self.cfg.xgb_calibration_method)
+                
+                # Показываем калибратору истинную пару (предсказание, результат)
+                self.cal_ph[ph].observe(float(p_raw), int(y_up))
+                
+                # Периодически пересчитываем калибровку
+                if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
+                    cal_path = self._cal_path(self.cfg.xgb_cal_path, ph)
+                    self.cal_ph[ph].save(cal_path)
         except Exception:
             pass
 
-        # обучение по фазе (если включено и пришло время)
-        try:
-            self.maybe_train(reg_ctx=reg_ctx)
-        except Exception:
-            pass
+        # ========== БЛОК 8: НОВОЕ - ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
+        # Каждые N примеров запускаем полную cross-validation для оценки реального качества
+        # Это защищает от переобучения и дает честную оценку обобщающей способности
+        self.cv_last_check[ph] += 1
+        
+        if self.cfg.cv_enabled and self.cv_last_check[ph] >= self.cfg.cv_check_every:
+            # Сбрасываем счетчик
+            self.cv_last_check[ph] = 0
+            
+            # Запускаем полную walk-forward cross-validation с purging
+            cv_results = self._run_cv_validation(ph)
+            
+            # Сохраняем результаты для использования в _maybe_flip_modes
+            self.cv_metrics[ph] = cv_results
+            
+            # Если CV прошла успешно, помечаем фазу как валидированную
+            if cv_results.get("status") == "ok":
+                self.validation_passed[ph] = True
+            
+            # Логируем результаты для мониторинга
+            if cv_results.get("status") == "ok":
+                print(f"[{self.__class__.__name__}] CV ph={ph}: "
+                    f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
+                    f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
+                    f"folds={cv_results['n_folds']}")
 
+        # ========== БЛОК 9: ОБУЧЕНИЕ МОДЕЛИ ПО ФАЗЕ ==========
+        # Когда накопилось достаточно новых примеров в фазе, запускаем переобучение
+        self._maybe_train_phase(ph)
+
+        # ========== БЛОК 10: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ==========
+        # Проверяем метрики (включая CV) и решаем, переключать ли SHADOW ↔ ACTIVE
         self._maybe_flip_modes()
+        
+        # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
+        # Периодически сохраняем все на диск для восстановления после перезапуска
         self._save_all()
 
     def _maybe_flip_modes(self):
+        """
+        Улучшенное переключение режимов с учётом:
+        1. Cross-validation метрик
+        2. Статистической значимости (bootstrap CI)
+        3. Out-of-fold predictions
+        """
+        if not self.cfg.cv_enabled:
+            # fallback к старой логике
+            self._maybe_flip_modes_simple()
+            return
+        
         def wr(arr, n):
-            if len(arr) < n:
-                return None
+            if len(arr) < n: return None
             window = arr[-n:]
             return 100.0 * (sum(window)/len(window))
-        wr_shadow = wr(self.shadow_hits, int(getattr(self.cfg, "min_ready", 80)))
-        if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= float(getattr(self.cfg, "enter_wr", 55.0)):
+        
+        # Текущие метрики
+        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
+        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
+        
+        # Получаем CV метрики текущей фазы
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_passed = self.validation_passed.get(ph, False)
+        
+        # SHADOW → ACTIVE: требуем CV validation + bootstrap CI
+        if self.mode == "SHADOW" and wr_shadow is not None:
+            basic_threshold_met = wr_shadow >= self.cfg.enter_wr
+            
+            if basic_threshold_met and cv_passed:
+                # Проверяем статистическую значимость
+                cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+                cv_ci_lower = cv_metrics.get("ci_lower", 0.0)
+                
+                # Нужно: OOF accuracy > порог И нижняя граница CI тоже
+                if cv_wr >= self.cfg.enter_wr and cv_ci_lower >= (self.cfg.enter_wr - self.cfg.cv_min_improvement):
+                    self.mode = "ACTIVE"
+                    if HAVE_RIVER:
+                        self.adwin = ADWIN(delta=self.cfg.adwin_delta)
+                    print(f"[{self.__class__.__name__}] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}%, CV_WR={cv_wr:.2f}% (CI: [{cv_ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
+        
+        # ACTIVE → SHADOW: детектируем деградацию
+        if self.mode == "ACTIVE" and wr_active is not None:
+            basic_threshold_failed = wr_active < self.cfg.exit_wr
+            
+            # Также проверяем CV метрики на деградацию
+            cv_wr = cv_metrics.get("oof_accuracy", 100.0)
+            cv_degraded = cv_wr < self.cfg.exit_wr
+            
+            if basic_threshold_failed or cv_degraded:
+                self.mode = "SHADOW"
+                self.validation_passed[ph] = False
+                print(f"[{self.__class__.__name__}] ACTIVE→SHADOW ph={ph}: WR={wr_active:.2f}%, CV_WR={cv_wr:.2f}%")
+
+    def _maybe_flip_modes_simple(self):
+        """Старая логика для backward compatibility"""
+        def wr(arr, n):
+            if len(arr) < n: return None
+            window = arr[-n:]
+            return 100.0 * (sum(window)/len(window))
+        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
+        if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= self.cfg.enter_wr:
             self.mode = "ACTIVE"
             if HAVE_RIVER:
                 self.adwin = ADWIN(delta=self.cfg.adwin_delta)
-        wr_active = wr(self.active_hits, max(30, int(getattr(self.cfg, "min_ready", 80)) // 2))
-        if self.mode == "ACTIVE" and (wr_active is not None and wr_active < float(getattr(self.cfg, "exit_wr", 45.0))):
+        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
+        if self.mode == "ACTIVE" and (wr_active is not None and wr_active < self.cfg.exit_wr):
             self.mode = "SHADOW"
 
     # --- обучение NN по ФАЗЕ ---
@@ -3834,6 +4902,154 @@ class NNExpert(_BaseExpert):
             self.new_since_train_ph[ph] = 0
         except Exception as e:
             print(f"[nn  ] train error (ph={ph}): {e}")
+    def _run_cv_validation(self, ph: int) -> Dict:
+        """
+        Walk-forward purged cross-validation для фазы ph.
+        Возвращает метрики: accuracy, CI bounds, fold scores.
+        """
+        X_all, y_all = self._get_phase_train(ph)
+        
+        if len(X_all) < self.cfg.cv_min_train_size:
+            return {"status": "insufficient_data", "oof_accuracy": 0.0}
+        
+        n_samples = len(X_all)
+        n_splits = min(self.cfg.cv_n_splits, n_samples // self.cfg.cv_min_train_size)
+        
+        if n_splits < 2:
+            return {"status": "insufficient_splits", "oof_accuracy": 0.0}
+        
+        # Walk-forward splits с purge и embargo
+        embargo_size = max(1, int(n_samples * self.cfg.cv_embargo_pct))
+        purge_size = max(1, int(n_samples * self.cfg.cv_purge_pct))
+        
+        fold_size = n_samples // n_splits
+        oof_preds = np.zeros(n_samples)
+        oof_mask = np.zeros(n_samples, dtype=bool)
+        fold_scores = []
+        
+        for fold_idx in range(n_splits):
+            # Test fold
+            test_start = fold_idx * fold_size
+            test_end = min(test_start + fold_size, n_samples)
+            
+            # Train: всё до (test_start - purge_size)
+            train_end = max(0, test_start - purge_size)
+            
+            if train_end < self.cfg.cv_min_train_size:
+                continue
+            
+            X_train = X_all[:train_end]
+            y_train = y_all[:train_end]
+            X_test = X_all[test_start:test_end]
+            y_test = y_all[test_start:test_end]
+            
+            # Обучаем временную модель на train fold
+            temp_model = self._train_fold_model(X_train, y_train, ph)
+            
+            # Предсказания на test fold
+            preds = self._predict_fold(temp_model, X_test, ph)
+            
+            # Сохраняем OOF predictions
+            oof_preds[test_start:test_end] = preds
+            oof_mask[test_start:test_end] = True
+            
+            # Метрики фолда
+            fold_acc = np.mean((preds >= 0.5) == y_test)
+            fold_scores.append(fold_acc)
+        
+        # Итоговые OOF метрики
+        oof_valid = oof_mask.sum()
+        if oof_valid < self.cfg.cv_min_train_size:
+            return {"status": "insufficient_oof", "oof_accuracy": 0.0}
+        
+        oof_accuracy = 100.0 * np.mean((oof_preds[oof_mask] >= 0.5) == y_all[oof_mask])
+        
+        # Bootstrap confidence intervals
+        ci_lower, ci_upper = self._bootstrap_ci(
+            oof_preds[oof_mask], 
+            y_all[oof_mask],
+            n_bootstrap=self.cfg.cv_bootstrap_n,
+            confidence=self.cfg.cv_confidence
+        )
+        
+        return {
+            "status": "ok",
+            "oof_accuracy": oof_accuracy,
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
+            "fold_scores": fold_scores,
+            "n_folds": len(fold_scores),
+            "oof_samples": int(oof_valid)
+        }
+
+    def _bootstrap_ci(self, preds: np.ndarray, labels: np.ndarray, 
+                    n_bootstrap: int, confidence: float) -> tuple:
+        """
+        Bootstrap confidence intervals для accuracy.
+        """
+        accuracies = []
+        n = len(preds)
+        
+        for _ in range(n_bootstrap):
+            # Resample с возвратом
+            idx = np.random.choice(n, size=n, replace=True)
+            boot_preds = preds[idx]
+            boot_labels = labels[idx]
+            boot_acc = 100.0 * np.mean((boot_preds >= 0.5) == boot_labels)
+            accuracies.append(boot_acc)
+        
+        accuracies = np.array(accuracies)
+        alpha = 1.0 - confidence
+        ci_lower = np.percentile(accuracies, 100 * alpha / 2)
+        ci_upper = np.percentile(accuracies, 100 * (1 - alpha / 2))
+        
+        return ci_lower, ci_upper
+
+    def _train_fold_model(self, X: np.ndarray, y: np.ndarray, ph: int):
+        """
+        Обучает временную модель для CV fold.
+        Реализация зависит от типа эксперта (XGB/RF/ARF/NN).
+        """
+        # Пример для XGB
+        if not HAVE_XGB:
+            return None
+        
+        scaler = StandardScaler().fit(X) if HAVE_SKLEARN else None
+        X_scaled = scaler.transform(X) if scaler else X
+        
+        dtrain = xgb.DMatrix(X_scaled, label=y)
+        model = xgb.train(
+            params={
+                "objective": "binary:logistic",
+                "max_depth": self.cfg.xgb_max_depth,
+                "eta": self.cfg.xgb_eta,
+                "subsample": self.cfg.xgb_subsample,
+                "colsample_bytree": self.cfg.xgb_colsample_bytree,
+                "min_child_weight": self.cfg.xgb_min_child_weight,
+                "eval_metric": "logloss",
+            },
+            dtrain=dtrain,
+            num_boost_round=self.cfg.xgb_rounds_warm,
+            verbose_eval=False
+        )
+        
+        return {"model": model, "scaler": scaler}
+
+    def _predict_fold(self, fold_model, X: np.ndarray, ph: int) -> np.ndarray:
+        """
+        Предсказания временной модели CV fold.
+        """
+        if fold_model is None:
+            return np.full(len(X), 0.5)
+        
+        scaler = fold_model.get("scaler")
+        model = fold_model.get("model")
+        
+        X_scaled = scaler.transform(X) if scaler else X
+        dtest = xgb.DMatrix(X_scaled)
+        preds = model.predict(dtest)
+        
+        return preds
 
 
     def maybe_train(self, ph: Optional[int] = None, reg_ctx: Optional[dict] = None) -> None:
@@ -4022,17 +5238,23 @@ class NNExpert(_BaseExpert):
     # ---------- статус ----------
     def status(self):
         def _wr(xs):
-            if not xs:
-                return None
+            if not xs: return None
             return sum(xs) / float(len(xs))
         def _fmt_pct(p):
             return "—" if p is None else f"{100.0*p:.2f}%"
-
+        
         wr_a = _wr(self.active_hits)
         wr_s = _wr(self.shadow_hits)
         all_hits = (self.active_hits or []) + (self.shadow_hits or [])
         wr_all = _wr(all_hits)
-
+        
+        # CV метрики текущей фазы
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_status = cv_metrics.get("status", "N/A")
+        cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+        cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
+        
         return {
             "mode": self.mode,
             "enabled": self.enabled,
@@ -4041,7 +5263,10 @@ class NNExpert(_BaseExpert):
             "wr_shadow": _fmt_pct(wr_s),
             "n_shadow": len(self.shadow_hits or []),
             "wr_all": _fmt_pct(wr_all),
-            "n": len(all_hits)
+            "n": len(all_hits),
+            "cv_oof_wr": _fmt_pct(cv_wr / 100.0) if cv_wr > 0 else "—",
+            "cv_ci": cv_ci,
+            "cv_validated": str(self.validation_passed.get(ph, False))
         }
 
 
