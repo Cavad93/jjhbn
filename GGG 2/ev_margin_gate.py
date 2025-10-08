@@ -25,7 +25,7 @@ def loss_margin_q(csv_path: str, max_epoch_exclusive: Optional[int] = None, q: f
         return 0.0
     if df is None or df.empty:
         return 0.0
-    df = df.dropna(subset=["outcome","p_up","payout_ratio","side"])
+    df = df.dropna(subset=["outcome","p_up","side"])
     if "epoch" in df.columns and max_epoch_exclusive is not None:
         try:
             df = df[df["epoch"] < int(max_epoch_exclusive)]
@@ -36,7 +36,12 @@ def loss_margin_q(csv_path: str, max_epoch_exclusive: Optional[int] = None, q: f
 
     p_up = pd.to_numeric(df["p_up"], errors="coerce").astype(float)
     p_side = np.where(df["side"].astype(str).str.upper() == "UP", p_up, 1.0 - p_up)
-    r = pd.to_numeric(df["payout_ratio"], errors="coerce").astype(float)
+    
+    if "r_hat_used" in df.columns:
+        r = pd.to_numeric(df["r_hat_used"], errors="coerce").astype(float)
+    else:
+        r = pd.to_numeric(df["payout_ratio"], errors="coerce").astype(float)
+    
     loss = df["outcome"].astype(str).str.lower() == "loss"
 
     margin = p_side - (1.0 / np.maximum(1e-9, r))
