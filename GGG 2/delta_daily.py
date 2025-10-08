@@ -80,7 +80,7 @@ class DeltaDaily:
     def _p_thr_row(row: pd.Series) -> float | None:
         try:
             stake = float(row["stake"])
-            r_hat = float(row["payout_ratio"])
+            r_hat = float(row.get("r_hat_used", row.get("payout_ratio", float('nan'))))
             gb_hat = float(row.get("gas_bet_bnb", 0.0))
             gc_hat = float(row.get("gas_claim_bnb", 0.0))
             if not math.isfinite(stake) or stake <= 0: return None
@@ -245,10 +245,15 @@ class DeltaDaily:
     def _fit_expectation_model(self, df: pd.DataFrame):
         try:
             from sklearn.linear_model import HuberRegressor
-            X = df[["p_side","payout_ratio","stake","gas_bet_bnb","gas_claim_bnb"]].to_numpy(dtype=float)
+            df = df.copy()
+            df["r_hat_model"] = df.get("r_hat_used", df.get("payout_ratio"))
+            X = df[["p_side","r_hat_model","stake","gas_bet_bnb","gas_claim_bnb"]].to_numpy(dtype=float)
             y = df["g"].to_numpy(dtype=float)
             mdl = HuberRegressor().fit(X, y)
-            def predict(xdf): return mdl.predict(xdf[["p_side","payout_ratio","stake","gas_bet_bnb","gas_claim_bnb"]].to_numpy(dtype=float))
+            def predict(xdf): 
+                xdf = xdf.copy()
+                xdf["r_hat_model"] = xdf.get("r_hat_used", xdf.get("payout_ratio"))
+                return mdl.predict(xdf[["p_side","r_hat_model","stake","gas_bet_bnb","gas_claim_bnb"]].to_numpy(dtype=float))
             return predict
         except Exception:
             return lambda xdf: np.full(len(xdf), float(np.nan))
