@@ -5808,10 +5808,9 @@ def main_loop():
 
     # Если в этом файле уже есть переменные с токеном/чатом — подставляем их в cfg:
     ml_cfg.meta_report_dir = "meta_reports"    # опционально, куда сохранять PNG
+    ml_cfg.phase_min_ready = 50                # ← старт обучения с 50 примеров/фазу
+    ml_cfg.meta_retrain_every = 50             # ← тренироваться каждые 50 новых примеров
     meta    = MetaCEMMC(ml_cfg)
-
-    meta.opt.min_ready = 50          # ← старт обучения с 50 примеров/фазу
-    meta.opt.retrain_every = 50      # ← тренироваться каждые 50 новых примеров
 
     meta.bind_experts(xgb_exp, rf_exp, arf_exp, nn_exp)
 
