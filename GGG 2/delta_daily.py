@@ -260,8 +260,22 @@ class DeltaDaily:
 
 
     def _optimize_delta_dr_lcb(self, df: pd.DataFrame, B: int = 1000, q: float = 0.15, ips_shadow: float = 1.0):
-        if df.empty: return (0.03, 0.0, 0)
-        # g: лог-рост
+        """
+        Оптимизация delta через Doubly Robust оценку с Lower Confidence Bound.
+        
+        Args:
+            df: DataFrame с историей сделок
+            B: количество bootstrap итераций
+            q: уровень квантиля для LCB (0.15 = 15й перцентиль)
+            ips_shadow: вес для IPS компонента
+        
+        Returns:
+            (best_delta, best_lcb, best_n) - оптимальная дельта, её LCB значение, количество выбранных сделок
+        """
+        if df.empty: 
+            return (0.03, 0.0, 0)
+        
+        # g: лог-рост капитала
         def _safe_g(row):
             cb = row.get("capital_before", np.nan)
             ca = row.get("capital_after",  np.nan)
@@ -271,6 +285,7 @@ class DeltaDaily:
             pnl   = float(row.get("pnl", 0.0) or 0.0)
             base  = max(stake, 1e-9)
             return float(np.log(1.0 + pnl/base))
+        
         df = df.copy()
         df["g"] = df.apply(_safe_g, axis=1)
 
@@ -278,34 +293,49 @@ class DeltaDaily:
         g_hat = self._fit_expectation_model(df)
 
         a, b, h = self.grid_start, self.grid_stop, self.grid_step
-        best_delta, best_lcb, best_n = 0.03, -1e9, 0
+        best_delta, best_lcb, best_n = 0.03, 0.0, 0  # Изменено с -1e9 на 0.0
         n_steps = int(round((b - a) / h)) + 1
         rng = np.random.default_rng(42)
+        
+        found_valid = False
 
         for k in range(n_steps):
             delta = a + k * h
             mask = (df["p_side"] >= (df["p_thr"] + delta))
             sub  = df.loc[mask].copy()
             nsel = int(len(sub))
-            if nsel < 10:  # слишком мало — пропускаем
+            if nsel < 10:  # слишком мало данных — пропускаем
                 continue
 
+            found_valid = True
             gh = g_hat(sub)
             gh = np.where(np.isfinite(gh), gh, sub["g"].to_numpy())  # fallback → чистый IPS (dr=g)
             dr = (1.0 * (sub["g"].to_numpy() - gh)) + gh
 
-            # бутстрап LCB по среднему dr
+            # Bootstrap для получения распределения средних
             means = []
-
             idxs = np.arange(nsel)
             for _ in range(B):
                 bs = rng.choice(idxs, size=nsel, replace=True)
-                means.append(float(np.nanmean(dr[bs])))
+                mean_val = np.nanmean(dr[bs])
+                if np.isfinite(mean_val):
+                    means.append(float(mean_val))
+            
+            # Если не удалось собрать достаточно means, пропускаем
+            if len(means) < 100:
+                continue
+                
+            # Вычисляем LCB на уровне q (по умолчанию 15%)
             lcb = float(np.nanpercentile(means, q*100.0))
-
+            
+            # Выбираем лучшую дельту по максимальному LCB
             if (lcb > best_lcb + 1e-12) or (abs(lcb - best_lcb) <= 1e-12 and nsel > best_n):
                 best_delta, best_lcb, best_n = float(delta), float(lcb), int(nsel)
 
+        # Если ни одна итерация не дала валидных результатов
+        if not found_valid or best_n == 0:
+            return (0.03, 0.0, 0)
+            
         return best_delta, best_lcb, best_n
 
 
@@ -348,8 +378,8 @@ class DeltaDaily:
 
         # --- выбор δ ---
         if getattr(self, "opt_mode", "p_star").lower() == "dr_lcb":
-            # DR-OPE + бутстрап LCB(5%)
-            delta, score, nsel = self._optimize_delta_dr_lcb(df, B=1000, q=0.05, ips_shadow=1.0)
+            # DR-OPE + бутстрап LCB(15%)
+            delta, score, nsel = self._optimize_delta_dr_lcb(df, B=1000, q=0.15, ips_shadow=1.0)
             p_thr_opt = float(pd.to_numeric(df["p_thr"], errors="coerce").dropna().mean())
 
             # ⬇️ ДОБАВКА: avg_used и P&L* на оптимальном δ
@@ -360,7 +390,7 @@ class DeltaDaily:
 
             state = dict(
                 computed_at_utc=now_ts, window_hours=self.window_hours, sample_size=sample_size,
-                delta=float(delta), p_thr_opt=p_thr_opt, lcb5=score, selected_n=int(nsel),
+                delta=float(delta), p_thr_opt=p_thr_opt, lcb15=score, selected_n=int(nsel),
                 valid_for_utc_date=today, method="dr_lcb",
                 grid=self._grid_to_str(self.grid_start, self.grid_stop, self.grid_step),
                 # ⬇️ ДОБАВКА: чтобы не было NaN в логах
