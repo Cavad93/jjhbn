@@ -7069,6 +7069,11 @@ def main_loop():
                             f"Kelly/2={kelly_txt} r̂={_as_float(r_hat,1.0):.3f} S={_as_float(stake,0.0):.6f} gas_bet={_as_float(gas_bet_bnb_cur,0.0):.8f}BNB "
                             f"(lock in {int(_as_float(rd.lock_ts,0)-_as_float(now,0))}s)")
 
+                        _delta15_str = None
+                        if USE_STRESS_R15 and 'delta15' in locals():
+                            _d15 = _as_float(delta15, float("nan"))
+                            if math.isfinite(_d15):
+                                _delta15_str = f"Δ15_med={(_d15/1e18 if _d15 > 1e6 else _d15):.4f} BNB"
 
                         extra = [
                             f"side=<b>{side}</b>, p={_as_float(p_side,0.0):.4f} ≥ p_thr+δ={(_as_float(p_thr)+_as_float(delta_eff,0.0)):.4f} [{p_thr_src}]",
