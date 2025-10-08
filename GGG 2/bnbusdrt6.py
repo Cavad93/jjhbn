@@ -40,6 +40,23 @@ import math
 import time
 import json
 import pickle
+
+# --- numeric guards ---
+def _is_finite_num(x) -> bool:
+    try:
+        v = float(x)
+        return math.isfinite(v)
+    except Exception:
+        return False
+
+def _as_float(x, default=float("nan")):
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else default
+    except Exception:
+        return default
+
+
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 from gating_no_r import compute_p_thr_no_r
@@ -166,14 +183,34 @@ def _tail_df(path, n=300):
     except Exception:
         return None
 
+# bnbusdrt6.py
 def rolling_calib_error(path: str, n: int = 200) -> float:
     """Средняя |y - p_side| по последним n сеттлам как прокси ECE/Brier."""
     df = _tail_df(path, n)
-    if df is None or df.empty: return 0.10
-    y = (df["outcome"] == "win").astype(float).to_numpy()
-    p = np.where(df["side"].str.upper() == "UP", df["p_up"].to_numpy(), 1.0 - df["p_up"].to_numpy())
-    p = np.clip(p, 1e-6, 1-1e-6)
-    return float(np.mean(np.abs(y - p)))
+    if df is None or df.empty:
+        return 0.10
+    # безопасная типизация и фильтрация
+    side = df.get("side")
+    p_up = pd.to_numeric(df.get("p_up"), errors="coerce")
+    y = (df.get("outcome") == "win").astype(float)
+
+    mask = side.astype(str).str.upper().isin(["UP", "DOWN"]) & p_up.notna() & y.notna()
+    if not mask.any():
+        return 0.10
+
+    side_u = side[mask].astype(str).str.upper()
+    p_u = p_up[mask].astype(float).to_numpy()
+    y_u = y[mask].astype(float).to_numpy()
+
+    p_side = np.where(side_u == "UP", p_u, 1.0 - p_u)
+    p_side = np.clip(p_side, 1e-6, 1 - 1e-6)
+
+    err = np.abs(y_u - p_side)
+    m = float(np.mean(err)) if np.isfinite(err).all() else float(np.nanmean(err))
+    if not math.isfinite(m):
+        return 0.10
+    return m
+
 
 def realized_sigma_g(path: str, n: int = 200) -> float:
     """Стд.кв. лог-роста на сделку по последним n."""
@@ -1319,15 +1356,18 @@ def _coerce_csv_dtypes(df: pd.DataFrame) -> pd.DataFrame:
         df[obj_like] = df[obj_like].fillna("")  # безопаснее чем .where()
     
     for col, dtype in CSV_DTYPES.items():
+        # bnbusdrt6.py  (функция _coerce_csv_dtypes)
         if col not in df.columns:
             # ✅ Используем np.nan вместо pd.NA
             if dtype in ("float64", "Int64"):
                 df[col] = np.nan
             elif dtype == "boolean":
-                df[col] = pd.Series(dtype="boolean")
+                # было: df[col] = pd.Series(dtype="boolean")  ← длина 0 → рассинхрон с индексом df
+                df[col] = pd.Series([pd.NA]*len(df), dtype="boolean")
             else:
                 df[col] = ""
             continue
+
         
         try:
             if dtype in ("float64",):
@@ -1337,9 +1377,19 @@ def _coerce_csv_dtypes(df: pd.DataFrame) -> pd.DataFrame:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
                 # ✅ Int64 поддерживает pd.NA, но безопаснее через astype
                 df[col] = df[col].astype("Int64")
+            # bnbusdrt6.py  (функция _coerce_csv_dtypes)
             elif dtype == "boolean":
-                # ✅ boolean тоже поддерживает pd.NA, но лучше явно
-                df[col] = df[col].astype("boolean")
+                # Надёжная нормализация булевых значений из старых CSV:
+                # поддерживает 'True'/'False', '1'/'0', 't'/'f', 'y'/'n', 'yes'/'no' (регистр/пробелы игнорируем)
+                s_str = df[col].astype("string").str.strip().str.lower()
+                _map = {
+                    "true": True, "false": False,
+                    "1": True, "0": False,
+                    "t": True, "f": False,
+                    "y": True, "n": False,
+                    "yes": True, "no": False,
+                }
+                df[col] = pd.Series(s_str.map(_map), dtype="boolean")
             else:
                 df[col] = df[col].astype(dtype)
         except Exception as e:
@@ -5138,6 +5188,11 @@ def main_loop():
                         
                         _now_ts = int(time.time())
                         t_rem_s = max(0, int(getattr(rd, "lock_ts", _now_ts) - _now_ts))
+                        if t_rem_s <= 2:
+                            bets[epoch] = dict(skipped=True, reason="late", wait_polls=0, settled=False)
+                            print(f"[late] epoch={epoch} missed betting window")
+                            notify_ens_used(None, None, None, None, None, None, False, meta.mode)
+                            continue
                         pool_tot = float(getattr(rd, "bull_amount", 0.0) + getattr(rd, "bear_amount", 0.0))
                         
                         try:
@@ -5194,13 +5249,18 @@ def main_loop():
                             kelly_half = None
                         else:
                             # --- Kelly по рынку (риск/выплата r̂): f* = (p*r̂ - 1) / (r̂ - 1) ---
+                            # --- Kelly по рынку (риск/выплата r̂): f* = (p*r̂ - 1) / (r̂ - 1) ---
                             denom_r = max(1e-6, float(r_hat) - 1.0)
                             f_kelly_base = float(max(0.0, (p_side * float(r_hat) - 1.0) / denom_r))
+                            if not math.isfinite(f_kelly_base):
+                                f_kelly_base = 0.0
 
                             # калибровочная и волатильностная поправки — как и раньше
                             calib_err = rolling_calib_error(CSV_PATH, n=200)   # ~ECE proxy
                             calib_err = float(np.clip(calib_err, 0.0, 0.15))
                             f_calib = float(np.clip(1.0 - 2.0*calib_err, 0.5, 1.0))
+                            if not math.isfinite(f_calib):
+                                f_calib = 1.0
 
                             sigma_star = 0.01
                             sigma_realized = realized_sigma_g(CSV_PATH, n=200)
@@ -5217,6 +5277,8 @@ def main_loop():
                             
                             # Вычисляем эффективный Kelly (base * calibration)
                             f_eff = f_kelly_base * f_calib
+                            if not math.isfinite(f_eff):
+                                f_eff = 0.0
                             
                             # Применяем делитель (Kelly/10)
                             f_eff_scaled = f_eff * (1.0 / float(KELLY_DIVISOR))
@@ -5311,11 +5373,13 @@ def main_loop():
                         # ============================================================
                         
                         # Инициализируем переменные для всех веток
-                        q70_loss = None
-                        q50_loss = None
-                        margin_vs_market = None
-                        p_thr = None
-                        p_thr_ev = None
+                        # Инициализируем переменные для всех веток
+                        q70_loss = 0.0
+                        q50_loss = 0.0
+                        margin_vs_market = 0.0
+                        p_thr = 0.0
+                        p_thr_ev = 0.0
+                        pass_reason = "NA"
 
                         if has_critical_override:
                             # === РЕЖИМ OVERRIDE: фиксированный порог ===
@@ -5404,9 +5468,17 @@ def main_loop():
                             else:
                                 pass_reason = "FAIL"
                             
-                            p_thr_src = (f"EV|δ+gas; q70={q70_loss:.4f}, q50={q50_loss:.4f}; "
-                                         f"margin={margin_vs_market:+.4f}; r̂={float(r_hat):.3f}; "
-                                         f"pass={pass_reason}")
+                            # bnbusdrt6.py  (логирование pass_reason — безопасно к незаданным значениям)
+                            _safe_q70 = float(q70_loss) if isinstance(q70_loss, (int, float)) and math.isfinite(float(q70_loss)) else 0.0
+                            _safe_q50 = float(q50_loss) if isinstance(q50_loss, (int, float)) and math.isfinite(float(q50_loss)) else 0.0
+                            _safe_margin = float(margin_vs_market) if isinstance(margin_vs_market, (int, float)) and math.isfinite(float(margin_vs_market)) else 0.0
+                            _safe_r = float(r_hat) if isinstance(r_hat, (int, float)) and math.isfinite(float(r_hat)) else 1.0
+                            _safe_reason = pass_reason if isinstance(pass_reason, str) else "NA"
+
+                            p_thr_src = (f"EV|δ+gas; q70={_safe_q70:.4f}, q50={_safe_q50:.4f}; "
+                                        f"margin={_safe_margin:+.4f}; r̂={_safe_r:.3f}; "
+                                        f"pass={_safe_reason}")
+
                             
                             # === ПРОВЕРКА: хотя бы одно условие должно пройти ===
                             if not (pass_ev_strong or pass_margin_q70 or pass_margin_q50):
@@ -5428,7 +5500,12 @@ def main_loop():
                                              else f"{kelly_half:.3f}")
                                 
                                 # === Telegram notification ===
+                                # === Telegram notification ===
                                 try:
+                                    _safe_margin = float(margin_vs_market) if isinstance(margin_vs_market, (int, float)) and math.isfinite(float(margin_vs_market)) else 0.0
+                                    _safe_q70 = float(q70_loss) if isinstance(q70_loss, (int, float)) and math.isfinite(float(q70_loss)) else 0.0
+                                    _safe_q50 = float(q50_loss) if isinstance(q50_loss, (int, float)) and math.isfinite(float(q50_loss)) else 0.0
+
                                     notify_ev_decision(
                                         title="⛔ Skip by EV gate",
                                         epoch=epoch,
@@ -5443,30 +5520,40 @@ def main_loop():
                                         delta15=(delta15 if (USE_STRESS_R15 and 'delta15' in locals()) else None),
                                         extra_lines=[
                                             f"Kelly/2:   {kelly_txt}",
-                                            f"❌ EV strong: p={p_side:.4f} < p_thr+δ={(p_thr + delta_eff):.4f}",
-                                            f"❌ Margin q70: margin={margin_vs_market:+.4f} < q70={q70_loss:.4f}",
-                                            f"❌ Margin q50: margin={margin_vs_market:+.4f} < q50={q50_loss:.4f}",
+                                            f"❌ EV strong: p={_as_float(p_side,0.0):.4f} < p_thr+δ={(_as_float(p_thr)+_as_float(delta_eff,0.0)):.4f}",
+                                            f"❌ Margin q70: margin={_safe_margin:+.4f} < q70={_safe_q70:.4f}",
+                                            f"❌ Margin q50: margin={_safe_margin:+.4f} < q50={_safe_q50:.4f}",
                                         ],
                                         delta_eff=delta_eff,
                                     )
                                 except Exception as e:
                                     print(f"[tg ] notify skip failed: {e}")
+
                                 
                                 # === Console log ===
                                 print(f"[skip] epoch={epoch} side={side_txt} EV-gate ALL FAIL | "
-                                      f"p={p_side:.4f} p_thr+δ={(p_thr + delta_eff):.4f} | "
-                                      f"margin={margin_vs_market:+.4f} q70={q70_loss:.4f} q50={q50_loss:.4f} | "
-                                      f"r̂={r_hat:.3f} S={stake:.6f}")
+                                    f"p={_as_float(p_side,0.0):.4f} p_thr+δ={(_as_float(p_thr)+_as_float(delta_eff,0.0)):.4f} | "
+                                    f"margin={float(margin_vs_market):+.4f} q70={float(q70_loss):.4f} q50={float(q50_loss):.4f} | "
+                                    f"r̂={float(r_hat):.3f} S={float(stake):.6f}")
+
                                 
                                 # === Snapshot ===
-                                _delta15_str = (f"Δ15_med={ (float(delta15)/1e18 if float(delta15) > 1e6 else float(delta15)) :.4f} BNB"
-                                                if (USE_STRESS_R15 and 'delta15' in locals()) else None)
-                                
+                                # === Snapshot ===
+                                _delta15_str = None
+                                if USE_STRESS_R15 and (('delta15' in locals()) or ('delta15' in globals())):
+                                    _d15 = _as_float(delta15, float("nan"))
+                                    if math.isfinite(_d15):
+                                        _delta15_str = f"Δ15_med={(_d15/1e18 if _d15 > 1e6 else _d15):.4f} BNB"
+
+
+                                _safe_margin = float(margin_vs_market) if isinstance(margin_vs_market, (int, float)) and math.isfinite(float(margin_vs_market)) else 0.0
+                                _safe_q70 = float(q70_loss) if isinstance(q70_loss, (int, float)) and math.isfinite(float(q70_loss)) else 0.0
+                                _safe_q50 = float(q50_loss) if isinstance(q50_loss, (int, float)) and math.isfinite(float(q50_loss)) else 0.0
                                 extra = [
                                     f"p_ctx={p_side:.4f} vs p_thr_ev={(p_thr + delta_eff):.4f} [{p_thr_src}]",
                                     f"❌ EV strong: {p_side:.4f} < {(p_thr + delta_eff):.4f}",
-                                    f"❌ Margin q70: {margin_vs_market:+.4f} < {q70_loss:.4f}",
-                                    f"❌ Margin q50: {margin_vs_market:+.4f} < {q50_loss:.4f}",
+                                    f"❌ Margin q70: {_safe_margin:+.4f} < {_safe_q70:.4f}",
+                                    f"❌ Margin q50: {_safe_margin:+.4f} < {_safe_q50:.4f}",
                                     f"r̂={r_hat:.3f} [{r_hat_source}], S={stake:.6f}, gb̂={gb_hat:.8f}, gĉ={gc_hat:.8f}",
                                     _delta15_str,
                                     f"gas_bet≈{gas_bet_bnb_cur:.8f} BNB",
@@ -5516,13 +5603,15 @@ def main_loop():
                         # ============================================================
                         
                         # --- считаем запас на входе
+                        # --- считаем запас на входе
                         edge_at_entry = float(p_side - (p_thr + delta_eff))
-                        
+
+                        _safe_margin = float(margin_vs_market) if isinstance(margin_vs_market, (int, float)) and math.isfinite(float(margin_vs_market)) else 0.0
                         print(f"[bet ] epoch={epoch} side={side} "
-                              f"✅ {pass_reason} passed | "
-                              f"p={p_side:.4f} margin={margin_vs_market:+.4f} | "
-                              f"edge@entry={edge_at_entry:+.4f} "
-                              f"Kelly/2={kelly_txt if 'kelly_txt' in locals() else '—'} r̂={r_hat:.3f} S={stake:.6f}")
+                            f"p_side={_as_float(p_side,0.0):.3f} ≥ p_thr+δ={(_as_float(p_thr)+_as_float(delta_eff,0.0)):.3f} "
+                            f"edge@entry={edge_at_entry:+.4f} "
+                            f"Kelly/2={kelly_txt if 'kelly_txt' in locals() else '—'} r̂={r_hat:.3f} S={stake:.6f}")
+
 
 
                         # --- сохранить контекст ставки
@@ -5545,21 +5634,45 @@ def main_loop():
                         # --- считаем запас на входе
                         # при ENTER:
                         edge_at_entry = float(p_side - (p_thr + delta_eff))   # здесь p_thr+δ == p_thr_ev
-                        print(f"... p_ctx={p_side:.3f} ≥ p_thr_ev={(p_thr + delta_eff):.3f} | margin={margin_vs_market:+.4f}≥q90={q90_loss:.4f} ...")
+                        # безопасные значения для логирования
+                        _safe_margin = float(margin_vs_market) if isinstance(margin_vs_market, (int, float)) and math.isfinite(margin_vs_market) else 0.0
+                        _safe_q90 = float(q90_loss) if (('q90_loss' in locals()) or ('q90_loss' in globals())) and isinstance(q90_loss, (int, float)) and math.isfinite(q90_loss) else 0.0
+                        # предпочитаем p_thr_ev, если есть; иначе p_thr; иначе 0.0
+                        _safe_pthr = None
+                        if 'p_thr_ev' in locals() or 'p_thr_ev' in globals():
+                            _safe_pthr = p_thr_ev
+                        elif 'p_thr' in locals() or 'p_thr' in globals():
+                            _safe_pthr = p_thr
+                        _safe_pthr = float(_safe_pthr) if isinstance(_safe_pthr, (int, float)) and math.isfinite(_safe_pthr) else 0.0
+
+                        _safe_p = float(p_side) if isinstance(p_side, (int, float)) and math.isfinite(p_side) else 0.0
+                        _side_str = (str(side).upper() if ('side' in locals() or 'side' in globals()) else "NA")
+
+                        _safe_p = _as_float(p_side, 0.0)
+                        _safe_q70 = _as_float(q70_loss, 0.0)
+                        _safe_margin = _as_float(margin_vs_market, 0.0)
+                        print(f"[enter] side={_side_str} "
+                            f"p_ctx={_safe_p:.4f} ≥ p_thr+δ={_as_float(p_thr) + _as_float(delta_eff, 0.0):.4f} | "
+                            f"margin={_safe_margin:+.4f} ≥ q70={_safe_q70:.4f}")
                         bets[epoch] = dict(
                             placed=True, settled=False, wait_polls=0,
                             time=now, t_lock=rd.lock_ts,
-                            bet_up=bet_up, p_up=P_up, p_side=p_side, p_thr=p_thr,
-                            p_thr_src=p_thr_src,                     # ✳️ сохраняем источник порога
-                            r_hat=r_hat,
-                            r_hat_source=r_hat_source,
-                            gb_hat=gb_hat, gc_hat=gc_hat,
-                            kelly_half=(None if bootstrap_phase else kelly_half), stake=stake,
-                            p_meta_raw=float(p_meta_raw) if 'p_meta_raw' in locals() else float('nan'),
-                            p_meta2_raw=float(p_meta2_raw) if 'p_meta2_raw' in locals() and p_meta2_raw is not None else float('nan'),  # ← NEW
-                            p_blend=float(p_blend) if 'p_blend' in locals() else float('nan'),                                          # ← NEW
-                            blend_w=float(blend_w) if 'blend_w' in locals() else float('nan'),                                          # ← NEW
-                            calib_src=str(calib_src) if 'calib_src' in locals() else "calib[off]",
+                            bet_up=bool(bet_up),
+                            p_up=_as_float(P_up),
+                            p_side=_as_float(p_side),
+                            p_thr=_as_float(p_thr),
+                            p_thr_src=str(p_thr_src),
+                            r_hat=_as_float(r_hat, 1.0),
+                            r_hat_source=str(r_hat_source),
+                            gb_hat=_as_float(gb_hat, 0.0),
+                            gc_hat=_as_float(gc_hat, 0.0),
+                            kelly_half=(None if bootstrap_phase else _as_float(kelly_half, 0.0)),
+                            stake=_as_float(stake, 0.0),
+                            p_meta_raw=_as_float(locals().get("p_meta_raw")),
+                            p_meta2_raw=_as_float(locals().get("p_meta2_raw")),   # ← NEW
+                            p_blend=_as_float(locals().get("p_blend")),           # ← NEW
+                            blend_w=_as_float(locals().get("blend_w")),           # ← NEW
+                            calib_src=str(locals().get("calib_src", "calib[off]")),
                             gas_price_bet_wei=gas_price_wei, gas_bet_bnb=gas_bet_bnb_cur,
                             edge_at_entry=edge_at_entry,
                             delta15=(float(delta15) if (USE_STRESS_R15 and 'delta15' in locals()) else None),
@@ -5582,17 +5695,17 @@ def main_loop():
                         kelly_txt = ("—" if bootstrap_phase else f"{kelly_half:.3f}")
 
                         print(f"[bet ] epoch={epoch} side={side} "
-                            f"... p_side={p_side:.3f} ≥ p_thr+δ={(p_thr + delta_eff):.3f} ..."
-                            f"edge@entry={edge_at_entry:+.4f} "
-                            f"Kelly/2={kelly_txt} r̂={r_hat:.3f} S={stake:.6f} gas_bet={gas_bet_bnb_cur:.8f}BNB "
-                            f"(lock in {rd.lock_ts-now}s)")
+                            f"... p_side={_as_float(p_side,0.0):.3f} ≥ p_thr+δ={(_as_float(p_thr)+_as_float(delta_eff,0.0)):.3f} ..."
+                            f"edge@entry={_as_float(edge_at_entry,0.0):+.4f} "
+                            f"Kelly/2={kelly_txt} r̂={_as_float(r_hat,1.0):.3f} S={_as_float(stake,0.0):.6f} gas_bet={_as_float(gas_bet_bnb_cur,0.0):.8f}BNB "
+                            f"(lock in {int(_as_float(rd.lock_ts,0)-_as_float(now,0))}s)")
+
 
                         extra = [
-                            f"side=<b>{side}</b>, p={p_side:.4f} ≥ p_thr+δ={(p_thr + delta_eff):.4f} [{p_thr_src}]",
+                            f"side=<b>{side}</b>, p={_as_float(p_side,0.0):.4f} ≥ p_thr+δ={(_as_float(p_thr)+_as_float(delta_eff,0.0)):.4f} [{p_thr_src}]",
                             f"edge@entry={edge_at_entry:+.4f}",
                             f"S={stake:.6f} BNB (кэп {MAX_STAKE_FRACTION*100:.0f}% от капитала), gas_bet≈{gas_bet_bnb_cur:.8f} BNB",
-                            (f"Δ15_med={ (float(delta15)/1e18 if float(delta15) > 1e6 else float(delta15)) :.4f} BNB"
-                                if (USE_STRESS_R15 and 'delta15' in locals()) else None),
+                            (_delta15_str if USE_STRESS_R15 else None),
                         ]
                         if override_reasons:
                             extra.append(f"p_thr override: {', '.join(override_reasons)}")
@@ -5785,20 +5898,25 @@ def main_loop():
                                 pass
 
                             # NEW: обновляем калибровщики и блендер на исходе
+                            # NEW: обновляем калибровщики и блендер на исходе
                             try:
                                 CM1 = globals().get("_CALIB_MGR")
                                 CM2 = globals().get("_CALIB_MGR2")
                                 BL  = globals().get("_BLENDER")
-                                if CM1 and "p_meta_raw" in b and b["p_meta_raw"] == b["p_meta_raw"]:
-                                    CM1.update(float(b["p_meta_raw"]), int(y_up_int), int(time.time()))
-                                if CM2 and "p_meta2_raw" in b and b["p_meta2_raw"] == b["p_meta2_raw"]:
-                                    CM2.update(float(b["p_meta2_raw"]), int(y_up_int), int(time.time()))
-                                if BL and "p_meta_raw" in b:
-                                    p1c = (CM1.transform(float(b["p_meta_raw"])) if CM1 else float(b["p_meta_raw"]))
-                                    p2c = (CM2.transform(float(b["p_meta2_raw"])) if (CM2 and "p_meta2_raw" in b and b["p_meta2_raw"] == b["p_meta2_raw"]) else p1c)
+
+                                if CM1 and ("p_meta_raw" in b) and _is_finite_num(b["p_meta_raw"]):
+                                    CM1.update(_as_float(b["p_meta_raw"]), int(y_up_int), int(time.time()))
+
+                                if CM2 and ("p_meta2_raw" in b) and _is_finite_num(b["p_meta2_raw"]):
+                                    CM2.update(_as_float(b["p_meta2_raw"]), int(y_up_int), int(time.time()))
+
+                                if BL:
+                                    p1c = _as_float(CM1.transform(_as_float(b.get("p_meta_raw"))) if (CM1 and _is_finite_num(b.get("p_meta_raw"))) else b.get("p_meta_raw"))
+                                    p2c = _as_float(CM2.transform(_as_float(b.get("p_meta2_raw"))) if (CM2 and _is_finite_num(b.get("p_meta2_raw"))) else p1c)
                                     BL.record(int(y_up_int), float(p1c), float(p2c))
                             except Exception:
                                 pass
+
 
 
 
@@ -5853,20 +5971,20 @@ def main_loop():
                         "settled_ts": int(time.time()),
                         "epoch": epoch,
                         "side": side,
-                        "p_up": float(b.get("p_up", float('nan'))),
-                        "p_meta_raw": float(b.get("p_meta_raw", float('nan'))),   # ← ДОБАВИЛИ
-                        "p_meta2_raw": float(b.get("p_meta2_raw", float('nan'))),  # ← NEW
-                        "p_blend":     float(b.get("p_blend",     float('nan'))),  # ← NEW
-                        "blend_w":     float(b.get("blend_w",     float('nan'))),  # ← NEW
-                        "calib_src":  str(b.get("calib_src", "")), 
-                        "p_thr_used": float(b.get("p_thr", float('nan'))),
-                        "p_thr_src":  str(b.get("p_thr_src", "")),
-                        "edge_at_entry": float(b.get("edge_at_entry", float('nan'))),
-                        "stake": stake,
-                        "gas_bet_bnb": gas_bet_bnb,
-                        "gas_claim_bnb": gas_claim_bnb,
-                        "gas_price_bet_gwei": float(b.get("gas_price_bet_wei", 0.0)) / 1e9,
-                        "gas_price_claim_gwei": gas_price_claim_wei / 1e9,
+                        "p_up":           _as_float(b.get("p_up")),
+                        "p_meta_raw":     _as_float(b.get("p_meta_raw")),     # ← ДОБАВИЛИ
+                        "p_meta2_raw":    _as_float(b.get("p_meta2_raw")),    # ← NEW
+                        "p_blend":        _as_float(b.get("p_blend")),        # ← NEW
+                        "blend_w":        _as_float(b.get("blend_w")),        # ← NEW
+                        "calib_src":      str(b.get("calib_src", "")),
+                        "p_thr_used":     _as_float(b.get("p_thr")),
+                        "p_thr_src":      str(b.get("p_thr_src", "")),
+                        "edge_at_entry":  _as_float(b.get("edge_at_entry")),
+                        "stake":          _as_float(stake, 0.0),
+                        "gas_bet_bnb":    _as_float(gas_bet_bnb, 0.0),
+                        "gas_claim_bnb":  _as_float(gas_claim_bnb, 0.0),
+                        "gas_price_bet_gwei":   (_as_float(b.get("gas_price_bet_wei"), 0.0) / 1e9),
+                        "gas_price_claim_gwei": (_as_float(gas_price_claim_wei, 0.0) / 1e9),
                         "outcome": outcome,
                         "pnl": pnl,
                         "capital_before": capital_before,
