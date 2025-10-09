@@ -5982,12 +5982,14 @@ def main_loop():
                 if reserve is not None:
                     evt = reserve.maybe_eod_rebalance(now_ts=now, capital=capital)
                     if evt and evt.get("changed"):
-                        capital = float(evt["capital"])
+                        new_capital = float(evt["capital"])
+                        # ✅ атомарное обновление (без CSV-строки для rebalance)
                         try:
-                            capital = update_capital_atomic(capital_state, new_capital, now, csv_row)  # сохраняем новый рабочий капитал
+                            capital_state.save(new_capital, ts=now)
+                            capital = new_capital
                         except Exception as e:
                             print(f"[warn] capital_state save failed: {e}")
-                        # информируем в TG (тихо игнорим сбои)
+                        # информируем в TG
                         try:
                             tg_send(evt["message"])
                         except Exception:
@@ -7341,12 +7343,7 @@ def main_loop():
                     except Exception:
                         pass
 
-                    append_trade_row(CSV_PATH, row)
-                    # дублируем капитал в отдельный state-файл (на случай удаления CSV)
-                    try:
-                        capital_state.save(capital, ts=int(time.time()))
-                    except Exception as e:
-                        print(f"[warn] capital_state save failed: {e}")
+                    capital = update_capital_atomic(capital_state, new_capital, now, row)
 
                     # --- Performance monitor: прокинем сделку
                     try:
@@ -7639,12 +7636,8 @@ def main_loop():
                         except Exception:
                             pass
 
-                        append_trade_row(CSV_PATH, row)
-                        # дублируем капитал в отдельный state-файл (на случай удаления CSV)
-                        try:
-                            capital_state.save(capital, ts=int(time.time()))
-                        except Exception as e:
-                            print(f"[warn] capital_state save failed: {e}")
+                        capital = update_capital_atomic(capital_state, new_capital, now, row)
+
                         # --- Performance monitor: прокинем сделку
                         try:
                             if perf is not None:
@@ -7778,5 +7771,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
-
-
