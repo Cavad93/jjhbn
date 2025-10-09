@@ -156,9 +156,6 @@ class TemperatureCalibrator(_BaseCal):
             return False
 
 def make_calibrator(method: str = "platt") -> _BaseCal:
-    m = (method or "platt").lower()
-    if m == "isotonic":
-        return IsotonicCalibrator()
-    if m == "temp" or m == "temperature":
-        return TemperatureCalibrator()
+    # УПРОЩЕНО: всегда используем Platt (логистическая регрессия)
+    # Без множественного выбора между методами
     return PlattCalibrator()
