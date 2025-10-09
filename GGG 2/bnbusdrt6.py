@@ -158,6 +158,17 @@ def _get_proj_tz():
 PROJ_TZ = _get_proj_tz()
 PROJ_STATE_PATH = os.path.join(os.path.dirname(__file__), "proj_state.json")
 
+# === НОВОЕ: адрес кошелька для проверки баланса ===
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "").strip()
+PAPER_TRADING = not bool(WALLET_ADDRESS)  # автоопределение режима
+
+if PAPER_TRADING:
+    print("[init] 📄 PAPER TRADING mode (no WALLET_ADDRESS)")
+    WALLET_ADDRESS = None
+else:
+    WALLET_ADDRESS = Web3.to_checksum_address(WALLET_ADDRESS)
+    print(f"[init] 💰 REAL TRADING mode - Wallet: {WALLET_ADDRESS}")
+
 from futures_ctx import FuturesContext
 from pool_features import PoolFeaturesCtx
 from extra_features import realized_metrics, jump_flag_from_rv_bv_rq, amihud_illiq, kyle_lambda
@@ -713,6 +724,39 @@ def nearest_close_price_ms(symbol: str, ts_ms: int) -> Optional[float]:
     if i == -1:
         return float(df["close"].iloc[0])
     return float(df["close"].iloc[i])
+
+# =============================
+# ПРОВЕРКА БАЛАНСА КОШЕЛЬКА
+# =============================
+# =============================
+# ПРОВЕРКА БАЛАНСА (PAPER/REAL)
+# =============================
+def get_wallet_balance(w3: Web3, account_address: Optional[str], paper_capital: float) -> float:
+    """
+    Получает баланс в зависимости от режима:
+    - PAPER mode (account_address=None): возвращает виртуальный капитал из paper_capital
+    - REAL mode: проверяет реальный баланс кошелька через Web3
+    
+    Args:
+        w3: Web3 instance
+        account_address: адрес кошелька (None для paper mode)
+        paper_capital: текущий виртуальный капитал (для paper mode)
+    
+    Returns:
+        float: баланс в BNB
+    """
+    # PAPER TRADING: используем виртуальный капитал
+    if account_address is None:
+        return paper_capital
+    
+    # REAL TRADING: проверяем реальный баланс
+    try:
+        balance_wei = w3.eth.get_balance(account_address)
+        return balance_wei / 1e18
+    except Exception as e:
+        print(f"[wallet] real balance check failed: {e}")
+        return 0.0  # безопасный fallback при ошибке RPC
+
 
 # =============================
 # Техиндикаторы/фичи
@@ -5766,7 +5810,14 @@ def main_loop():
     min_bet_bnb  = get_min_bet_bnb(c)
     print(f"[init] Connected. interval={interval_sec}s buffer={buffer_sec}s minBet={min_bet_bnb:.6f} BNB")
     if tg_enabled():
-        tg_send(f"🤖 Bot online. interval={interval_sec}s, buffer={buffer_sec}s, minBet={min_bet_bnb:.6f} BNB.")
+        mode_emoji = "📄" if PAPER_TRADING else "💰"
+        mode_text = "PAPER TRADING" if PAPER_TRADING else "REAL TRADING"
+        tg_send(
+            f"🤖 Bot online ({mode_emoji} {mode_text})\n"
+            f"Interval: {interval_sec}s | Buffer: {buffer_sec}s\n"
+            f"MinBet: {min_bet_bnb:.6f} BNB\n"
+            f"Capital: {capital:.6f} BNB"
+        )
 
     # --- восстановим капитал из CSV (или из capital_state.json, если CSV пуст)
     capital_state = CapitalState(path=os.path.join(os.path.dirname(__file__), "capital_state.json"))
@@ -5777,7 +5828,14 @@ def main_loop():
     else:
         capital = capital_state.load(START_CAPITAL_BNB)
         cap_src = "capital_state.json (fallback)" if os.path.exists(capital_state.path) else "default"
+
     print(f"[init] Capital restored: {capital:.6f} BNB (source={cap_src})")
+    print(f"[init] Trading mode: {'📄 PAPER TRADING' if PAPER_TRADING else '💰 REAL TRADING'}")
+    
+    if PAPER_TRADING:
+        print("[init] Balance checks will use virtual capital from capital_state.json")
+    else:
+        print(f"[init] Balance checks will use real wallet: {WALLET_ADDRESS}")
 
     # --- монитор производительности (EV & log-growth)
     try:
@@ -6640,14 +6698,56 @@ def main_loop():
                             stake = min(stake, cap3)
 
 
-
-
                         if stake <= 0 or capital < min_bet_bnb * 1.0:
                             bets[epoch] = dict(skipped=True, reason="small_cap", wait_polls=0, settled=False)
                             print(f"[skip] epoch={epoch} (capital too small) cap={capital:.6f} minBet={min_bet_bnb:.6f}")
                             send_round_snapshot(
                                 prefix=f"⛔ <b>Skip</b> epoch={epoch} (малый капитал)",
                                 extra_lines=[f"capital={capital:.6f} BNB, minBet={min_bet_bnb:.6f} BNB"]
+                            )
+                            notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
+                            continue
+
+                        # === ПРОВЕРКА БАЛАНСА (PAPER/REAL MODE) ===
+                        wallet_balance = get_wallet_balance(w3, WALLET_ADDRESS, paper_capital=capital)
+                        
+                        # Резерв на флуктуации газа (только для REAL mode)
+                        BALANCE_RESERVE = 0.005 if not PAPER_TRADING else 0.0
+                        required_total = stake + gas_bet_bnb_cur + gas_claim_bnb_cur + BALANCE_RESERVE
+                        
+                        mode_label = "paper" if PAPER_TRADING else "real"
+                        
+                        if wallet_balance < required_total:
+                            bets[epoch] = dict(skipped=True, reason="insufficient_balance", wait_polls=0, settled=False)
+                            print(f"[skip] epoch={epoch} insufficient {mode_label} balance: need={required_total:.6f} have={wallet_balance:.6f}")
+                            send_round_snapshot(
+                                prefix=f"⛔ <b>Skip</b> epoch={epoch} (недостаточно {mode_label} баланса)",
+                                extra_lines=[
+                                    f"Требуется: {required_total:.6f} BNB",
+                                    f"Доступно: {wallet_balance:.6f} BNB",
+                                    f"Нехватка: {(required_total - wallet_balance):.6f} BNB",
+                                    f"Режим: {'📄 PAPER' if PAPER_TRADING else '💰 REAL'}"
+                                ]
+                            )
+                            notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
+                            continue
+                        
+                        # Корректируем stake вниз, если баланс близок к минимуму
+                        safe_stake = wallet_balance - gas_bet_bnb_cur - gas_claim_bnb_cur - BALANCE_RESERVE
+                        if safe_stake < stake:
+                            print(f"[balance] stake adjusted: {stake:.6f} → {safe_stake:.6f} ({mode_label} mode)")
+                            stake = safe_stake
+                        
+                        if stake < min_bet_bnb:
+                            bets[epoch] = dict(skipped=True, reason="stake_too_small_after_balance_check", wait_polls=0, settled=False)
+                            print(f"[skip] epoch={epoch} stake too small after {mode_label} balance adjustment: {stake:.6f} < {min_bet_bnb:.6f}")
+                            send_round_snapshot(
+                                prefix=f"⛔ <b>Skip</b> epoch={epoch} (ставка мала после коррекции {mode_label} баланса)",
+                                extra_lines=[
+                                    f"Скорректированная ставка: {stake:.6f} BNB",
+                                    f"Минимум: {min_bet_bnb:.6f} BNB",
+                                    f"Режим: {'📄 PAPER' if PAPER_TRADING else '💰 REAL'}"
+                                ]
                             )
                             notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
                             continue
