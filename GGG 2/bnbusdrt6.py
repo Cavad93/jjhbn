@@ -2212,8 +2212,8 @@ class MLConfig:
     exit_wr: float = 1.0
     retrain_every: int = 40
     adwin_delta: float = 0.002
-    max_memory: int = 5000
-    train_window: int = 1500
+    max_memory: int = 3000          # ИЗМЕНЕНО: было 5000
+    train_window: int = 3000        # ИЗМЕНЕНО: было 1500
 
     # XGB
     xgb_model_path: str = "gb_model.json"
@@ -2276,11 +2276,11 @@ class MLConfig:
 
     use_two_window_drop: bool = False
 # =============================
-    # ====== ФАЗОВАЯ ПАМЯТЬ / КАЛИБРОВКА ======
+# ====== ФАЗОВАЯ ПАМЯТЬ / КАЛИБРОВКА ======
     use_phase_memory: bool = True
-    phase_count: int = 6                   # дубль meta_exp4_phases для удобства
-    phase_memory_cap: int = 10_000         # на ФАЗУ
-    phase_min_ready: int = 50              # минимум для «включения» фазы
+    phase_count: int = 6
+    phase_memory_cap: int = 3000    # ИЗМЕНЕНО: было 10_000
+    phase_min_ready: int = 50
     phase_mix_global_share: float = 0.30   # если < phase_min_ready: доля глобального хвоста
     phase_hysteresis_s: int = 300     
     meta_use_cma_es: bool = True  # ← включаем CMA-ES     # залипание фазы (анти-дрожь)
@@ -4634,38 +4634,12 @@ class NNExpert(_BaseExpert):
         return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
 
     def _maybe_recalibrate_T(self, ph: int) -> None:
-        """Подбор температуры T_ph[ph] по логлоссу на фазовом батче."""
-        every = int(getattr(self.cfg, "nn_temp_recalib_every", 200))
-        if self.seen_since_calib_ph.get(ph, 0) < every:
-            return
-        if self.net is None:
-            return
-
-        X_all, y_all = self._get_phase_train(ph)
-        min_samples = int(getattr(self.cfg, "nn_temp_min_samples", 400))
-        if len(X_all) < min_samples:
-            return
-
-        # трансформ и логиты
-        Xt = self._transform(X_all)
-        z, _ = self.net.forward_logits(Xt)
-        z = z.astype(np.float64)
-        y = np.array(y_all[:len(z)], dtype=np.int32)
-
-        lo = float(getattr(self.cfg, "nn_temp_grid_lo", 0.5))
-        hi = float(getattr(self.cfg, "nn_temp_grid_hi", 3.0))
-        steps = int(getattr(self.cfg, "nn_temp_grid_steps", 25))
-        Ts = np.linspace(lo, hi, num=max(2, steps))
-
-        best_T = float(self.T_ph.get(ph, 1.0))
-        best_nll = float("inf")
-        for T in Ts:
-            nll = self._nll_with_T(z, y, float(T))
-            if nll < best_nll:
-                best_nll, best_T = nll, float(T)
-
-        self.T_ph[ph] = float(max(0.05, min(10.0, best_T)))
+        """УПРОЩЕНО: Фиксированная температура T=1.0 (без grid search)."""
+        # ОТКЛЮЧЕНО: grid search по 25 температурам
+        # Используем фиксированную температуру для упрощения
+        self.T_ph[ph] = 1.0
         self.seen_since_calib_ph[ph] = 0
+        return
 
     # ---------- API ЭКСПЕРТА ----------
     def proba_up(self, x_raw: np.ndarray, reg_ctx: Optional[dict] = None) -> Tuple[Optional[float], str]:
@@ -5921,28 +5895,15 @@ def main_loop():
         except Exception:
             pass
 
-    _CALIB_MGR2 = globals().get("_CALIB_MGR2")
-    if _CALIB_MGR2 is None:
-        _CALIB_MGR2 = OnlineCalibManager()
-        globals()["_CALIB_MGR2"] = _CALIB_MGR2
-
-    _LM_META = globals().get("_LM_META")
-    if _LM_META is None:
-        _LM_META = LambdaMARTMetaLite(
-            retrain_every=int(os.getenv("LM_RETRAIN_EVERY","80")),
-            min_ready=int(os.getenv("LM_MIN_READY","160")),
-            max_buf=int(os.getenv("LM_MAX_BUF","10000"))
-        )
-        globals()["_LM_META"] = _LM_META
-
-    _BLENDER = globals().get("_BLENDER")
-    if _BLENDER is None:
-        _BLENDER = ProbBlender(
-            metric=os.getenv("BLEND_METRIC","nll"),
-            window=int(os.getenv("BLEND_WIN","1200")),
-            step=float(os.getenv("BLEND_STEP","0.02"))
-        )
-        globals()["_BLENDER"] = _BLENDER
+    # Оставляем только первый калибратор для упрощения
+    _CALIB_MGR2 = None
+    _LM_META = None
+    _BLENDER = None
+    
+    # Сохраняем в globals для совместимости
+    globals()["_CALIB_MGR2"] = None
+    globals()["_LM_META"] = None
+    globals()["_BLENDER"] = None
 
         # поднимем "глобальный" калибратор на истории CSV, если есть данные
         try:
@@ -6510,50 +6471,33 @@ def main_loop():
                         p_base_before_ens = P_up
                         p_final = meta.predict(p_xgb, p_rf, p_arf, p_nn, p_base_before_ens, reg_ctx=reg_ctx)
                         ens_used = False
+                        
                         if meta.mode == "ACTIVE" and p_final is not None:
-                            # 1) «сырое» p от основной МЕТА
+                            # УПРОЩЕНО: один уровень калибровки с hold-out валидацией
                             p_meta_raw = float(np.clip(p_final, 0.0, 1.0))
 
-                            # 2) «сырое» p от LambdaMART-МЕТА (может быть None до обучения)
-                            LM = globals().get("_LM_META")
-                            p_meta2_raw = None
-                            try:
-                                p_meta2_raw = LM.predict(p_xgb, p_rf, p_arf, p_nn, p_base_before_ens, reg_ctx=reg_ctx) if LM else None
-                            except Exception:
-                                p_meta2_raw = None
-
-                            # 3) калибровка обеих мет
+                            # Одна калибровка через rolling window с hold-out
                             calib1 = globals().get("_CALIB_MGR")
-                            calib2 = globals().get("_CALIB_MGR2")
-                            p1_cal = float(calib1.transform(p_meta_raw)) if calib1 else p_meta_raw
-                            p2_cal = (float(calib2.transform(p_meta2_raw)) if (calib2 and p_meta2_raw is not None) else p1_cal)
-
-                            calib_src  = "calib[roll/global]" if calib1 else "calib[off]"
-                            calib2_src = ("calib2[roll/global]" if (calib2 and p_meta2_raw is not None) else "calib2[off]")
-
-                            # 4) смешивание по NLL/Brier на скользящем окне
-                            BL = globals().get("_BLENDER")
-                            blend_w = float(BL.w) if BL else 1.0
-                            try:
-                                P_up = float(BL.mix(p1_cal, p2_cal)) if BL else float(p1_cal)
-                                calib_src = f"blend[{BL.metric},w={BL.w:.2f}]" if BL else calib_src
-                            except Exception:
-                                P_up = float(p1_cal)
-                                calib_src = f"blend[fallback]"
-
-                            # для логов/CSV
-                            p_blend = float(P_up)
-
+                            p_side_cal = float(calib1.transform(p_meta_raw)) if calib1 else p_meta_raw
+                            
+                            calib_src = "calib[roll/holdout]" if (calib1 and calib1.roll_cal) else "calib[off]"
+                            
+                            # Обновляем P_up калиброванным значением
+                            P_up = float(np.clip(p_side_cal, 0.0, 1.0))
                             P_dn = 1.0 - P_up
                             ens_used = True
+                            
+                            # Для совместимости с CSV логированием
+                            p_blend = P_up
+                            blend_w = 1.0
+                            p_meta2_raw = None  # отключено
+                            calib2_src = "disabled"
 
 
-                        # --- выбор стороны
                         # --- выбор стороны
                         bet_up = P_up >= P_dn
                         p_side_raw = P_up if bet_up else P_dn
                         
-                        # === SHRINKAGE: подтягиваем к 0.5 для снижения overconfidence ===
                         # === АДАПТИВНЫЙ Shrinkage: меньше для высокого края ===
                         edge_est = abs(p_side_raw - 0.5)
 
@@ -6667,11 +6611,8 @@ def main_loop():
 
                         # НОВОЕ: контекстная калибровка p → p_ctx
                         # p_side здесь — «сырое» после ансамбля/сглаживаний; заменим его на p_ctx
-                        try:
-                            p_ctx = p_ctx_calibrated(p_raw=float(p_side), r_hat=float(r_hat), csv_path=CSV_PATH, max_epoch_exclusive=epoch)
-                            p_side = float(np.clip(p_ctx, 0.0, 1.0))
-                        except Exception:
-                            p_side = float(np.clip(p_side, 0.0, 1.0))
+                        # p_side остается без дополнительной калибровки
+                        p_side = float(np.clip(p_side, 0.0, 1.0))
 
                         if bootstrap_phase:
                             stake = max(min_bet_bnb, 0.01 * capital)
@@ -6703,7 +6644,7 @@ def main_loop():
                             # === Kelly/10 с адаптивным капом ===
                             # ============================================
                             
-                            KELLY_DIVISOR = 10  # было 16
+                            KELLY_DIVISOR = 20  # было 16
                             
                             # Вычисляем эффективный Kelly (base * calibration)
                             f_eff = f_kelly_base * f_calib
@@ -7349,31 +7290,11 @@ def main_loop():
                                 reg_ctx=reg_ctx
                             )
 
-                            # NEW: обновляем вторую МЕТА (LambdaMART)
-                            try:
-                                LM = globals().get("_LM_META")
-                                if LM:
-                                    LM.record_result(p_xgb, p_rf, p_arf, p_nn, p_base=p_base, y_up=y_up_int, reg_ctx=reg_ctx, used_in_live=used_flag)
-                            except Exception:
-                                pass
-
-                            # NEW: обновляем калибровщики и блендер на исходе
-                            # NEW: обновляем калибровщики и блендер на исходе
+                            # УПРОЩЕНО: обновляем только первый калибратор
                             try:
                                 CM1 = globals().get("_CALIB_MGR")
-                                CM2 = globals().get("_CALIB_MGR2")
-                                BL  = globals().get("_BLENDER")
-
                                 if CM1 and ("p_meta_raw" in b) and _is_finite_num(b["p_meta_raw"]):
                                     CM1.update(_as_float(b["p_meta_raw"]), int(y_up_int), int(time.time()))
-
-                                if CM2 and ("p_meta2_raw" in b) and _is_finite_num(b["p_meta2_raw"]):
-                                    CM2.update(_as_float(b["p_meta2_raw"]), int(y_up_int), int(time.time()))
-
-                                if BL:
-                                    p1c = _as_float(CM1.transform(_as_float(b.get("p_meta_raw"))) if (CM1 and _is_finite_num(b.get("p_meta_raw"))) else b.get("p_meta_raw"))
-                                    p2c = _as_float(CM2.transform(_as_float(b.get("p_meta2_raw"))) if (CM2 and _is_finite_num(b.get("p_meta2_raw"))) else p1c)
-                                    BL.record(int(y_up_int), float(p1c), float(p2c))
                             except Exception:
                                 pass
 
