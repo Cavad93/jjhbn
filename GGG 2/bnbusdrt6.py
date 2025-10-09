@@ -5863,20 +5863,6 @@ def main_loop():
     globals()["_LM_META"] = None
     globals()["_BLENDER"] = None
 
-        # поднимем "глобальный" калибратор на истории CSV, если есть данные
-        try:
-            import pandas as pd, numpy as np
-            if os.path.exists(CSV_PATH):
-                df_hist = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
-                if {"p_meta_raw","outcome"}.issubset(df_hist.columns):
-                    y_hist = (df_hist["outcome"].astype(str).str.lower()=="win").astype(int).to_numpy()
-                    p_hist = df_hist["p_meta_raw"].astype(float).to_numpy()
-                    mask = np.isfinite(p_hist)
-                    if mask.sum() >= int(os.getenv("CALIB_MIN_N","300")):
-                        _CALIB_MGR.fit_global(p_hist[mask], y_hist[mask])
-        except Exception:
-            pass
-
 
     import atexit, signal, sys
 
