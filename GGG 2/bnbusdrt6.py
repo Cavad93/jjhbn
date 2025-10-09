@@ -97,6 +97,11 @@ from error_logger import setup_error_logging, log_exception, get_logger
 
 from dotenv import load_dotenv; load_dotenv()
 
+
+# === GAS PRICE FALLBACK: глобальные переменные ===
+gas_price_history = []  # история последних 20 успешных запросов газа
+MAX_GAS_HISTORY = 20    # размер скользящего окна для медианы
+
 # инициализируем отдельный error-лог (GGG/errors.log)
 setup_error_logging(log_dir=".", filename="errors.log")
 
@@ -7773,3 +7778,5 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
+
+
