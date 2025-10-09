@@ -3881,43 +3881,55 @@ class RiverARFExpert(_BaseExpert):
         self.active_hits: List[int] = []
 
         from collections import deque
-        self._seen_epochs = deque(maxlen=5000)   # ← кэш последних обработанных epoch
+        self._seen_epochs = deque(maxlen=5000)
 
-        # 👇 ДОБАВКА: загрузка/инициализация калибратора вероятностей ARF
-        # __init__
+        # Фазовая калибровка
         self.P = int(getattr(self.cfg, "phase_count", 6))
         self.cal_ph = {p: None for p in range(self.P)}
         self._last_seen_phase = 0
         self.n_feats: Optional[int] = None
 
-        def _cal_path(base: str, ph: int) -> str:
-            root, ext = os.path.splitext(base)
-            return f"{root}_ph{ph}{ext}"
+        # Минимальная память для CV (только последние N примеров)
+        # River работает онлайн, но для CV нужна небольшая история
+        cv_window = int(getattr(self.cfg, "cv_oof_window", 2000))
+        self.X: deque = deque(maxlen=cv_window)
+        self.y: deque = deque(maxlen=cv_window)
+        
+        # Фазовая память (ограниченная)
+        phase_cap = int(getattr(self.cfg, "phase_memory_cap", 2000))
+        self.X_ph: Dict[int, deque] = {p: deque(maxlen=phase_cap) for p in range(self.P)}
+        self.y_ph: Dict[int, deque] = {p: deque(maxlen=phase_cap) for p in range(self.P)}
+        self.new_since_train = 0
+        self.new_since_train_ph: Dict[int, int] = {p: 0 for p in range(self.P)}
 
+        # Cross-validation tracking (per phase)
+        self.cv_oof_preds: Dict[int, deque] = {p: deque(maxlen=cv_window) for p in range(self.P)}
+        self.cv_oof_labels: Dict[int, deque] = {p: deque(maxlen=cv_window) for p in range(self.P)}
+        self.cv_metrics: Dict[int, Dict] = {p: {} for p in range(self.P)}
+        self.cv_last_check: Dict[int, int] = {p: 0 for p in range(self.P)}
+        self.validation_passed: Dict[int, bool] = {p: False for p in range(self.P)}
+
+        # Загрузка калибраторов
         for p in range(self.P):
             try:
-                self.cal_ph[p] = _BaseCal.load(_cal_path(self.cfg.arf_cal_path, p))
+                self.cal_ph[p] = _BaseCal.load(self._cal_path(self.cfg.arf_cal_path, p))
             except Exception:
                 self.cal_ph[p] = None
 
-        # Cross-validation tracking (per phase)
-        self.cv_oof_preds: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
-        self.cv_oof_labels: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
-        self.cv_metrics: Dict[int, Dict] = {p: {} for p in range(self.P)}
-        self.cv_last_check: Dict[int, int] = {p: 0 for p in range(self.P)}
-        
-        # Validation mode tracking
-        self.validation_passed: Dict[int, bool] = {p: False for p in range(self.P)}
-
         self._load_all()
 
+    def _cal_path(self, base: str, ph: int) -> str:
+        """Генерирует путь к калибратору для конкретной фазы"""
+        root, ext = os.path.splitext(base)
+        return f"{root}_ph{int(ph)}{ext}"
+
     def _ensure_dim(self, x_raw: np.ndarray):
-        """Проверяет и обновляет размерность признаков при необходимости"""
+        """Проверяет и обновляет размерность признаков"""
         d = int(x_raw.reshape(1, -1).shape[1])
         if self.n_feats is None:
             self.n_feats = d
         elif self.n_feats != d:
-            # смена размерности - сбрасываем модель
+            # Смена размерности - переинициализируем модель
             self.n_feats = d
             self.clf = None
             if self.enabled:
@@ -3926,18 +3938,27 @@ class RiverARFExpert(_BaseExpert):
                 except Exception:
                     self.clf = None
                     self.enabled = False
+            # Очищаем буферы
+            cv_window = int(getattr(self.cfg, "cv_oof_window", 2000))
+            self.X = deque(maxlen=cv_window)
+            self.y = deque(maxlen=cv_window)
+            phase_cap = int(getattr(self.cfg, "phase_memory_cap", 2000))
+            self.X_ph = {p: deque(maxlen=phase_cap) for p in range(self.P)}
+            self.y_ph = {p: deque(maxlen=phase_cap) for p in range(self.P)}
 
     def _load_all(self):
+        """Загрузка сохраненного состояния"""
         try:
             if os.path.exists(self.cfg.arf_state_path):
                 with open(self.cfg.arf_state_path, "r") as f:
                     st = json.load(f)
                 self.mode = st.get("mode", "SHADOW")
-                self.shadow_hits = st.get("shadow_hits", [])
-                self.active_hits = st.get("active_hits", [])
+                self.shadow_hits = st.get("shadow_hits", [])[-1000:]
+                self.active_hits = st.get("active_hits", [])[-1000:]
                 self.n_feats = st.get("n_feats")
         except Exception:
             pass
+        
         if self.enabled:
             try:
                 if os.path.exists(self.cfg.arf_model_path):
@@ -3947,6 +3968,7 @@ class RiverARFExpert(_BaseExpert):
                 pass
 
     def _save_all(self):
+        """Сохранение состояния"""
         try:
             with open(self.cfg.arf_state_path, "w", encoding="utf-8") as f:
                 json.dump({
@@ -3965,11 +3987,11 @@ class RiverARFExpert(_BaseExpert):
             except Exception:
                 pass
 
+        # Сохранение калибраторов
         try:
-            root, ext = os.path.splitext(self.cfg.arf_cal_path)
             for ph, cal in (self.cal_ph or {}).items():
                 if cal is not None and getattr(cal, "ready", False):
-                    cal_path = f"{root}_ph{int(ph)}{ext}"
+                    cal_path = self._cal_path(self.cfg.arf_cal_path, ph)
                     try:
                         cal.save(cal_path)
                     except Exception:
@@ -3977,30 +3999,35 @@ class RiverARFExpert(_BaseExpert):
         except Exception:
             pass
 
-
-
     def _to_dict(self, x_raw: np.ndarray) -> Dict[str, float]:
+        """Преобразует numpy массив в dict для River"""
         return {f"f{k}": float(v) for k, v in enumerate(x_raw.ravel().tolist())}
 
-
     def _predict_raw(self, x_raw: np.ndarray) -> Optional[float]:
+        """Сырое предсказание модели без калибровки"""
         if not self.enabled or self.clf is None:
             return None
-        pmap = self.clf.predict_proba_one(self._to_dict(x_raw))
-        p = float(pmap.get(True, pmap.get(1, 0.5)))
-        return float(min(max(p, 1e-6), 1.0 - 1e-6))
-
+        try:
+            pmap = self.clf.predict_proba_one(self._to_dict(x_raw))
+            p = float(pmap.get(True, pmap.get(1, 0.5)))
+            return float(min(max(p, 1e-6), 1.0 - 1e-6))
+        except Exception:
+            return None
 
     def proba_up(self, x_raw: np.ndarray, reg_ctx: Optional[dict] = None) -> Tuple[Optional[float], str]:
+        """Предсказание вероятности UP с калибровкой"""
         if not self.enabled or self.clf is None:
             return (None, "DISABLED" if not self.enabled else self.mode)
+        
         try:
-            # сырой прогноз
+            self._ensure_dim(x_raw)
+            
+            # Сырой прогноз
             p = self._predict_raw(x_raw)
             if p is None:
                 return (None, self.mode)
 
-            # фаза → фазовый калибратор
+            # Фазовая калибровка
             ph = int(reg_ctx.get("phase")) if isinstance(reg_ctx, dict) and "phase" in reg_ctx else 0
             self._last_seen_phase = ph
             cal = self.cal_ph.get(ph)
@@ -4015,215 +4042,198 @@ class RiverARFExpert(_BaseExpert):
         except Exception:
             return (None, self.mode)
 
-
     def record_result(self, x_raw: np.ndarray, y_up: int, used_in_live: bool,
                     p_pred: Optional[float] = None, reg_ctx: Optional[dict] = None) -> None:
         """
-        Записывает результат предсказания и обновляет модель.
-        
-        Теперь включает:
-        - Сохранение в глобальную и фазовую память
-        - Трекинг хитов для оценки качества
-        - Out-of-fold predictions для cross-validation
-        - Периодическую CV проверку для валидации модели
-        - Обучение модели при накоплении данных
-        - Переключение режимов SHADOW/ACTIVE на основе метрик
+        Записывает результат и обновляет модель онлайн.
+        River ARF обучается инкрементально без полного переобучения.
         """
-        
-        # ========== БЛОК 1: ИНИЦИАЛИЗАЦИЯ И ПРОВЕРКА РАЗМЕРНОСТИ ==========
-        # Убеждаемся, что размерность фичей корректна и инициализирована
+        if not self.enabled or self.clf is None:
+            return
+
+        # Проверка размерности
         self._ensure_dim(x_raw)
 
-        # ========== БЛОК 2: СОХРАНЕНИЕ В ГЛОБАЛЬНУЮ ПАМЯТЬ ==========
-        # Глобальная память используется как fallback, когда в фазе мало данных
+        # Дедупликация по epoch
+        try:
+            eid = int(reg_ctx.get("epoch")) if isinstance(reg_ctx, dict) and "epoch" in reg_ctx else None
+        except Exception:
+            eid = None
+        if eid is not None and eid in self._seen_epochs:
+            return
+        if eid is not None:
+            self._seen_epochs.append(eid)
+
+        # === ОНЛАЙН-ОБУЧЕНИЕ RIVER ARF ===
+        # Главное преимущество River: учится на каждом примере без переобучения
+        try:
+            self.clf.learn_one(self._to_dict(x_raw), bool(y_up))
+        except Exception:
+            pass
+
+        # === СОХРАНЕНИЕ В БУФЕРЫ (для CV и метрик) ===
         self.X.append(x_raw.astype(np.float32).ravel().tolist())
         self.y.append(int(y_up))
-        
-        # Ограничиваем размер глобальной памяти, чтобы не раздувалась
-        if len(self.X) > int(getattr(self.cfg, "max_memory", 10_000)):
-            self.X = self.X[-self.cfg.max_memory:]
-            self.y = self.y[-self.cfg.max_memory:]
-        
         self.new_since_train += 1
 
-        # ========== БЛОК 3: ОПРЕДЕЛЕНИЕ ФАЗЫ ==========
-        # Извлекаем текущую фазу из контекста (0-5 для 6 фаз)
+        # Фаза
         ph = 0
         if isinstance(reg_ctx, dict):
             ph = int(reg_ctx.get("phase", 0))
         self._last_seen_phase = ph
 
-        # ========== БЛОК 4: СОХРАНЕНИЕ В ФАЗОВУЮ ПАМЯТЬ ==========
-        # Каждая фаза хранит свою собственную историю примеров
-        # Это позволяет модели специализироваться на разных рыночных режимах
+        # Фазовая память
         self.X_ph[ph].append(x_raw.astype(np.float32).ravel().tolist())
         self.y_ph[ph].append(int(y_up))
-        
-        # Ограничиваем размер фазовой памяти
-        cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
-        if len(self.X_ph[ph]) > cap:
-            self.X_ph[ph] = self.X_ph[ph][-cap:]
-            self.y_ph[ph] = self.y_ph[ph][-cap:]
-        
         self.new_since_train_ph[ph] = self.new_since_train_ph.get(ph, 0) + 1
 
-        # ========== БЛОК 5: ТРЕКИНГ ХИТОВ И DRIFT DETECTION ==========
-        # Оцениваем качество предсказания и отслеживаем дрейф концепции
+        # === ТРЕКИНГ КАЧЕСТВА И DRIFT DETECTION ===
         if p_pred is not None:
             try:
-                # Считаем hit: правильно ли предсказали направление?
                 hit = int((float(p_pred) >= 0.5) == bool(y_up))
                 
                 if self.mode == "ACTIVE" and used_in_live:
-                    # В активном режиме отслеживаем реальные сделки
                     self.active_hits.append(hit)
-                    
-                    # ADWIN детектирует дрейф распределения ошибок
                     if self.adwin is not None:
-                        in_drift = self.adwin.update(1 - hit)  # 1=correct, 0=error
-                        if in_drift:
-                            # Обнаружен дрейф - возвращаемся в shadow режим
-                            self.mode = "SHADOW"
-                            self.active_hits = []
+                        try:
+                            in_drift = self.adwin.update(1 - hit)
+                            if in_drift:
+                                self.mode = "SHADOW"
+                                self.active_hits = []
+                        except Exception:
+                            pass
                 else:
-                    # В shadow режиме накапливаем "что было бы, если бы входили"
                     self.shadow_hits.append(hit)
             except Exception:
                 pass
 
-        # ========== БЛОК 6: НОВОЕ - СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
-        # Out-of-fold predictions нужны для расчета метрик cross-validation
-        # Эти предсказания были сделаны на данных, которые модель НЕ видела при обучении
-        if self.cfg.cv_enabled and p_pred is not None:
+        # === OOF PREDICTIONS ДЛЯ CV ===
+        if getattr(self.cfg, "cv_enabled", False) and p_pred is not None:
             self.cv_oof_preds[ph].append(float(p_pred))
             self.cv_oof_labels[ph].append(int(y_up))
 
-        # ========== БЛОК 7: ФАЗОВАЯ КАЛИБРОВКА ==========
-        # Калибратор корректирует вероятности для каждой фазы отдельно
-        # Это важно, потому что модель может быть по-разному откалибрована в разных режимах
+        # === ФАЗОВАЯ КАЛИБРОВКА ===
         try:
             p_raw = self._predict_raw(x_raw)
             if p_raw is not None:
-                # Инициализируем калибратор для этой фазы, если его нет
                 if self.cal_ph[ph] is None:
-                    self.cal_ph[ph] = make_calibrator(self.cfg.xgb_calibration_method)
+                    try:
+                        from prob_calibrators import make_calibrator
+                        cal_method = getattr(self.cfg, "arf_calibration_method", "logistic")
+                        self.cal_ph[ph] = make_calibrator(cal_method)
+                    except Exception:
+                        pass
                 
-                # Показываем калибратору истинную пару (предсказание, результат)
-                self.cal_ph[ph].observe(float(p_raw), int(y_up))
-                
-                # Периодически пересчитываем калибровку
-                if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
-                    cal_path = self._cal_path(self.cfg.xgb_cal_path, ph)
-                    self.cal_ph[ph].save(cal_path)
+                if self.cal_ph[ph] is not None:
+                    self.cal_ph[ph].observe(float(p_raw), int(y_up))
+                    if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
+                        cal_path = self._cal_path(self.cfg.arf_cal_path, ph)
+                        self.cal_ph[ph].save(cal_path)
         except Exception:
             pass
 
-        # ========== БЛОК 8: НОВОЕ - ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
-        # Каждые N примеров запускаем полную cross-validation для оценки реального качества
-        # Это защищает от переобучения и дает честную оценку обобщающей способности
-        self.cv_last_check[ph] += 1
+        # === ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ===
+        self.cv_last_check[ph] = self.cv_last_check.get(ph, 0) + 1
         
-        if self.cfg.cv_enabled and self.cv_last_check[ph] >= self.cfg.cv_check_every:
-            # Сбрасываем счетчик
-            self.cv_last_check[ph] = 0
-            
-            # Запускаем полную walk-forward cross-validation с purging
-            cv_results = self._run_cv_validation(ph)
-            
-            # Сохраняем результаты для использования в _maybe_flip_modes
-            self.cv_metrics[ph] = cv_results
-            
-            # Если CV прошла успешно, помечаем фазу как валидированную
-            if cv_results.get("status") == "ok":
-                self.validation_passed[ph] = True
-            
-            # Логируем результаты для мониторинга
-            if cv_results.get("status") == "ok":
-                print(f"[{self.__class__.__name__}] CV ph={ph}: "
-                    f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
-                    f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
-                    f"folds={cv_results['n_folds']}")
+        if getattr(self.cfg, "cv_enabled", False):
+            cv_check_every = int(getattr(self.cfg, "cv_check_every", 200))
+            if self.cv_last_check[ph] >= cv_check_every:
+                self.cv_last_check[ph] = 0
+                cv_results = self._run_cv_validation(ph)
+                self.cv_metrics[ph] = cv_results
+                
+                if cv_results.get("status") == "ok":
+                    self.validation_passed[ph] = True
+                    print(f"[ARF] CV ph={ph}: "
+                        f"ACC={cv_results['oof_accuracy']:.2f}% "
+                        f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
+                        f"n={cv_results['oof_samples']}")
 
-        # ========== БЛОК 9: ОБУЧЕНИЕ МОДЕЛИ ПО ФАЗЕ ==========
-        # Когда накопилось достаточно новых примеров в фазе, запускаем переобучение
-        self._maybe_train_phase(ph)
-
-        # ========== БЛОК 10: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ==========
-        # Проверяем метрики (включая CV) и решаем, переключать ли SHADOW ↔ ACTIVE
+        # === ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ===
         self._maybe_flip_modes()
         
-        # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
-        # Периодически сохраняем все на диск для восстановления после перезапуска
+        # === СОХРАНЕНИЕ ===
         self._save_all()
+
+    def _get_phase_train(self, ph: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Получает данные для обучения/валидации фазы"""
+        if not self.X_ph[ph]:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        
+        X = np.array(list(self.X_ph[ph]), dtype=np.float32)
+        y = np.array(list(self.y_ph[ph]), dtype=np.int32)
+        return X, y
 
     def _run_cv_validation(self, ph: int) -> Dict:
         """
-        Walk-forward purged cross-validation для фазы ph.
-        Возвращает метрики: accuracy, CI bounds, fold scores.
+        Простая walk-forward валидация для River ARF.
+        Использует последние N примеров из буфера.
         """
         X_all, y_all = self._get_phase_train(ph)
         
-        if len(X_all) < self.cfg.cv_min_train_size:
-            return {"status": "insufficient_data", "oof_accuracy": 0.0}
+        cv_min_train = int(getattr(self.cfg, "cv_min_train_size", 100))
+        if len(X_all) < cv_min_train:
+            return {"status": "insufficient_data", "oof_accuracy": 0.0, "oof_samples": 0}
         
-        n_samples = len(X_all)
-        n_splits = min(self.cfg.cv_n_splits, n_samples // self.cfg.cv_min_train_size)
-        
-        if n_splits < 2:
-            return {"status": "insufficient_splits", "oof_accuracy": 0.0}
-        
-        # Walk-forward splits с purge и embargo
-        embargo_size = max(1, int(n_samples * self.cfg.cv_embargo_pct))
-        purge_size = max(1, int(n_samples * self.cfg.cv_purge_pct))
-        
-        fold_size = n_samples // n_splits
-        oof_preds = np.zeros(n_samples)
-        oof_mask = np.zeros(n_samples, dtype=bool)
-        fold_scores = []
-        
-        for fold_idx in range(n_splits):
-            # Test fold
-            test_start = fold_idx * fold_size
-            test_end = min(test_start + fold_size, n_samples)
+        # Используем OOF predictions из буфера (честная оценка)
+        if ph in self.cv_oof_preds and len(self.cv_oof_preds[ph]) >= cv_min_train:
+            preds = np.array(list(self.cv_oof_preds[ph]))
+            labels = np.array(list(self.cv_oof_labels[ph]))
             
-            # Train: всё до (test_start - purge_size)
-            train_end = max(0, test_start - purge_size)
+            oof_accuracy = 100.0 * np.mean((preds >= 0.5) == labels)
             
-            if train_end < self.cfg.cv_min_train_size:
-                continue
+            # Bootstrap CI
+            ci_lower, ci_upper = self._bootstrap_ci(
+                preds, labels,
+                n_bootstrap=int(getattr(self.cfg, "cv_bootstrap_n", 100)),
+                confidence=float(getattr(self.cfg, "cv_confidence", 0.95))
+            )
             
-            X_train = X_all[:train_end]
-            y_train = y_all[:train_end]
-            X_test = X_all[test_start:test_end]
-            y_test = y_all[test_start:test_end]
-            
-            # Обучаем временную модель на train fold
-            temp_model = self._train_fold_model(X_train, y_train, ph)
-            
-            # Предсказания на test fold
-            preds = self._predict_fold(temp_model, X_test, ph)
-            
-            # Сохраняем OOF predictions
-            oof_preds[test_start:test_end] = preds
-            oof_mask[test_start:test_end] = True
-            
-            # Метрики фолда
-            fold_acc = np.mean((preds >= 0.5) == y_test)
-            fold_scores.append(fold_acc)
+            return {
+                "status": "ok",
+                "oof_accuracy": oof_accuracy,
+                "ci_lower": ci_lower,
+                "ci_upper": ci_upper,
+                "oof_samples": len(preds)
+            }
         
-        # Итоговые OOF метрики
-        oof_valid = oof_mask.sum()
-        if oof_valid < self.cfg.cv_min_train_size:
-            return {"status": "insufficient_oof", "oof_accuracy": 0.0}
+        # Fallback: простая валидация на последних данных
+        n_test = max(50, len(X_all) // 5)
+        X_train, y_train = X_all[:-n_test], y_all[:-n_test]
+        X_test, y_test = X_all[-n_test:], y_all[-n_test:]
         
-        oof_accuracy = 100.0 * np.mean((oof_preds[oof_mask] >= 0.5) == y_all[oof_mask])
+        if len(X_train) < cv_min_train // 2:
+            return {"status": "insufficient_train", "oof_accuracy": 0.0, "oof_samples": 0}
         
-        # Bootstrap confidence intervals
+        # Временная модель для валидации
+        temp_clf = None
+        if HAVE_RIVER:
+            try:
+                temp_clf = river_forest.ARFClassifier(n_models=self.cfg.arf_n_models, seed=42)
+                for i in range(len(X_train)):
+                    x_dict = {f"f{k}": float(v) for k, v in enumerate(X_train[i])}
+                    temp_clf.learn_one(x_dict, bool(y_train[i]))
+            except Exception:
+                temp_clf = None
+        
+        if temp_clf is None:
+            return {"status": "temp_model_failed", "oof_accuracy": 0.0, "oof_samples": 0}
+        
+        # Предсказания
+        preds = []
+        for i in range(len(X_test)):
+            x_dict = {f"f{k}": float(v) for k, v in enumerate(X_test[i])}
+            pmap = temp_clf.predict_proba_one(x_dict)
+            p = float(pmap.get(True, pmap.get(1, 0.5)))
+            preds.append(p)
+        
+        preds = np.array(preds)
+        oof_accuracy = 100.0 * np.mean((preds >= 0.5) == y_test)
+        
         ci_lower, ci_upper = self._bootstrap_ci(
-            oof_preds[oof_mask], 
-            y_all[oof_mask],
-            n_bootstrap=self.cfg.cv_bootstrap_n,
-            confidence=self.cfg.cv_confidence
+            preds, y_test,
+            n_bootstrap=int(getattr(self.cfg, "cv_bootstrap_n", 100)),
+            confidence=float(getattr(self.cfg, "cv_confidence", 0.95))
         )
         
         return {
@@ -4231,21 +4241,19 @@ class RiverARFExpert(_BaseExpert):
             "oof_accuracy": oof_accuracy,
             "ci_lower": ci_lower,
             "ci_upper": ci_upper,
-            "fold_scores": fold_scores,
-            "n_folds": len(fold_scores),
-            "oof_samples": int(oof_valid)
+            "oof_samples": len(preds)
         }
 
     def _bootstrap_ci(self, preds: np.ndarray, labels: np.ndarray, 
                     n_bootstrap: int, confidence: float) -> tuple:
-        """
-        Bootstrap confidence intervals для accuracy.
-        """
+        """Bootstrap confidence intervals для accuracy"""
         accuracies = []
         n = len(preds)
         
+        if n < 10:
+            return (0.0, 100.0)
+        
         for _ in range(n_bootstrap):
-            # Resample с возвратом
             idx = np.random.choice(n, size=n, replace=True)
             boot_preds = preds[idx]
             boot_labels = labels[idx]
@@ -4259,126 +4267,72 @@ class RiverARFExpert(_BaseExpert):
         
         return ci_lower, ci_upper
 
-    def _train_fold_model(self, X: np.ndarray, y: np.ndarray, ph: int):
+    def maybe_train(self, ph: Optional[int] = None, reg_ctx: Optional[dict] = None) -> None:
         """
-        Обучает временную модель для CV fold.
-        Реализация зависит от типа эксперта (XGB/RF/ARF/NN).
+        River ARF обучается онлайн в record_result(), поэтому этот метод пустой.
+        Оставлен для совместимости с интерфейсом _BaseExpert.
         """
-        # Пример для XGB
-        if not HAVE_XGB:
-            return None
-        
-        scaler = StandardScaler().fit(X) if HAVE_SKLEARN else None
-        X_scaled = scaler.transform(X) if scaler else X
-        
-        dtrain = xgb.DMatrix(X_scaled, label=y)
-        model = xgb.train(
-            params={
-                "objective": "binary:logistic",
-                "max_depth": self.cfg.xgb_max_depth,
-                "eta": self.cfg.xgb_eta,
-                "subsample": self.cfg.xgb_subsample,
-                "colsample_bytree": self.cfg.xgb_colsample_bytree,
-                "min_child_weight": self.cfg.xgb_min_child_weight,
-                "eval_metric": "logloss",
-            },
-            dtrain=dtrain,
-            num_boost_round=self.cfg.xgb_rounds_warm,
-            verbose_eval=False
-        )
-        
-        return {"model": model, "scaler": scaler}
-
-    def _predict_fold(self, fold_model, X: np.ndarray, ph: int) -> np.ndarray:
-        """
-        Предсказания временной модели CV fold.
-        """
-        if fold_model is None:
-            return np.full(len(X), 0.5)
-        
-        scaler = fold_model.get("scaler")
-        model = fold_model.get("model")
-        
-        X_scaled = scaler.transform(X) if scaler else X
-        dtest = xgb.DMatrix(X_scaled)
-        preds = model.predict(dtest)
-        
-        return preds
+        pass
 
     def _maybe_flip_modes(self):
-        """
-        Улучшенное переключение режимов с учётом:
-        1. Cross-validation метрик
-        2. Статистической значимости (bootstrap CI)
-        3. Out-of-fold predictions
-        """
-        if not self.cfg.cv_enabled:
-            # fallback к старой логике
-            self._maybe_flip_modes_simple()
-            return
-        
+        """Переключение режимов SHADOW ↔ ACTIVE с учетом CV"""
         def wr(arr, n):
-            if len(arr) < n: return None
+            if len(arr) < n:
+                return None
             window = arr[-n:]
-            return 100.0 * (sum(window)/len(window))
+            return 100.0 * (sum(window) / len(window))
         
-        # Текущие метрики
-        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
-        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
+        min_ready = int(getattr(self.cfg, "min_ready", 500))
+        enter_wr = float(getattr(self.cfg, "enter_wr", 55.0))
+        exit_wr = float(getattr(self.cfg, "exit_wr", 50.0))
+        cv_enabled = getattr(self.cfg, "cv_enabled", False)
         
-        # Получаем CV метрики текущей фазы
+        wr_shadow = wr(self.shadow_hits, min_ready)
+        wr_active = wr(self.active_hits, max(30, min_ready // 2))
+        
         ph = self._last_seen_phase
         cv_metrics = self.cv_metrics.get(ph, {})
         cv_passed = self.validation_passed.get(ph, False)
         
-        # SHADOW → ACTIVE: требуем CV validation + bootstrap CI
+        # SHADOW → ACTIVE
         if self.mode == "SHADOW" and wr_shadow is not None:
-            basic_threshold_met = wr_shadow >= self.cfg.enter_wr
+            basic_met = wr_shadow >= enter_wr
             
-            if basic_threshold_met and cv_passed:
-                # Проверяем статистическую значимость
+            if cv_enabled and basic_met and cv_passed:
                 cv_wr = cv_metrics.get("oof_accuracy", 0.0)
                 cv_ci_lower = cv_metrics.get("ci_lower", 0.0)
+                cv_min_improvement = float(getattr(self.cfg, "cv_min_improvement", 2.0))
                 
-                # Нужно: OOF accuracy > порог И нижняя граница CI тоже
-                if cv_wr >= self.cfg.enter_wr and cv_ci_lower >= (self.cfg.enter_wr - self.cfg.cv_min_improvement):
+                if cv_wr >= enter_wr and cv_ci_lower >= (enter_wr - cv_min_improvement):
                     self.mode = "ACTIVE"
                     if HAVE_RIVER:
                         self.adwin = ADWIN(delta=self.cfg.adwin_delta)
-                    print(f"[{self.__class__.__name__}] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}%, CV_WR={cv_wr:.2f}% (CI: [{cv_ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
+                    print(f"[ARF] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}%, "
+                          f"CV={cv_wr:.2f}% (CI: [{cv_ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
+            elif not cv_enabled and basic_met:
+                self.mode = "ACTIVE"
+                if HAVE_RIVER:
+                    self.adwin = ADWIN(delta=self.cfg.adwin_delta)
         
-        # ACTIVE → SHADOW: детектируем деградацию
+        # ACTIVE → SHADOW
         if self.mode == "ACTIVE" and wr_active is not None:
-            basic_threshold_failed = wr_active < self.cfg.exit_wr
+            basic_failed = wr_active < exit_wr
             
-            # Также проверяем CV метрики на деградацию
             cv_wr = cv_metrics.get("oof_accuracy", 100.0)
-            cv_degraded = cv_wr < self.cfg.exit_wr
+            cv_degraded = cv_enabled and cv_wr < exit_wr
             
-            if basic_threshold_failed or cv_degraded:
+            if basic_failed or cv_degraded:
                 self.mode = "SHADOW"
                 self.validation_passed[ph] = False
-                print(f"[{self.__class__.__name__}] ACTIVE→SHADOW ph={ph}: WR={wr_active:.2f}%, CV_WR={cv_wr:.2f}%")
-
-    def _maybe_flip_modes_simple(self):
-        """Старая логика для backward compatibility"""
-        def wr(arr, n):
-            if len(arr) < n: return None
-            window = arr[-n:]
-            return 100.0 * (sum(window)/len(window))
-        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
-        if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= self.cfg.enter_wr:
-            self.mode = "ACTIVE"
-            if HAVE_RIVER:
-                self.adwin = ADWIN(delta=self.cfg.adwin_delta)
-        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
-        if self.mode == "ACTIVE" and (wr_active is not None and wr_active < self.cfg.exit_wr):
-            self.mode = "SHADOW"
+                print(f"[ARF] ACTIVE→SHADOW ph={ph}: WR={wr_active:.2f}%, CV={cv_wr:.2f}%")
 
     def status(self):
+        """Статус эксперта с метриками"""
         def _wr(xs):
-            if not xs: return None
+            if not xs:
+                return None
             return sum(xs) / float(len(xs))
+        
         def _fmt_pct(p):
             return "—" if p is None else f"{100.0*p:.2f}%"
         
@@ -4387,12 +4341,17 @@ class RiverARFExpert(_BaseExpert):
         all_hits = (self.active_hits or []) + (self.shadow_hits or [])
         wr_all = _wr(all_hits)
         
-        # CV метрики текущей фазы
+        # CV метрики
         ph = self._last_seen_phase
         cv_metrics = self.cv_metrics.get(ph, {})
         cv_status = cv_metrics.get("status", "N/A")
         cv_wr = cv_metrics.get("oof_accuracy", 0.0)
-        cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
+        
+        cv_ci = "N/A"
+        if cv_status == "ok":
+            ci_l = cv_metrics.get('ci_lower', 0)
+            ci_u = cv_metrics.get('ci_upper', 0)
+            cv_ci = f"[{ci_l:.1f}%, {ci_u:.1f}%]"
         
         return {
             "mode": self.mode,
@@ -4407,7 +4366,6 @@ class RiverARFExpert(_BaseExpert):
             "cv_ci": cv_ci,
             "cv_validated": str(self.validation_passed.get(ph, False))
         }
-
 
 
 
@@ -7829,5 +7787,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
-
-
