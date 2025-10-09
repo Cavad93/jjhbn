@@ -5809,17 +5809,8 @@ def main_loop():
     buffer_sec   = int(c.functions.bufferSeconds().call())
     min_bet_bnb  = get_min_bet_bnb(c)
     print(f"[init] Connected. interval={interval_sec}s buffer={buffer_sec}s minBet={min_bet_bnb:.6f} BNB")
-    if tg_enabled():
-        mode_emoji = "📄" if PAPER_TRADING else "💰"
-        mode_text = "PAPER TRADING" if PAPER_TRADING else "REAL TRADING"
-        tg_send(
-            f"🤖 Bot online ({mode_emoji} {mode_text})\n"
-            f"Interval: {interval_sec}s | Buffer: {buffer_sec}s\n"
-            f"MinBet: {min_bet_bnb:.6f} BNB\n"
-            f"Capital: {capital:.6f} BNB"
-        )
 
-    # --- восстановим капитал из CSV (или из capital_state.json, если CSV пуст)
+    # --- ПЕРЕМЕСТИЛИ СЮДА: восстановим капитал из CSV (или из capital_state.json, если CSV пуст)
     capital_state = CapitalState(path=os.path.join(os.path.dirname(__file__), "capital_state.json"))
     cap_csv = _restore_capital_from_csv(CSV_PATH)
     if cap_csv is not None:
@@ -5831,6 +5822,17 @@ def main_loop():
 
     print(f"[init] Capital restored: {capital:.6f} BNB (source={cap_src})")
     print(f"[init] Trading mode: {'📄 PAPER TRADING' if PAPER_TRADING else '💰 REAL TRADING'}")
+
+    # --- ТЕПЕРЬ МОЖНО отправить в Telegram (capital уже определён)
+    if tg_enabled():
+        mode_emoji = "📄" if PAPER_TRADING else "💰"
+        mode_text = "PAPER TRADING" if PAPER_TRADING else "REAL TRADING"
+        tg_send(
+            f"🤖 Bot online ({mode_emoji} {mode_text})\n"
+            f"Interval: {interval_sec}s | Buffer: {buffer_sec}s\n"
+            f"MinBet: {min_bet_bnb:.6f} BNB\n"
+            f"Capital: {capital:.6f} BNB"  # ✅ Теперь capital уже определён!
+        )
     
     if PAPER_TRADING:
         print("[init] Balance checks will use virtual capital from capital_state.json")
@@ -6041,17 +6043,16 @@ def main_loop():
                     evt = reserve.maybe_eod_rebalance(now_ts=now, capital=capital)
                     if evt and evt.get("changed"):
                         new_capital = float(evt["capital"])
-                        # ✅ атомарное обновление (без CSV-строки для rebalance)
                         try:
-                            capital_state.save(new_capital, ts=now)
-                            capital = new_capital
+                            capital_state.save(new_capital, ts=now)  # сохраняем новый рабочий капитал
                         except Exception as e:
                             print(f"[warn] capital_state save failed: {e}")
-                        # информируем в TG
+                        # информируем в TG (тихо игнорим сбои)
                         try:
                             tg_send(evt["message"])
                         except Exception:
                             pass
+                        capital = new_capital  # обновляем capital в самом конце
             except Exception as e:
                 print(f"[reserve] eod rebalance failed: {e}")
 
@@ -7871,3 +7872,5 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
+
+
