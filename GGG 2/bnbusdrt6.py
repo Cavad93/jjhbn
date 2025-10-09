@@ -3888,6 +3888,7 @@ class RiverARFExpert(_BaseExpert):
         self.P = int(getattr(self.cfg, "phase_count", 6))
         self.cal_ph = {p: None for p in range(self.P)}
         self._last_seen_phase = 0
+        self.n_feats: Optional[int] = None
 
         def _cal_path(base: str, ph: int) -> str:
             root, ext = os.path.splitext(base)
@@ -3934,6 +3935,7 @@ class RiverARFExpert(_BaseExpert):
                 self.mode = st.get("mode", "SHADOW")
                 self.shadow_hits = st.get("shadow_hits", [])
                 self.active_hits = st.get("active_hits", [])
+                self.n_feats = st.get("n_feats")
         except Exception:
             pass
         if self.enabled:
@@ -3945,18 +3947,17 @@ class RiverARFExpert(_BaseExpert):
                 pass
 
     def _save_all(self):
-        # 1) сохраняем state (режим и последние хиты)
         try:
             with open(self.cfg.arf_state_path, "w", encoding="utf-8") as f:
                 json.dump({
                     "mode": self.mode,
                     "shadow_hits": self.shadow_hits[-1000:],
                     "active_hits": self.active_hits[-1000:],
+                    "n_feats": self.n_feats,
                 }, f)
         except Exception:
             pass
 
-        # 2) сохраняем модель ARF
         if self.enabled and self.clf is not None:
             try:
                 with open(self.cfg.arf_model_path, "wb") as f:
@@ -3964,8 +3965,6 @@ class RiverARFExpert(_BaseExpert):
             except Exception:
                 pass
 
-        # 3) сохраняем калибратор вероятностей (если готов)
-        # 3) сохраняем калибраторы вероятностей по фазам (если готовы)
         try:
             root, ext = os.path.splitext(self.cfg.arf_cal_path)
             for ph, cal in (self.cal_ph or {}).items():
