@@ -6625,7 +6625,13 @@ def main_loop():
                         p_side = float(np.clip(p_side, 0.0, 1.0))
 
                         if bootstrap_phase:
-                            stake = max(min_bet_bnb, 0.01 * capital)
+                            # Более агрессивный подход после 200 сделок
+                            if n_trades >= 200:
+                                stake_pct = 0.015  # 1.5% если уже есть статистика
+                            else:
+                                stake_pct = 0.01   # 1% в начале
+                            
+                            stake = max(min_bet_bnb, stake_pct * capital)
                             stake = min(stake, cap3)
                             kelly_half = None
                         else:
@@ -6654,7 +6660,7 @@ def main_loop():
                             # === Kelly/10 с адаптивным капом ===
                             # ============================================
                             
-                            KELLY_DIVISOR = 20  # было 16
+                            KELLY_DIVISOR = 10  # было 16
                             
                             # Вычисляем эффективный Kelly (base * calibration)
                             f_eff = f_kelly_base * f_calib
