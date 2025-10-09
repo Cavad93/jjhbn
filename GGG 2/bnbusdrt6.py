@@ -40,6 +40,14 @@ import math
 import time
 import json
 import pickle
+import numpy as np
+import pandas as pd
+from web3 import Web3, HTTPProvider     # ← ПЕРЕМЕСТИЛИ СЮДА, В САМОЕ НАЧАЛО!
+try:
+    from web3.middleware import geth_poa_middleware  # для BSC/PoA
+    HAVE_POA = True
+except Exception:
+    HAVE_POA = False
 
 # --- numeric guards ---
 def _is_finite_num(x) -> bool:
@@ -140,13 +148,6 @@ def _get_proj_tz():
     # предупреждение можно убрать, если не нужно
     print("[proj] warning: tz database unavailable; using UTC")
     return timezone.utc
-
-
-rpc_fail_streak = 0
-RPC_FAIL_MAX = 3
-
-gas_price_history = []
-MAX_GAS_HISTORY = 20
 
 # часовой пояс для ежедневной проекции и файл-маркер "раз в день"
 PROJ_TZ = _get_proj_tz()
@@ -309,14 +310,10 @@ from calib.selector import CalibratorSelector  # <— наш селектор к
 
 from meta_cem_mc import MetaCEMMC, LambdaMARTMetaLite, ProbBlender  # ← NEW
 
-import numpy as np
-import pandas as pd
-from web3 import Web3, HTTPProvider
-try:
-    from web3.middleware import geth_poa_middleware  # для BSC/PoA
-    HAVE_POA = True
-except Exception:
-    HAVE_POA = False
+# УБИРАЕМ ДУБЛИРУЮЩИЕ ИМПОРТЫ - они уже есть в начале!
+# import numpy as np        # ← УБРАТЬ
+# import pandas as pd       # ← УБРАТЬ
+# from web3 import Web3, HTTPProvider    # ← УБРАТЬ (дубликат)
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
