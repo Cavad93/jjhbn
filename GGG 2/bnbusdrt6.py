@@ -286,6 +286,48 @@ def rolling_calib_error(path: str, n: int = 200) -> float:
         return 0.10
     return m
 
+
+def adaptive_kelly_cap(edge, recent_wr, calib_error, vol_scale):
+    """
+    Адаптивный кап для Kelly fraction
+    
+    Args:
+        edge: текущий edge (p_side - 1/r_hat)
+        recent_wr: винрейт за последние 100 сделок
+        calib_error: ошибка калибровки
+        vol_scale: масштаб волатильности
+    """
+    # Базовый кап на основе edge
+    if edge > 0.10:
+        base_cap = 0.020  # 2.0% при очень высоком edge
+    elif edge > 0.08:
+        base_cap = 0.015  # 1.5%
+    elif edge > 0.05:
+        base_cap = 0.012  # 1.2%
+    elif edge > 0.03:
+        base_cap = 0.008  # 0.8%
+    else:
+        base_cap = 0.005  # 0.5%
+    
+    # Модификатор по винрейту
+    if recent_wr >= 0.58:
+        wr_mult = 1.3  # можем быть агрессивнее
+    elif recent_wr >= 0.56:
+        wr_mult = 1.15
+    elif recent_wr >= 0.54:
+        wr_mult = 1.0
+    else:
+        wr_mult = 0.85  # осторожнее при низком WR
+    
+    # Модификатор по калибровке
+    calib_mult = 1.1 if calib_error < 0.03 else (0.9 if calib_error > 0.07 else 1.0)
+    
+    # Применяем все масштабы
+    final_cap = base_cap * wr_mult * calib_mult * vol_scale
+    
+    return float(np.clip(final_cap, 0.003, 0.025))  # 0.3% - 2.5%
+
+
 def adaptive_delta_protect(recent_wr, calib_error, n_trades):
     """
     Динамическая δ на основе производительности
@@ -6726,6 +6768,11 @@ def main_loop():
                                 sigma_realized = 1e-6
                             f_vol = float(np.clip(sigma_star / sigma_realized, 0.5, 2.0))
 
+                            # Вычисляем винрейт для адаптивного капа
+                            recent_wr = rolling_winrate_laplace(CSV_PATH, n=100, max_epoch_exclusive=epoch)
+                            if recent_wr is None:
+                                recent_wr = 0.53  # консервативный fallback
+
                             # ============================================
                             # === Kelly/10 с адаптивным капом ===
                             # ============================================
@@ -6740,20 +6787,18 @@ def main_loop():
                             # Применяем делитель (Kelly/10)
                             f_eff_scaled = f_eff * (1.0 / float(KELLY_DIVISOR))
                             
-                            # Адаптивный кап: зависит от уверенности
+                            # Адаптивный кап через функцию
                             edge = p_side - (1.0 / r_hat)
-                            
-                            if edge > 0.08:  # высокая уверенность
-                                f_cap = 0.015  # 1.5%
-                            elif edge > 0.05:  # средняя уверенность
-                                f_cap = 0.010  # 1.0%
-                            else:
-                                f_cap = 0.006  # 0.6%
-                            
+                            f_cap = adaptive_kelly_cap(
+                                edge=edge,
+                                recent_wr=recent_wr,
+                                calib_error=calib_err,
+                                vol_scale=f_vol
+                            )
                             f_eff_scaled = min(f_eff_scaled, f_cap)
                             
                             # Применяем волатильность
-                            frac = float(np.clip(f_eff_scaled, 0.001, 0.015))  # макс 1.5%
+                            frac = float(np.clip(f_eff_scaled, 0.001, 0.025))  # макс 2.5% (обновлено из 1.5%)
                             frac *= f_vol
                             
                             # Масштаб в просадке (без дополнительного множителя 0.5)
@@ -6761,12 +6806,12 @@ def main_loop():
                                 dd_scale = _dd_scale_factor(CSV_PATH)
                                 frac *= dd_scale
                                 print(f"[kelly] f_base={f_kelly_base:.5f}, f_eff={f_eff:.5f}, "
-                                      f"f_scaled={f_eff_scaled:.5f}, edge={edge:.4f}, "
-                                      f"dd_scale={dd_scale:.3f}, final frac={frac:.5f}")
+                                    f"f_scaled={f_eff_scaled:.5f}, edge={edge:.4f}, f_cap={f_cap:.5f}, "
+                                    f"recent_wr={recent_wr:.3f}, dd_scale={dd_scale:.3f}, final frac={frac:.5f}")
                             except Exception:
                                 print(f"[kelly] f_base={f_kelly_base:.5f}, f_eff={f_eff:.5f}, "
-                                      f"f_scaled={f_eff_scaled:.5f}, edge={edge:.4f}, "
-                                      f"final frac={frac:.5f}")
+                                    f"f_scaled={f_eff_scaled:.5f}, edge={edge:.4f}, f_cap={f_cap:.5f}, "
+                                    f"recent_wr={recent_wr:.3f}, final frac={frac:.5f}")
                             
                             # Kelly для информации (совместимость с остальным кодом)
                             kelly_half = f_eff_scaled  # для логов
