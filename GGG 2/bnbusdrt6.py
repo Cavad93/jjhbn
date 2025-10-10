@@ -5811,15 +5811,34 @@ def main_loop():
     print(f"[init] Connected. interval={interval_sec}s buffer={buffer_sec}s minBet={min_bet_bnb:.6f} BNB")
 
     # --- ПЕРЕМЕСТИЛИ СЮДА: восстановим капитал из CSV (или из capital_state.json, если CSV пуст)
+    # --- восстановим капитал: приоритет capital_state.json (актуальный), потом CSV
     capital_state = CapitalState(path=os.path.join(os.path.dirname(__file__), "capital_state.json"))
+    
+    # Сначала пробуем загрузить из capital_state.json
+    cap_state = None
+    if os.path.exists(capital_state.path):
+        try:
+            with open(capital_state.path, "r") as f:
+                obj = json.load(f)
+            cap_state = float(obj.get("capital"))
+            if not math.isfinite(cap_state) or cap_state <= 0:
+                cap_state = None
+        except Exception:
+            cap_state = None
+    
+    # Потом из CSV
     cap_csv = _restore_capital_from_csv(CSV_PATH)
-    if cap_csv is not None:
+    
+    # Выбираем источник: capital_state.json имеет приоритет, если существует
+    if cap_state is not None:
+        capital = cap_state
+        cap_src = "capital_state.json"
+    elif cap_csv is not None:
         capital = cap_csv
         cap_src = "trades_prediction.csv"
     else:
-        capital = capital_state.load(START_CAPITAL_BNB)
-        cap_src = "capital_state.json (fallback)" if os.path.exists(capital_state.path) else "default"
-
+        capital = START_CAPITAL_BNB
+        cap_src = "default"
     print(f"[init] Capital restored: {capital:.6f} BNB (source={cap_src})")
     print(f"[init] Trading mode: {'📄 PAPER TRADING' if PAPER_TRADING else '💰 REAL TRADING'}")
 
@@ -7878,5 +7897,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
-
-
