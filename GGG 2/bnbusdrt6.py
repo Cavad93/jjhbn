@@ -217,7 +217,7 @@ def update_capital_atomic(capital_state, new_capital: float, ts: int, csv_row: d
         
         # Только после успешного сохранения капитала пишем в CSV
         try:
-            append_csv_row(CSV_PATH, csv_row)
+            append_trade_row(CSV_PATH, csv_row)  # ← ИСПРАВЛЕНО
         except Exception as e:
             print(f"[csv ] write failed but capital saved: {e}")
         
@@ -7878,3 +7878,5 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
+
+
