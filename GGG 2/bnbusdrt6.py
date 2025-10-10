@@ -286,6 +286,43 @@ def rolling_calib_error(path: str, n: int = 200) -> float:
         return 0.10
     return m
 
+def adaptive_delta_protect(recent_wr, calib_error, n_trades):
+    """
+    Динамическая δ на основе производительности
+    
+    Args:
+        recent_wr: винрейт за последние 100 сделок
+        calib_error: ошибка калибровки (ECE)
+        n_trades: количество сделок за последний час
+    """
+    base_delta = 0.03
+    
+    # Масштаб по винрейту (агрессивнее при хорошем WR)
+    if recent_wr >= 0.58:
+        wr_scale = 0.7  # снижаем защиту при отличном WR
+    elif recent_wr >= 0.56:
+        wr_scale = 0.85
+    elif recent_wr >= 0.54:
+        wr_scale = 1.0  # базовый
+    elif recent_wr >= 0.52:
+        wr_scale = 1.2
+    else:
+        wr_scale = 1.4  # повышаем при плохом WR
+    
+    # Масштаб по калибровке (хорошая калибровка → меньше защиты)
+    if calib_error < 0.03:
+        calib_scale = 0.9
+    elif calib_error < 0.05:
+        calib_scale = 1.0
+    else:
+        calib_scale = 1.15
+    
+    # Масштаб по активности (больше сделок → больше уверенность)
+    activity_scale = 1.0 if n_trades >= 20 else 1.1
+    
+    delta_eff = base_delta * wr_scale * calib_scale * activity_scale
+    return float(np.clip(delta_eff, 0.02, 0.08))
+
 
 def realized_sigma_g(path: str, n: int = 200) -> float:
     """Стд.кв. лог-роста на сделку по последним n."""
@@ -521,7 +558,7 @@ TREASURY_FEE = 0.03
 GUARD_SECONDS   = 30      # решаем судьбу ставки только в последние 15с до lock
 SEND_WIN_LOW    = 12      # «окно отправки»: нижняя граница (для реальной торговли; сейчас paper)
 SEND_WIN_HIGH   = 8       # верхняя граница (для реальной торговли; сейчас paper)
-DELTA_PROTECT   = 0.04    # δ — страховой зазор поверх EV-порога
+DELTA_PROTECT   = 0.03    # δ — страховой зазор поверх EV-порога
 USE_STRESS_R15  = True    # использовать стресс по медианному притоку за 15с
 
 
@@ -1913,6 +1950,20 @@ def had_trade_in_last_hours(path: str, hours: float = 1.0) -> bool:
     cutoff = now_ts - int(hours * 3600)
     ts = pd.to_numeric(df.get("settled_ts", pd.Series(dtype=float)), errors="coerce").dropna()
     return bool((ts >= cutoff).any())
+
+def count_trades_last_hour(path: str, hours: float = 1.0) -> int:
+    """Возвращает количество завершённых сделок за последний час."""
+    df = _read_csv_df(path)
+    if df.empty:
+        return 0
+    df = df.dropna(subset=["outcome"])
+    df = df[df["outcome"].isin(["win","loss","draw"])]
+    if df.empty:
+        return 0
+    now_ts = int(time.time())
+    cutoff = now_ts - int(hours * 3600)
+    ts = pd.to_numeric(df.get("settled_ts", pd.Series(dtype=float)), errors="coerce").dropna()
+    return int((ts >= cutoff).sum())
 
 # =============================
 # ПЕРСИСТЕНТНОСТЬ КАПИТАЛА
@@ -6787,28 +6838,24 @@ def main_loop():
                         if meta.mode != "ACTIVE":
                             override_reasons.append("meta≠ACTIVE")
 
-                        # === АДАПТИВНАЯ δ: увеличиваем при низком винрейте ===
-                        base_delta = float(DELTA_PROTECT)  # 0.06 из глобальных настроек
-                        
+                        # === АДАПТИВНАЯ δ: многофакторная стратегия ===
                         if not bootstrap_phase and has_recent and meta.mode == "ACTIVE":
-                            # Проверяем винрейт последних 100 сделок
+                            # Получаем метрики производительности
                             recent_wr = rolling_winrate_laplace(CSV_PATH, n=100, max_epoch_exclusive=epoch)
+                            calib_err = rolling_calib_error(CSV_PATH, n=200)
+                            n_trades_hour = count_trades_last_hour(CSV_PATH)
                             
-                            if recent_wr is not None:
-                                if recent_wr < 0.50:
-                                    delta_eff = base_delta * 1.3  # +50% при плохом винрейте
-                                    print(f"[delta] BOOSTED: {delta_eff:.3f} (wr={recent_wr:.2%} < 52%)")
-                                elif recent_wr < 0.52:
-                                    delta_eff = base_delta * 1.15  # +20% при посредственном
-                                    print(f"[delta] slightly increased: {delta_eff:.3f} (wr={recent_wr:.2%} < 54%)")
-                                else:
-                                    delta_eff = base_delta
-                                    print(f"[delta] normal: {delta_eff:.3f} (wr={recent_wr:.2%})")
-                            else:
-                                delta_eff = base_delta * 1.3  # если нет данных - консервативнее
-                                print(f"[delta] conservative (no wr data): {delta_eff:.3f}")
+                            # Вычисляем адаптивную дельту
+                            delta_eff = adaptive_delta_protect(
+                                recent_wr=recent_wr or 0.53,
+                                calib_error=calib_err or 0.05,
+                                n_trades=n_trades_hour or 25
+                            )
+                            
+                            print(f"[delta] adaptive: δ={delta_eff:.3f} | wr={recent_wr or 0.53:.2%} | calib_err={calib_err or 0.05:.3f} | trades/h={n_trades_hour or 25}")
                         else:
-                            delta_eff = 0.0
+                            delta_eff = DELTA_PROTECT
+                            print(f"[delta] base: δ={delta_eff:.3f} (override mode)")
 
                         # устойчивее проверка override-условий (частичные совпадения)
                         critical_flags = ("bootstrap меньше чем 500", "idle≥1h")
