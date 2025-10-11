@@ -699,7 +699,8 @@ class MetaCEMMC:
             - oof_samples: количество OOF примеров
         """
         # Загружаем накопленные данные фазы
-        X_list, y_list = self._load_phase_buffer_from_disk(ph)
+        # Загружаем накопленные данные фазы с весами
+        X_list, y_list, sample_weights = self._load_phase_buffer_from_disk(ph)
         
         if len(X_list) < int(getattr(self.cfg, "cv_min_train_size", 200)):
             return {
@@ -946,11 +947,15 @@ class MetaCEMMC:
         Обучает модель для конкретной фазы через CEM или CMA-ES
         
         Это основная функция обучения. Она:
-        1. Загружает все накопленные данные фазы из CSV
-        2. Готовит X, y массивы
-        3. Запускает CEM или CMA-ES оптимизацию
+        1. Загружает все накопленные данные фазы из CSV (теперь с весами по времени)
+        2. Готовит X, y массивы и веса экспоненциального забывания
+        3. Запускает CEM или CMA-ES оптимизацию с учётом весов
         4. Сохраняет лучшие веса
         5. Генерирует отчет с графиками (опционально)
+        
+        НОВОЕ: Экспоненциальное взвешивание означает, что свежие паттерны
+        влияют на обучение сильнее, чем старые. Это позволяет модели адаптироваться
+        к изменяющимся рыночным условиям, не теряя при этом долгосрочную память.
         
         Почему CEM/CMA-ES, а не градиентный спуск?
         - Не требует дифференцируемости (можем использовать любую метрику)
@@ -961,24 +966,29 @@ class MetaCEMMC:
         Args:
             ph: номер фазы для обучения
         """
-        # Загружаем все данные фазы
-        X_list, y_list = self._load_phase_buffer_from_disk(ph)
+        # Загружаем все данные фазы с весами по времени
+        X_list, y_list, sample_weights = self._load_phase_buffer_from_disk(ph)
         
         if len(X_list) < int(getattr(self.cfg, "meta_min_train", 100)):
             return  # Недостаточно данных
 
         X = np.array(X_list, dtype=float)
         y = np.array(y_list, dtype=float)
+        sample_weights = np.array(sample_weights, dtype=float)
+        
+        # Нормализуем веса так, чтобы их сумма равнялась количеству примеров
+        # Это сохраняет баланс между взвешенными и невзвешенными примерами
+        sample_weights = sample_weights * len(sample_weights) / (sample_weights.sum() + 1e-12)
 
         # Выбираем оптимизатор
         use_cma = getattr(self.cfg, "meta_use_cma_es", False) and HAVE_CMA
         
         if use_cma:
             # CMA-ES: более мощный, но требует внешней библиотеки
-            w_best = self._train_cma_es(X, y, ph)
+            w_best = self._train_cma_es(X, y, ph, sample_weights=sample_weights)
         else:
             # CEM: проще, без зависимостей
-            w_best = self._train_cem(X, y)
+            w_best = self._train_cem(X, y, sample_weights=sample_weights)
 
         # Сохраняем обученные веса для этой фазы
         self.w_meta_ph[ph] = w_best
@@ -989,22 +999,26 @@ class MetaCEMMC:
         y: np.ndarray,
         n_iter: int = 50,
         pop_size: int = 100,
-        elite_frac: float = 0.2
+        elite_frac: float = 0.2,
+        sample_weights: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """
-        Cross-Entropy Method оптимизация
+        Cross-Entropy Method оптимизация с поддержкой взвешенных примеров
         
         CEM - это простой и эффективный алгоритм стохастической оптимизации.
         
         Идея:
         1. Начинаем с нормального распределения N(μ, σ²)
         2. Сэмплируем популяцию решений из этого распределения
-        3. Оцениваем каждое решение через Монте-Карло
+        3. Оцениваем каждое решение через Монте-Карло (с учётом весов примеров)
         4. Отбираем top-k% лучших (элиту)
         5. Обновляем μ и σ по элите
         6. Повторяем
         
         Процесс постепенно сужает распределение вокруг оптимума.
+        
+        НОВОЕ: Параметр sample_weights позволяет придавать разный вес примерам.
+        Свежие данные влияют на fitness сильнее через экспоненциальное затухание.
         
         Args:
             X: матрица фичей (N × D)
@@ -1012,12 +1026,17 @@ class MetaCEMMC:
             n_iter: количество итераций
             pop_size: размер популяции
             elite_frac: доля элиты (0.2 = top 20%)
+            sample_weights: веса примеров (None = все равны)
         
         Returns:
             Лучший найденный вектор весов
         """
         D = X.shape[1]  # Размерность (8 для META)
         n_elite = max(1, int(pop_size * elite_frac))
+        
+        # Если веса не заданы - все примеры равнозначны
+        if sample_weights is None:
+            sample_weights = np.ones(len(X))
         
         # Инициализация распределения
         mu = np.zeros(D)
@@ -1035,10 +1054,10 @@ class MetaCEMMC:
                 w = np.clip(w, -clip_val, clip_val)
                 population.append(w)
             
-            # Оцениваем каждое решение через Монте-Карло
+            # Оцениваем каждое решение через Монте-Карло с учётом весов
             scores = []
             for w in population:
-                loss = self._mc_eval(w, X, y, n_bootstrap=10)  # Быстрая оценка
+                loss = self._mc_eval(w, X, y, n_bootstrap=10, sample_weights=sample_weights)
                 scores.append(loss)
             
             # Отбираем элиту (лучшие решения)
@@ -1057,7 +1076,7 @@ class MetaCEMMC:
 
         return best_w
 
-    def _train_cma_es(self, X: np.ndarray, y: np.ndarray, ph: int) -> np.ndarray:
+    def _train_cma_es(self, X: np.ndarray, y: np.ndarray, ph: int, sample_weights: Optional[np.ndarray] = None) -> np.ndarray:
         """
         CMA-ES оптимизация (более продвинутая версия)
         
@@ -1114,7 +1133,7 @@ class MetaCEMMC:
             fitness = []
             for w in solutions:
                 w_clipped = np.clip(w, -clip_val, clip_val)
-                loss = self._mc_eval(w_clipped, X, y, n_bootstrap=20)
+                loss = self._mc_eval(w_clipped, X, y, n_bootstrap=20, sample_weights=sample_weights)
                 fitness.append(loss)
             
             # Обновляем распределение
@@ -1152,37 +1171,53 @@ class MetaCEMMC:
         w: np.ndarray,
         X: np.ndarray,
         y: np.ndarray,
-        n_bootstrap: int = 20
+        n_bootstrap: int = 20,
+        sample_weights: Optional[np.ndarray] = None
     ) -> float:
         """
-        Монте-Карло оценка качества весов через bootstrap
+        Монте-Карло оценка качества весов через взвешенный bootstrap
         
         Вместо того чтобы считать loss на всей выборке (что может дать
         переоптимистичную оценку), мы:
-        1. Многократно пересэмплируем данные
-        2. Считаем loss на каждой бутстрэп выборке
+        1. Многократно пересэмплируем данные с учётом весов
+        2. Считаем взвешенный loss на каждой бутстрэп выборке
         3. Усредняем
         
         Это дает более устойчивую оценку, особенно на малых выборках.
+        
+        НОВОЕ: При наличии sample_weights более свежие примеры:
+        - Чаще попадают в bootstrap выборки (weighted sampling)
+        - Сильнее влияют на итоговый loss (weighted loss)
+        Это позволяет модели быстрее адаптироваться к новым паттернам.
         
         Args:
             w: веса для оценки
             X: матрица фичей
             y: вектор меток
             n_bootstrap: количество бутстрэп итераций
+            sample_weights: веса примеров для взвешенного sampling
         
         Returns:
-            Средний log-loss с L2 регуляризацией
+            Средний взвешенный log-loss с L2 регуляризацией
         """
         n = len(X)
         losses = []
         l2_reg = float(getattr(self.cfg, "meta_l2", 0.001))
+        
+        # Если веса не заданы - все примеры равнозначны
+        if sample_weights is None:
+            sample_weights = np.ones(n)
+        
+        # Нормализуем веса для использования в качестве вероятностей
+        probs = sample_weights / (sample_weights.sum() + 1e-12)
 
         for _ in range(n_bootstrap):
-            # Resample с возвратом
-            idx = np.random.choice(n, size=n, replace=True)
+            # Resample с возвратом, учитывая веса примеров
+            # Свежие данные (с большим весом) будут чаще попадать в выборку
+            idx = np.random.choice(n, size=n, replace=True, p=probs)
             Xb = X[idx]
             yb = y[idx]
+            weights_b = sample_weights[idx]
             
             # Предсказания
             z = Xb @ w
@@ -1190,13 +1225,15 @@ class MetaCEMMC:
             p = 1.0 / (1.0 + np.exp(-z))
             p = np.clip(p, 1e-6, 1 - 1e-6)
             
-            # Log-loss
-            log_loss = -np.mean(yb * np.log(p) + (1 - yb) * np.log(1 - p))
+            # Взвешенный Log-loss
+            # Свежие примеры влияют на loss сильнее через weights_b
+            sample_losses = -(yb * np.log(p) + (1 - yb) * np.log(1 - p))
+            weighted_loss = np.sum(sample_losses * weights_b) / (weights_b.sum() + 1e-12)
             
             # L2 регуляризация
             reg = l2_reg * np.sum(w**2)
             
-            losses.append(log_loss + reg)
+            losses.append(weighted_loss + reg)
 
         return float(np.mean(losses))
 
@@ -1348,13 +1385,15 @@ class MetaCEMMC:
     
     def _append_example(self, ph: int, x: np.ndarray, y: int) -> List:
         """
-        Добавляет пример в буфер фазы и сохраняет в CSV
+        Добавляет пример в буфер фазы и сохраняет в CSV с временной меткой
         
         Мы используем двухуровневое хранение:
         1. In-memory буфер (быстрый доступ, ограниченный размер)
         2. CSV файл на диске (долгосрочное хранение)
         
         При обучении мы загружаем все данные из CSV.
+        НОВОЕ: Каждая запись теперь имеет timestamp для экспоненциального взвешивания.
+        Старые паттерны постепенно теряют вес, позволяя модели адаптироваться к новым условиям.
         
         Args:
             ph: номер фазы
@@ -1372,53 +1411,101 @@ class MetaCEMMC:
         if csv_path:
             try:
                 file_exists = os.path.isfile(csv_path)
+                current_timestamp = time.time()
+                
                 with open(csv_path, "a", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
-                    # Заголовок только для нового файла
+                    # Заголовок только для нового файла - теперь с timestamp
                     if not file_exists:
-                        header = [f"x{i}" for i in range(len(x))] + ["y"]
+                        header = [f"x{i}" for i in range(len(x))] + ["y", "timestamp"]
                         writer.writerow(header)
-                    # Данные
-                    row = list(x) + [int(y)]
+                    # Данные с временной меткой
+                    row = list(x) + [int(y), current_timestamp]
                     writer.writerow(row)
             except Exception:
                 pass  # Не падаем если запись не удалась
 
         return self.buf_ph[ph]
 
-    def _load_phase_buffer_from_disk(self, ph: int) -> Tuple[List, List]:
+    def _load_phase_buffer_from_disk(self, ph: int, max_age_days: Optional[float] = None) -> Tuple[List, List, List]:
         """
-        Загружает все накопленные данные фазы из CSV
+        Загружает накопленные данные фазы из CSV с экспоненциальным взвешиванием
+        
+        Механизм экспоненциального забывания работает следующим образом:
+        - Каждому примеру присваивается вес w = exp(-age_days / tau)
+        - Свежие данные (age ≈ 0) имеют вес ≈ 1.0
+        - Данные возрастом tau дней имеют вес ≈ 0.37 (1/e)
+        - Данные возрастом 2*tau дней имеют вес ≈ 0.14 (1/e²)
+        
+        Это позволяет модели:
+        - Адаптироваться к новым рыночным условиям
+        - Постепенно забывать устаревшие паттерны
+        - Сохранять полезные долгосрочные закономерности
         
         Args:
             ph: номер фазы
+            max_age_days: период полураспада в днях (tau), по умолчанию из конфига
         
         Returns:
-            (X_list, y_list): списки фичей и меток
+            (X_list, y_list, weights): списки фичей, меток и временных весов
         """
-        X_list, y_list = [], []
+        X_list, y_list, weights = [], [], []
         
         csv_path = self._phase_csv_paths.get(ph)
         if not csv_path or not os.path.isfile(csv_path):
-            return X_list, y_list
+            return X_list, y_list, weights
+
+        # Получаем период полураспада из конфига
+        if max_age_days is None:
+            max_age_days = float(getattr(self.cfg, "meta_weight_decay_days", 30.0))
+        
+        current_time = time.time()
 
         try:
             with open(csv_path, "r", encoding="utf-8") as f:
                 reader = csv.reader(f)
-                next(reader, None)  # Пропускаем заголовок
+                header = next(reader, None)
+                
+                # Проверяем, есть ли колонка timestamp в CSV
+                has_timestamp = header and "timestamp" in header
                 
                 for row in reader:
                     if len(row) < 2:
                         continue
-                    # Последний элемент - метка, остальное - фичи
-                    x = [float(v) for v in row[:-1]]
-                    y = int(float(row[-1]))
-                    X_list.append(x)
-                    y_list.append(y)
+                    
+                    try:
+                        # Обрабатываем как новый формат (с timestamp), так и старый
+                        if has_timestamp and len(row) >= 3:
+                            # Новый формат: [x0, x1, ..., xN, y, timestamp]
+                            x = [float(v) for v in row[:-2]]
+                            y = int(float(row[-2]))
+                            row_time = float(row[-1])
+                        else:
+                            # Старый формат без timestamp: [x0, x1, ..., xN, y]
+                            # Даём старым данным максимальный вес, чтобы не потерять их
+                            x = [float(v) for v in row[:-1]]
+                            y = int(float(row[-1]))
+                            row_time = current_time
+                        
+                        # Вычисляем возраст записи в днях
+                        age_days = (current_time - row_time) / 86400.0
+                        
+                        # Экспоненциальное затухание: вес падает с возрастом
+                        # При age = tau: вес = e^(-1) ≈ 0.368
+                        # При age = 2*tau: вес = e^(-2) ≈ 0.135
+                        weight = math.exp(-age_days / max_age_days)
+                        
+                        X_list.append(x)
+                        y_list.append(y)
+                        weights.append(weight)
+                        
+                    except (ValueError, IndexError):
+                        continue  # Пропускаем повреждённые строки
+                        
         except Exception:
             pass
 
-        return X_list, y_list
+        return X_list, y_list, weights
 
     def _clear_phase_storage(self, ph: int):
         """
