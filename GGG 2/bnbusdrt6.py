@@ -7225,6 +7225,7 @@ def main_loop():
                                     if math.isfinite(_d15):
                                         _delta15_str = f"Δ15_med={(_d15/1e18 if _d15 > 1e6 else _d15):.4f} BNB"
 
+
                                 _safe_margin = float(margin_vs_market) if isinstance(margin_vs_market, (int, float)) and math.isfinite(float(margin_vs_market)) else 0.0
                                 _safe_q70 = float(q70_loss) if isinstance(q70_loss, (int, float)) and math.isfinite(float(q70_loss)) else 0.0
                                 _safe_q50 = float(q50_loss) if isinstance(q50_loss, (int, float)) and math.isfinite(float(q50_loss)) else 0.0
@@ -7239,18 +7240,19 @@ def main_loop():
                                     (f"порог-оверрайды: {', '.join(override_reasons)}" if override_reasons else None),
                                     f"Kelly/8={kelly_txt}",
                                 ]
+                                
                                 extra = [x for x in extra if x is not None]
-
+                                
                                 send_round_snapshot(
                                     prefix=f"⛔ <b>Skip</b> epoch={epoch} (EV-gate)",
                                     extra_lines=extra
                                 )
-
+                                
                                 notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
-
-                                # === Теневой лог в CSV ===
+                                
+                                # === Теневой лог ===
                                 try:
-                                    gas_gwei_for_log = float(gas_gwei_now) if ('gas_gwei_now' in locals()) else float(get_gas_price_wei(w3)) / 1e9
+                                    gas_gwei_for_log = float(gas_gwei_now) if 'gas_gwei_now' in locals() else float(get_gas_price_wei(w3)) / 1e9
                                     append_shadow_row(CSV_SHADOW_PATH, {
                                         "settled_ts": "",
                                         "epoch": epoch,
@@ -7273,38 +7275,8 @@ def main_loop():
                                     })
                                 except Exception as e:
                                     print(f"[shadow] append failed: {e}")
-
-                                # === Теневой «бет» в оперативной памяти для OOF/теней всех экспертов ===
-                                bets[epoch] = dict(
-                                    skipped=True, reason="ev_gate", settled=False, wait_polls=0,
-                                    time=now, t_lock=rd.lock_ts,
-                                    bet_up=bool(bet_up),
-                                    p_up=_as_float(P_up),
-                                    p_side=_as_float(p_side),
-                                    p_thr=_as_float(p_thr),
-                                    p_thr_src=str(p_thr_src),
-                                    r_hat=_as_float(r_hat, 1.0),
-                                    r_hat_source=str(r_hat_source),
-                                    gas_price_bet_wei=int(gas_gwei_for_log * 1e9),
-                                    gas_bet_bnb=float(gas_bet_bnb_cur),
-                                    edge_at_entry=float("nan"),
-                                    # сохраняем всё, что нужно МЕТА/экспертам для record_result()
-                                    ens=dict(
-                                        x=x_ml.tolist(),
-                                        p_xgb=(None if p_xgb is None else float(p_xgb)),
-                                        p_rf=(None if p_rf is None else float(p_rf)),
-                                        p_arf=(None if p_arf is None else float(p_arf)),
-                                        p_nn=(None if p_nn is None else float(p_nn)),
-                                        p_final=float(p_final) if p_final is not None else None,
-                                        used=False,                      # в EV-скипе ансамбль не использован
-                                        meta_mode=meta.mode,
-                                        p_base=float(p_base_before_ens),
-                                        reg_ctx=reg_ctx,
-                                    ),
-                                )
-
+                                
                                 continue  # ← переход к следующему epoch
-
 
                         # ============================================================
                         # === ЕСЛИ ДОШЛИ СЮДА: ФИЛЬТР ПРОЙДЕН, РАЗМЕЩАЕМ СТАВКУ ===
@@ -7435,32 +7407,6 @@ def main_loop():
 
                     elif now >= rd.lock_ts:
                         bets[epoch] = dict(skipped=True, reason="late", wait_polls=0, settled=False)
-
-                        # Пытаемся сохранить «теневой» ENS-снимок, если признаки ещё доступны
-                        try:
-                            _x = x_ml if ('x_ml' in locals()) else None
-                            if isinstance(_x, np.ndarray) and _x.size > 0:
-                                px, mx = xgb_exp.proba_up(_x,  reg_ctx=reg_ctx)
-                                pr, mr = rf_exp.proba_up(_x,   reg_ctx=reg_ctx)
-                                pa, ma = arf_exp.proba_up(_x,  reg_ctx=reg_ctx)
-                                pn, mn = nn_exp.proba_up(_x,   reg_ctx=reg_ctx)
-                                pf = meta.predict(px, pr, pa, pn, p_base_before_ens, reg_ctx=reg_ctx)
-
-                                bets[epoch]["ens"] = dict(
-                                    x=_x.tolist(),
-                                    p_xgb=(None if px is None else float(px)),
-                                    p_rf=(None if pr is None else float(pr)),
-                                    p_arf=(None if pa is None else float(pa)),
-                                    p_nn=(None if pn is None else float(pn)),
-                                    p_final=float(pf) if pf is not None else None,
-                                    used=False,
-                                    meta_mode=meta.mode,
-                                    p_base=float(p_base_before_ens),
-                                    reg_ctx=reg_ctx,
-                                )
-                        except Exception:
-                            pass
-
                         print(f"[late] epoch={epoch} missed betting window")
                         send_round_snapshot(
                             prefix=f"⛔ <b>Skip</b> epoch={epoch} (late)",
@@ -7468,24 +7414,20 @@ def main_loop():
                         )
                         notify_ens_used(None, None, None, None, None, None, False, meta.mode)
 
-
                 # --- обработка закрытия/сеттла
                 b = bets.get(epoch)
                 if not b or b.get("settled"):
                     continue
 
                 # пропущенные считаем финализированными сразу после close_ts
-                # пропущенные НЕ финализируем без исхода — ждём oracleCalled, чтобы прокинуть y_up в OOF/тени
-                # безопасный таймаут на случай, если оракул так и не придёт
-                if b.get("skipped") and (now > rd.close_ts + 900) and (not rd.oracle_called):
+                if b.get("skipped") and now > rd.close_ts:
                     b["settled"] = True
                     b["outcome"] = "skipped"
                     send_round_snapshot(
-                        prefix=f"ℹ️ <b>Round</b> epoch={epoch} finalized (skip, timeout).",
-                        extra_lines=["Оракул не пришёл в течение 15 минут, финализируем как skip."]
+                        prefix=f"ℹ️ <b>Round</b> epoch={epoch} finalized (skip).",
+                        extra_lines=["Раунд завершён, пропуск подтверждён."]
                     )
                     continue
-
 
                 # обычный сеттл — когда oracleCalled
                 # обычный сеттл — когда oracleCalled
