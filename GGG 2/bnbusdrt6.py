@@ -2419,6 +2419,7 @@ class MLConfig:
     use_two_window_drop: bool = False
 # =============================
 # ====== ФАЗОВАЯ ПАМЯТЬ / КАЛИБРОВКА ======
+# ====== ФАЗОВАЯ ПАМЯТЬ / КАЛИБРОВКА ======
     use_phase_memory: bool = True
     phase_count: int = 6
     phase_memory_cap: int = 3000    # ИЗМЕНЕНО: было 10_000
@@ -2426,6 +2427,7 @@ class MLConfig:
     phase_mix_global_share: float = 0.30   # если < phase_min_ready: доля глобального хвоста
     phase_hysteresis_s: int = 300     
     meta_use_cma_es: bool = True  # ← включаем CMA-ES     # залипание фазы (анти-дрожь)
+    meta_weight_decay_days: float = 30.0  # период полураспада для экспоненциального забывания (в днях)
     phase_state_path: str = "phase_state.json"
 
     # для файлов калибраторов по фазе (будем апеллировать к существующим путям)
