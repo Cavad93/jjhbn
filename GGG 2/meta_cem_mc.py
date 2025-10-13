@@ -535,7 +535,7 @@ class MetaCEMMC:
         return float(np.clip(p, 0.0, 1.0))
 
     # ========== ЗАПИСЬ РЕЗУЛЬТАТА И ОБУЧЕНИЕ ==========
-    
+        
     def record_result(
         self,
         p_xgb: Optional[float],
@@ -588,18 +588,21 @@ class MetaCEMMC:
         if p_for_gate is not None:
             hit = int((p_for_gate >= 0.5) == bool(y_up))
             
-            if used_in_live and self.mode == "ACTIVE":
-                # В активном режиме отслеживаем реальные сделки
+            # ИСПРАВЛЕНИЕ: убрана двойная проверка режима
+            # Теперь решение основано только на текущем self.mode
+            if self.mode == "ACTIVE" and used_in_live:
+                # В ACTIVE режиме: отслеживаем только реальные ставки
                 self.active_hits.append(hit)
                 
                 # ADWIN детектирует концептуальный дрейф
                 if self.adwin is not None:
                     in_drift = self.adwin.update(1 - hit)
                     if in_drift:
-                        self.mode = "SHADOW"  # Обнаружен дрейф - возвращаемся в shadow
+                        self.mode = "SHADOW"
                         self.active_hits = []
             else:
-                # В shadow режиме накапливаем "что было бы"
+                # В SHADOW режиме: накапливаем ВСЕ наблюдения
+                # Это позволяет МЕТЕ учиться даже когда она не используется в ставках
                 self.shadow_hits.append(hit)
             
             # Ограничиваем размер буферов хитов
@@ -632,9 +635,9 @@ class MetaCEMMC:
                     
                     # Логируем результаты CV
                     print(f"[MetaCEMMC] CV ph={ph}: "
-                          f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
-                          f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
-                          f"folds={cv_results['n_folds']}")
+                        f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
+                        f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
+                        f"folds={cv_results['n_folds']}")
             except Exception as e:
                 print(f"[MetaCEMMC] CV failed for phase {ph}: {e}")
 
