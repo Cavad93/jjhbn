@@ -3568,6 +3568,48 @@ class RFCalibratedExpert(_BaseExpert):
             self.new_since_train_ph = {p: 0 for p in range(self.P)}
             self._last_seen_phase = 0
 
+    def _predict_raw(self, x_raw: np.ndarray) -> Optional[float]:
+        """
+        Сырое предсказание модели БЕЗ калибровки.
+        Для CalibratedClassifierCV возвращает предсказание базового estimator.
+        """
+        if not self.enabled:
+            return None
+        
+        # Определяем текущую фазу
+        ph = getattr(self, '_last_seen_phase', 0)
+        
+        # Выбираем модель: фазовая или глобальная
+        model = self.clf_ph.get(ph) or self.clf
+        
+        if model is None:
+            return None
+        
+        try:
+            xx = x_raw.astype(np.float32).reshape(1, -1)
+            if self.n_feats is None:
+                self.n_feats = xx.shape[1]
+            
+            # Пытаемся получить СЫРОЕ предсказание до калибровки
+            # CalibratedClassifierCV хранит базовый estimator
+            if hasattr(model, 'calibrated_classifiers_'):
+                # Берем первый калиброванный классификатор
+                base = model.calibrated_classifiers_[0].base_estimator
+                p = float(base.predict_proba(xx)[0, 1])
+            elif hasattr(model, 'base_estimator'):
+                p = float(model.base_estimator.predict_proba(xx)[0, 1])
+            elif hasattr(model, 'estimator'):
+                p = float(model.estimator.predict_proba(xx)[0, 1])
+            else:
+                # Fallback: используем калиброванную вероятность
+                # (не идеально, но лучше чем крэш)
+                p = float(model.predict_proba(xx)[0, 1])
+            
+            return float(min(max(p, 1e-6), 1.0 - 1e-6))
+        except Exception:
+            return None
+
+
     # ---------- ЗАГРУЗКА/СОХРАНЕНИЕ ----------
     def _load_all(self) -> None:
         # --- загружаем состояние эксперта (JSON) ---
@@ -7054,7 +7096,7 @@ def main_loop():
                                     p_side=p_side, p_thr=p_thr, p_thr_src=p_thr_src,
                                     r_hat=r_hat, r_hat_source=r_hat_source,
                                     gb_hat=gb_hat, gc_hat=gc_hat, stake=stake,
-                                    delta15=(_as_float(delta15, None) if (USE_STRESS_R15 and 'delta15' in locals()) else None),
+                                    delta15=(_as_float(locals().get('delta15'), None) if USE_STRESS_R15 else None),
                                     wait_polls=0, settled=False,
                                     p_meta_raw=float(p_meta_raw) if 'p_meta_raw' in locals() else float('nan'),
                                     calib_src=str(calib_src) if 'calib_src' in locals() else "calib[off]"
@@ -7076,7 +7118,7 @@ def main_loop():
                                         gb_hat=gb_hat,
                                         gc_hat=gc_hat,
                                         stake=stake,
-                                        delta15=(_as_float(delta15, None) if (USE_STRESS_R15 and 'delta15' in locals()) else None),
+                                        delta15=(_as_float(locals().get('delta15'), None) if USE_STRESS_R15 else None),
                                         extra_lines=[],
                                         delta_eff=0.0,
                                     )
@@ -7169,7 +7211,7 @@ def main_loop():
                                     p_side=p_side, p_thr=p_thr, p_thr_src=p_thr_src,
                                     r_hat=r_hat, r_hat_source=r_hat_source,
                                     gb_hat=gb_hat, gc_hat=gc_hat, stake=stake,
-                                    delta15=(_as_float(delta15, None) if (USE_STRESS_R15 and 'delta15' in locals()) else None),
+                                    delta15=(_as_float(locals().get('delta15'), None) if USE_STRESS_R15 else None),
                                     wait_polls=0, settled=False,
                                     p_meta_raw=float(p_meta_raw) if 'p_meta_raw' in locals() else float('nan'),
                                     calib_src=str(calib_src) if 'calib_src' in locals() else "calib[off]"
@@ -7197,7 +7239,7 @@ def main_loop():
                                         gb_hat=gb_hat,
                                         gc_hat=gc_hat,
                                         stake=stake,
-                                        delta15=(_as_float(delta15, None) if (USE_STRESS_R15 and 'delta15' in locals()) else None),
+                                        delta15=(_as_float(locals().get('delta15'), None) if USE_STRESS_R15 else None),
                                         extra_lines=[
                                             f"Kelly/2:   {kelly_txt}",
                                             f"❌ EV strong: p={_as_float(p_side,0.0):.4f} < p_thr+δ={(_as_float(p_thr)+_as_float(delta_eff,0.0)):.4f}",
@@ -7355,7 +7397,7 @@ def main_loop():
                             calib_src=str(locals().get("calib_src", "calib[off]")),
                             gas_price_bet_wei=gas_price_wei, gas_bet_bnb=gas_bet_bnb_cur,
                             edge_at_entry=edge_at_entry,
-                            delta15=(_as_float(delta15, None) if (USE_STRESS_R15 and 'delta15' in locals()) else None),
+                            delta15=(_as_float(locals().get('delta15'), None) if USE_STRESS_R15 else None),
                             phi=phi, phi_wf=phi_wf,
                             ens=dict(
                                 x=x_ml.tolist(),
@@ -8144,3 +8186,5 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
+
+
