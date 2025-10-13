@@ -582,35 +582,42 @@ class MetaCEMMC:
         self.seen_ph[ph] += 1
 
         # ===== ШАГ 3: ОБНОВЛЕНИЕ МЕТРИК =====
+        # ===== ШАГ 3: ОБНОВЛЕНИЕ МЕТРИК =====
         # Вычисляем, было ли предсказание правильным
+        # ИСПРАВЛЕНИЕ: всегда делаем предсказание для статистики, даже если веса не обучены
         p_for_gate = p_final_used if (p_final_used is not None) else self._safe_p_from_x(ph, x)
-        
-        if p_for_gate is not None:
-            hit = int((p_for_gate >= 0.5) == bool(y_up))
-            
-            # ИСПРАВЛЕНИЕ: убрана двойная проверка режима
-            # Теперь решение основано только на текущем self.mode
-            if self.mode == "ACTIVE" and used_in_live:
-                # В ACTIVE режиме: отслеживаем только реальные ставки
-                self.active_hits.append(hit)
-                
-                # ADWIN детектирует концептуальный дрейф
-                if self.adwin is not None:
-                    in_drift = self.adwin.update(1 - hit)
-                    if in_drift:
-                        self.mode = "SHADOW"
-                        self.active_hits = []
-            else:
-                # В SHADOW режиме: накапливаем ВСЕ наблюдения
-                # Это позволяет МЕТЕ учиться даже когда она не используется в ставках
-                self.shadow_hits.append(hit)
-            
-            # Ограничиваем размер буферов хитов
-            self.active_hits = self.active_hits[-2000:]
-            self.shadow_hits = self.shadow_hits[-2000:]
 
-            self._unsaved += 1
-            self._save_throttled()
+        # НОВОЕ: Если веса еще не обучены, делаем baseline предсказание
+        if p_for_gate is None:
+            # Используем базовое предсказание или нейтральное 0.5
+            p_for_gate = p_base if p_base is not None else 0.5
+
+        # Теперь p_for_gate ВСЕГДА определено
+        hit = int((p_for_gate >= 0.5) == bool(y_up))
+
+        # ИСПРАВЛЕНИЕ: убрана двойная проверка режима
+        # Теперь решение основано только на текущем self.mode
+        if self.mode == "ACTIVE" and used_in_live:
+            # В ACTIVE режиме: отслеживаем только реальные ставки
+            self.active_hits.append(hit)
+            
+            # ADWIN детектирует концептуальный дрейф
+            if self.adwin is not None:
+                in_drift = self.adwin.update(1 - hit)
+                if in_drift:
+                    self.mode = "SHADOW"
+                    self.active_hits = []
+        else:
+            # В SHADOW режиме: накапливаем ВСЕ наблюдения
+            # Это позволяет МЕТЕ учиться даже когда она не используется в ставках
+            self.shadow_hits.append(hit)
+
+        # Ограничиваем размер буферов хитов
+        self.active_hits = self.active_hits[-2000:]
+        self.shadow_hits = self.shadow_hits[-2000:]
+
+        self._unsaved += 1
+        self._save_throttled()
 
         # ===== ШАГ 4: НОВОЕ - OOF TRACKING ДЛЯ CV =====
         # Сохраняем предсказания для последующей валидации
