@@ -7867,7 +7867,7 @@ def main_loop():
                             pass
 
                         try:
-                            ens_info = b.get("ens") or {}   # ← та же защита
+                            ens_info = b.get("ens") or {}
                             x_ml = np.array(ens_info.get("x", []), dtype=float)
                             p_xgb = ens_info.get("p_xgb", None)
                             p_rf  = ens_info.get("p_rf", None)
@@ -7878,53 +7878,87 @@ def main_loop():
                             used_flag = bool(ens_info.get("used", False))
 
                             reg_ctx = (ens_info.get("reg_ctx", {}) or {})
-                            reg_ctx = dict(reg_ctx, epoch=int(epoch))  # ← добавили идентификатор раунда
+                            reg_ctx = dict(reg_ctx, epoch=int(epoch))
 
-                            if not draw and x_ml.size > 0:
+                            if not draw:
                                 y_up_int = 1 if up_won else 0
 
-                                if xgb_exp.enabled:
-                                    xgb_exp.record_result(x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_xgb, reg_ctx=reg_ctx)
-                                    xgb_exp.maybe_train()
-                                if rf_exp.enabled:
-                                    rf_exp.record_result( x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_rf,  reg_ctx=reg_ctx)
-                                    rf_exp.maybe_train()
-                                if arf_exp.enabled:
-                                    arf_exp.record_result(x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_arf, reg_ctx=reg_ctx)
-                                if nn_exp.enabled:
-                                    nn_exp.record_result( x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_nn,  reg_ctx=reg_ctx)
-                                    nn_exp.maybe_train()
+                                if xgb_exp.enabled and x_ml.size > 0:
+                                    xgb_exp.record_result(
+                                        x_ml,
+                                        y_up=y_up_int,
+                                        used_in_live=used_flag,
+                                        p_pred=p_xgb,
+                                        reg_ctx=reg_ctx
+                                    )
+                                    xgb_exp.maybe_train(reg_ctx=reg_ctx)
+
+                                if rf_exp.enabled and x_ml.size > 0:
+                                    rf_exp.record_result(
+                                        x_ml,
+                                        y_up=y_up_int,
+                                        used_in_live=used_flag,
+                                        p_pred=p_rf,
+                                        reg_ctx=reg_ctx
+                                    )
+                                    rf_exp.maybe_train(reg_ctx=reg_ctx)
+
+                                if arf_exp.enabled and x_ml.size > 0:
+                                    arf_exp.record_result(
+                                        x_ml,
+                                        y_up=y_up_int,
+                                        used_in_live=used_flag,
+                                        p_pred=p_arf,
+                                        reg_ctx=reg_ctx
+                                    )
+                                    arf_exp.maybe_train(reg_ctx=reg_ctx)
+
+                                if nn_exp.enabled and x_ml.size > 0:
+                                    nn_exp.record_result(
+                                        x_ml,
+                                        y_up=y_up_int,
+                                        used_in_live=used_flag,
+                                        p_pred=p_nn,
+                                        reg_ctx=reg_ctx
+                                    )
+                                    nn_exp.maybe_train(reg_ctx=reg_ctx)
 
                                 meta.record_result(
-                                    p_xgb, p_rf, p_arf, p_nn, p_base=p_base,
-                                    y_up=y_up_int, used_in_live=used_flag, p_final_used=p_fin,
+                                    p_xgb,
+                                    p_rf,
+                                    p_arf,
+                                    p_nn,
+                                    p_base=p_base,
+                                    y_up=y_up_int,
+                                    used_in_live=used_flag,
+                                    p_final_used=p_fin,
                                     reg_ctx=reg_ctx
                                 )
 
-                                # NEW: обновляем вторую МЕТА (LambdaMART)
                                 try:
                                     LM = globals().get("_LM_META")
                                     if LM:
-                                        LM.record_result(p_xgb, p_rf, p_arf, p_nn, p_base=p_base, y_up=y_up_int, reg_ctx=reg_ctx, used_in_live=used_flag)
+                                        LM.record_result(
+                                            p_xgb,
+                                            p_rf,
+                                            p_arf,
+                                            p_nn,
+                                            p_base=p_base,
+                                            y_up=y_up_int,
+                                            reg_ctx=reg_ctx,
+                                            used_in_live=used_flag
+                                        )
                                 except Exception:
                                     pass
 
-                                # NEW: обновляем калибровщики и блендер на исходе
+
+                                # УПРОЩЕНО: обновляем только первый калибратор
                                 try:
                                     CM1 = globals().get("_CALIB_MGR")
-                                    CM2 = globals().get("_CALIB_MGR2")
-                                    BL  = globals().get("_BLENDER")
-                                    if CM1 and "p_meta_raw" in b and b["p_meta_raw"] == b["p_meta_raw"]:
-                                        CM1.update(float(b["p_meta_raw"]), int(y_up_int), int(time.time()))
-                                    if CM2 and "p_meta2_raw" in b and b["p_meta2_raw"] == b["p_meta2_raw"]:
-                                        CM2.update(float(b["p_meta2_raw"]), int(y_up_int), int(time.time()))
-                                    if BL and "p_meta_raw" in b:
-                                        p1c = (CM1.transform(float(b["p_meta_raw"])) if CM1 else float(b["p_meta_raw"]))
-                                        p2c = (CM2.transform(float(b["p_meta2_raw"])) if (CM2 and "p_meta2_raw" in b and b["p_meta2_raw"] == b["p_meta2_raw"]) else p1c)
-                                        BL.record(int(y_up_int), float(p1c), float(p2c))
+                                    if CM1 and ("p_meta_raw" in b) and _is_finite_num(b["p_meta_raw"]):
+                                        CM1.update(_as_float(b["p_meta_raw"]), int(y_up_int), int(time.time()))
                                 except Exception:
                                     pass
-
 
 
                         except Exception as _e:
