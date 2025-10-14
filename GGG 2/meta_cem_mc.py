@@ -360,7 +360,13 @@ class MetaCEMMC:
         self._load()
 
     # ========== СВЯЗЫВАНИЕ С ЭКСПЕРТАМИ ==========
-    
+    def settle(self, *args, **kwargs):
+        """
+        Алиас для record_result() (обратная совместимость с legacy кодом).
+        Просто перенаправляет вызов на record_result().
+        """
+        return self.record_result(*args, **kwargs)
+
     def bind_experts(self, *experts):
         """
         Сохраняет ссылки на экспертов для логирования и диагностики
