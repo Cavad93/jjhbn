@@ -4471,7 +4471,7 @@ class RiverARFExpert(_BaseExpert):
         min_ready = int(getattr(self.cfg, "min_ready", 500))
         enter_wr = float(getattr(self.cfg, "enter_wr", 55.0))
         exit_wr = float(getattr(self.cfg, "exit_wr", 50.0))
-        cv_enabled = getattr(self.cfg, "cv_enabled", False)
+        cv_enabled = getattr(self.cfg, "cv_enabled", True)
         
         wr_shadow = wr(self.shadow_hits, min_ready)
         wr_active = wr(self.active_hits, max(30, min_ready // 2))
@@ -7601,26 +7601,25 @@ def main_loop():
                         reg_ctx = (ens_info.get("reg_ctx", {}) or {})
                         reg_ctx = dict(reg_ctx, epoch=int(epoch))  # ← добавили идентификатор раунда
 
-                        if not draw:
+                        if not draw and x_ml.size > 0:
                             y_up_int = 1 if up_won else 0
-
-                            if xgb_exp.enabled and x_ml.size > 0:
+                            if xgb_exp.enabled:
                                 xgb_exp.record_result(x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_xgb, reg_ctx=reg_ctx)
                                 xgb_exp.maybe_train()
-                            if rf_exp.enabled and x_ml.size > 0:
+                            if rf_exp.enabled:
                                 rf_exp.record_result( x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_rf,  reg_ctx=reg_ctx)
                                 rf_exp.maybe_train()
-                            if arf_exp.enabled and x_ml.size > 0:
+                            if arf_exp.enabled:
                                 arf_exp.record_result(x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_arf, reg_ctx=reg_ctx)
-                            if nn_exp.enabled and x_ml.size > 0:
+                            if nn_exp.enabled:
                                 nn_exp.record_result( x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_nn,  reg_ctx=reg_ctx)
                                 nn_exp.maybe_train()
-
-                            meta.record_result(
+                            meta.settle(
                                 p_xgb, p_rf, p_arf, p_nn, p_base=p_base,
                                 y_up=y_up_int, used_in_live=used_flag, p_final_used=p_fin,
                                 reg_ctx=reg_ctx
                             )
+
 
                             # УПРОЩЕНО: обновляем только первый калибратор
                             try:
@@ -7965,7 +7964,7 @@ def main_loop():
                                     )
                                     nn_exp.maybe_train(reg_ctx=reg_ctx)
 
-                                meta.record_result(
+                                meta.settle(
                                     p_xgb,
                                     p_rf,
                                     p_arf,
