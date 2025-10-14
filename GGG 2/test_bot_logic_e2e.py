@@ -36,10 +36,46 @@ def ev_threshold(gb: float, gc: float, S: float, r: float):
 def meta_record_adaptive(meta, *args, **kwargs):
     """
     Универсальная запись примера в МЕТА.
-    Пытаемся meta.record(...), иначе record_result(...), иначе observe(...).
+    Пытаемся meta.settle(...), иначе record(...), иначе record_result(...), иначе observe(...).
     Подбираем сигнатуры на лету.
     """
-    # 1) Прямой вызов record(...)
+    # 1) Прямой вызов settle(...) - ПРИОРИТЕТ 1
+    if hasattr(meta, "settle"):
+        try:
+            return meta.settle(*args, **kwargs)
+        except TypeError:
+            # Извлекаем значения для settle
+            p_xgb = kwargs.get("p_xgb", args[0] if len(args) > 0 else 0.5)
+            p_rf  = kwargs.get("p_rf",  args[1] if len(args) > 1 else 0.5)
+            p_arf = kwargs.get("p_arf", args[2] if len(args) > 2 else 0.5)
+            p_nn  = kwargs.get("p_nn",  args[3] if len(args) > 3 else 0.5)
+            p_base = kwargs.get("p_base", args[4] if len(args) > 4 else 0.5)
+            y = kwargs.get("y_up", 0)
+            ctx = kwargs.get("reg_ctx", None)
+            used_in_live = kwargs.get("used_in_live", True)
+            p_final_used = kwargs.get("p_final_used", None)
+            
+            try:
+                # Полная сигнатура settle
+                return meta.settle(
+                    p_xgb=p_xgb,
+                    p_rf=p_rf,
+                    p_arf=p_arf,
+                    p_nn=p_nn,
+                    p_base=p_base,
+                    y_up=y,
+                    used_in_live=used_in_live,
+                    p_final_used=p_final_used,
+                    reg_ctx=ctx
+                )
+            except TypeError:
+                try:
+                    # Позиционные аргументы
+                    return meta.settle(p_xgb, p_rf, p_arf, p_nn, p_base, y, used_in_live, p_final_used, ctx)
+                except TypeError:
+                    pass
+
+    # 2) Прямой вызов record(...)
     if hasattr(meta, "record"):
         try:
             return meta.record(*args, **kwargs)
@@ -49,7 +85,7 @@ def meta_record_adaptive(meta, *args, **kwargs):
             except TypeError:
                 pass
 
-    # 2) Универсальный вызов record_result(...)
+    # 3) Универсальный вызов record_result(...)
     if hasattr(meta, "record_result"):
         try:
             return meta.record_result(*args, **kwargs)
@@ -59,13 +95,13 @@ def meta_record_adaptive(meta, *args, **kwargs):
 
             # Извлечём значения из нашего унифицированного вызова
             # Мы передаём: (p_xgb, p_rf, p_arf, p_nn, p_base), y_up=..., reg_ctx=...
-            p_xgb = kwargs.get("p_xgb", args[0] if len(args)>0 else 0.5)
-            p_rf  = kwargs.get("p_rf",  args[1] if len(args)>1 else 0.5)
-            p_arf = kwargs.get("p_arf", args[2] if len(args)>2 else 0.5)
-            p_nn  = kwargs.get("p_nn",  args[3] if len(args)>3 else 0.5)
-            p_base= kwargs.get("p_base",args[4] if len(args)>4 else 0.5)
-            y     = kwargs.get("y_up", 0)
-            ctx   = kwargs.get("reg_ctx", None)
+            p_xgb = kwargs.get("p_xgb", args[0] if len(args) > 0 else 0.5)
+            p_rf  = kwargs.get("p_rf",  args[1] if len(args) > 1 else 0.5)
+            p_arf = kwargs.get("p_arf", args[2] if len(args) > 2 else 0.5)
+            p_nn  = kwargs.get("p_nn",  args[3] if len(args) > 3 else 0.5)
+            p_base = kwargs.get("p_base", args[4] if len(args) > 4 else 0.5)
+            y = kwargs.get("y_up", 0)
+            ctx = kwargs.get("reg_ctx", None)
             used_in_live = kwargs.get("used_in_live", True)
 
             # Сигнатура: (p_xgb,p_rf,p_arf,p_nn,p_base,y_up,used_in_live,reg_ctx)
@@ -80,7 +116,7 @@ def meta_record_adaptive(meta, *args, **kwargs):
                         pass
 
             # Сигнатура: (p_final, y_up, reg_ctx) или (p,y,ctx)
-            if {"p_final","y_up"}.issubset(set(names)) or (len(names)>=2 and names[0] in ("p_final","p")):
+            if {"p_final","y_up"}.issubset(set(names)) or (len(names) >= 2 and names[0] in ("p_final","p")):
                 pf = kwargs.get("p_final", p_xgb)
                 try:
                     return meta.record_result(p_final=pf, y_up=y, reg_ctx=ctx)
@@ -90,14 +126,14 @@ def meta_record_adaptive(meta, *args, **kwargs):
                     except TypeError:
                         pass
 
-    # 3) Наконец, observe(...)
+    # 4) Наконец, observe(...)
     if hasattr(meta, "observe"):
         try:
             return meta.observe(*args, **kwargs)
         except TypeError:
             pass
 
-    pytest.skip("У МЕТА нет совместимого метода record/record_result/observe")
+    pytest.skip("У МЕТА нет совместимого метода settle/record/record_result/observe")
 
 # ------------------------ САМ ТЕСТ ------------------------
 
