@@ -7391,13 +7391,14 @@ def main_loop():
                             kelly_half=(None if bootstrap_phase else _as_float(kelly_half, 0.0)),
                             stake=_as_float(stake, 0.0),
                             p_meta_raw=_as_float(locals().get("p_meta_raw")),
-                            p_meta2_raw=_as_float(locals().get("p_meta2_raw")),   # ← NEW
-                            p_blend=_as_float(locals().get("p_blend")),           # ← NEW
-                            blend_w=_as_float(locals().get("blend_w")),           # ← NEW
+                            p_meta2_raw=_as_float(locals().get("p_meta2_raw")),
+                            p_blend=_as_float(locals().get("p_blend")),
+                            blend_w=_as_float(locals().get("blend_w")),
                             calib_src=str(locals().get("calib_src", "calib[off]")),
                             gas_price_bet_wei=gas_price_wei, gas_bet_bnb=gas_bet_bnb_cur,
                             edge_at_entry=edge_at_entry,
-                            delta15=(_as_float(locals().get('delta15'), None) if USE_STRESS_R15 else None),
+                            delta15=(_as_float(delta15, None) if (USE_STRESS_R15 and 'delta15' in locals()) else None),
+                            delta_eff=_as_float(delta_eff, 0.0),
                             phi=phi, phi_wf=phi_wf,
                             ens=dict(
                                 x=x_ml.tolist(),
@@ -7656,6 +7657,7 @@ def main_loop():
                         gc_hat = float(b.get("gc_hat", 0.0))
                         stake  = float(b.get("stake",  0.0))
                         delta15 = b.get("delta15", None)
+                        delta_eff = float(b.get("delta_eff", 0.0))
 
                         notify_ev_decision(
                             title=f"{status} Settle",
@@ -7672,7 +7674,7 @@ def main_loop():
                             extra_lines=[
                                 f"outcome:   {'win' if (up_won or down_won) else 'draw'}",
                                 f"pnl:       {pnl:+.6f}  (BNB)",
-                            ],  # ← запятая обязательна
+                            ],
                             delta_eff=delta_eff,
                         )
                     except Exception as e:
