@@ -1784,6 +1784,189 @@ def _period_return_pct(df: pd.DataFrame, start_ts: int, now_ts: int) -> Optional
         return None
     return (end_cap - base_cap) / base_cap * 100.0
 
+def compute_extended_stats_from_csv(path: str) -> Dict[str, Any]:
+    """Расширенная статистика с риск-метриками и текущим состоянием"""
+    df = _read_csv_df(path)
+    if df.empty:
+        return dict(total=0, wins=0, losses=0, winrate=None, roi_24h=None, roi_7d=None, roi_30d=None,
+                   max_dd=None, profit_factor=None, current_streak=None, avg_edge=None,
+                   avg_win=None, avg_loss=None, win_loss_ratio=None, sharpe=None,
+                   last_trade_ago_min=None, skip_stats=None, gas_efficiency=None)
+    
+    df = df.dropna(subset=["outcome"])
+    df_tr = df[df["outcome"].isin(["win","loss"])]
+    
+    # Базовые метрики
+    wins = int((df_tr["outcome"] == "win").sum())
+    losses = int((df_tr["outcome"] == "loss").sum())
+    total = wins + losses
+    winrate = (wins / total * 100.0) if total > 0 else None
+    
+    now_ts = int(time.time())
+    roi_24 = _period_return_pct(df, now_ts - 24*3600, now_ts)
+    roi_7d = _period_return_pct(df, now_ts - 7*24*3600, now_ts)
+    roi_30 = _period_return_pct(df, now_ts - 30*24*3600, now_ts)
+    
+    # === НОВЫЕ МЕТРИКИ ===
+    
+    # 1. Max Drawdown
+    max_dd = None
+    dd_peak = None
+    dd_trough = None
+    try:
+        caps = pd.to_numeric(df_tr["capital_after"], errors="coerce").dropna()
+        if len(caps) > 0:
+            peak = caps.iloc[0]
+            max_drawdown = 0.0
+            peak_val = peak
+            trough_val = peak
+            for cap in caps:
+                if cap > peak:
+                    peak = cap
+                    peak_val = cap
+                dd = (cap - peak) / peak if peak > 0 else 0.0
+                if dd < max_drawdown:
+                    max_drawdown = dd
+                    trough_val = cap
+            max_dd = max_drawdown * 100.0
+            dd_peak = float(peak_val)
+            dd_trough = float(trough_val)
+    except Exception:
+        pass
+    
+    # 2. Profit Factor
+    profit_factor = None
+    try:
+        pnls = pd.to_numeric(df_tr["pnl"], errors="coerce").dropna()
+        wins_sum = pnls[pnls > 0].sum()
+        losses_sum = abs(pnls[pnls < 0].sum())
+        if losses_sum > 0:
+            profit_factor = wins_sum / losses_sum
+    except Exception:
+        pass
+    
+    # 3. Current Streak
+    current_streak = None
+    try:
+        outcomes = df_tr["outcome"].tail(20).tolist()
+        if outcomes:
+            last = outcomes[-1]
+            count = 1
+            for i in range(len(outcomes)-2, -1, -1):
+                if outcomes[i] == last:
+                    count += 1
+                else:
+                    break
+            current_streak = f"{count}{'W' if last == 'win' else 'L'}"
+    except Exception:
+        pass
+    
+    # 4. Average Edge
+    avg_edge = None
+    edge_realized = None
+    try:
+        edges = pd.to_numeric(df_tr["edge_at_entry"], errors="coerce").dropna()
+        if len(edges) > 0:
+            avg_edge = float(edges.mean())
+            # Реализованный edge = фактический винрейт vs ожидаемый
+            if winrate is not None and len(edges) > 0:
+                expected_wr = (edges.mean() + 0.5) * 100  # грубая оценка
+                edge_realized = winrate - expected_wr
+    except Exception:
+        pass
+    
+    # 5. Avg Win/Loss
+    avg_win = None
+    avg_loss = None
+    win_loss_ratio = None
+    try:
+        pnls = pd.to_numeric(df_tr["pnl"], errors="coerce").dropna()
+        wins_pnl = pnls[pnls > 0]
+        losses_pnl = pnls[pnls < 0]
+        if len(wins_pnl) > 0:
+            avg_win = float(wins_pnl.mean())
+        if len(losses_pnl) > 0:
+            avg_loss = float(losses_pnl.mean())
+        if avg_win and avg_loss and avg_loss != 0:
+            win_loss_ratio = avg_win / abs(avg_loss)
+    except Exception:
+        pass
+    
+    # 6. Sharpe Ratio (24h, annualized)
+    sharpe = None
+    try:
+        df_24h = df_tr[pd.to_numeric(df_tr["settled_ts"], errors="coerce") >= (now_ts - 24*3600)]
+        if len(df_24h) >= 10:
+            pnls = pd.to_numeric(df_24h["pnl"], errors="coerce").dropna()
+            caps = pd.to_numeric(df_24h["capital_before"], errors="coerce").dropna()
+            if len(pnls) > 0 and len(caps) > 0:
+                returns = (pnls / caps).dropna()
+                if len(returns) >= 10 and returns.std() > 0:
+                    # Аннуализация: √(365*24*60/5) для 5-минутных раундов
+                    periods_per_year = 365 * 24 * 60 / 5
+                    sharpe = (returns.mean() / returns.std()) * np.sqrt(periods_per_year)
+    except Exception:
+        pass
+    
+    # 7. Last Trade Time
+    last_trade_ago_min = None
+    try:
+        last_ts = pd.to_numeric(df_tr["settled_ts"], errors="coerce").dropna().iloc[-1]
+        last_trade_ago_min = (now_ts - last_ts) / 60.0
+    except Exception:
+        pass
+    
+    # 8. Skip Statistics
+    skip_stats = None
+    try:
+        all_rows = df.copy()
+        skipped = all_rows[all_rows["outcome"].isin(["skipped"])]
+        total_epochs = len(all_rows)
+        skip_count = len(skipped)
+        if total_epochs > 0:
+            skip_rate = skip_count / total_epochs * 100
+            skip_stats = {
+                "total": skip_count,
+                "rate": skip_rate,
+                "reasons": {}
+            }
+            # Подсчёт по причинам (если есть колонка reason)
+            # Это требует модификации CSV, пока пропустим детали
+    except Exception:
+        pass
+    
+    # 9. Gas Efficiency
+    gas_efficiency = None
+    try:
+        gas_bet = pd.to_numeric(df_tr["gas_bet_bnb"], errors="coerce").dropna()
+        gas_claim = pd.to_numeric(df_tr["gas_claim_bnb"], errors="coerce").dropna()
+        stakes = pd.to_numeric(df_tr["stake"], errors="coerce").dropna()
+        if len(gas_bet) > 0 and len(stakes) > 0:
+            total_gas = (gas_bet + gas_claim).mean()
+            avg_stake = stakes.mean()
+            if avg_stake > 0:
+                gas_efficiency = {
+                    "avg_gas": float(total_gas),
+                    "gas_stake_ratio": float(total_gas / avg_stake * 100)
+                }
+    except Exception:
+        pass
+    
+    return dict(
+        total=total, wins=wins, losses=losses, winrate=winrate,
+        roi_24h=roi_24, roi_7d=roi_7d, roi_30d=roi_30,
+        max_dd=max_dd, dd_peak=dd_peak, dd_trough=dd_trough,
+        profit_factor=profit_factor,
+        current_streak=current_streak,
+        avg_edge=avg_edge, edge_realized=edge_realized,
+        avg_win=avg_win, avg_loss=avg_loss, win_loss_ratio=win_loss_ratio,
+        sharpe=sharpe,
+        last_trade_ago_min=last_trade_ago_min,
+        skip_stats=skip_stats,
+        gas_efficiency=gas_efficiency
+    )
+
+
 def compute_stats_from_csv(path: str) -> Dict[str, Optional[float]]:
     df = _read_csv_df(path)
     if df.empty:
@@ -2314,7 +2497,7 @@ def build_stats_message(stats: Dict[str, Optional[float]]) -> str:
     except Exception:
         reserve_line = ""
     
-    # ← НОВОЕ: анализ точности r̂ из модуля
+    # r̂ accuracy
     r_hat_line = ""
     try:
         from r_hat_improved import analyze_r_hat_accuracy
@@ -2326,18 +2509,82 @@ def build_stats_message(stats: Dict[str, Optional[float]]) -> str:
             r_hat_line = f"r̂ accuracy: MAE={mae:.1f}%, bias={bias:+.1f}% (n={n})\n"
     except Exception:
         pass
-
+    
+    # === НОВЫЕ МЕТРИКИ ===
+    
+    # Max Drawdown
+    dd_line = ""
+    if stats.get("max_dd") is not None:
+        dd = stats["max_dd"]
+        peak = stats.get("dd_peak", 0)
+        trough = stats.get("dd_trough", 0)
+        dd_line = f"Max DD: <b>{dd:+.2f}%</b> (peak: {peak:.3f} → trough: {trough:.3f})\n"
+    
+    # Profit Factor & Win/Loss
+    pf_line = ""
+    if stats.get("profit_factor"):
+        pf = stats["profit_factor"]
+        pf_line = f"Profit Factor: <b>{pf:.2f}</b>"
+        if stats.get("avg_win") and stats.get("avg_loss"):
+            avg_w = stats["avg_win"]
+            avg_l = stats["avg_loss"]
+            wl_ratio = stats.get("win_loss_ratio", 0)
+            pf_line += f" | Avg W/L: {avg_w:+.4f} / {avg_l:+.4f} ({wl_ratio:.2f}x)\n"
+        else:
+            pf_line += "\n"
+    
+    # Current Streak & Last Trade
+    streak_line = ""
+    if stats.get("current_streak"):
+        streak = stats["current_streak"]
+        streak_line = f"Streak: <b>{streak}</b>"
+        if stats.get("last_trade_ago_min") is not None:
+            ago = stats["last_trade_ago_min"]
+            if ago < 60:
+                streak_line += f" | Last: {ago:.0f}m ago"
+            else:
+                streak_line += f" | Last: {ago/60:.1f}h ago"
+        streak_line += "\n"
+    
+    # Average Edge
+    edge_line = ""
+    if stats.get("avg_edge") is not None:
+        edge = stats["avg_edge"]
+        edge_line = f"Avg Edge: <b>{edge:+.4f}</b>"
+        if stats.get("edge_realized") is not None:
+            realized = stats["edge_realized"]
+            edge_line += f" (реализация: {realized:+.1f} п.п.)"
+        edge_line += "\n"
+    
+    # Sharpe Ratio
+    sharpe_line = ""
+    if stats.get("sharpe") is not None:
+        sharpe = stats["sharpe"]
+        sharpe_line = f"Sharpe (24h): <b>{sharpe:.2f}</b>\n"
+    
+    # Gas Efficiency
+    gas_line = ""
+    if stats.get("gas_efficiency"):
+        ge = stats["gas_efficiency"]
+        gas_line = f"Gas: {ge['avg_gas']:.6f} BNB/trade ({ge['gas_stake_ratio']:.2f}% of stake)\n"
+    
     msg = (f"<b>Статистика</b>\n"
            f"Trades: {total} | Wins: {wins} | Losses: {losses}\n"
            f"Winrate: <b>{wr}</b>\n"
            f"ROI: 24h={r24} | 7d={r7} | 30d={r30}\n"
            f"{reserve_line}"
+           f"{dd_line}"
+           f"{pf_line}"
+           f"{streak_line}"
+           f"{edge_line}"
+           f"{sharpe_line}"
+           f"{gas_line}"
            f"{r_hat_line}")
     return msg
 
 
 def send_round_snapshot(prefix: str, extra_lines: List[str]):
-    stats_dict = compute_stats_from_csv(CSV_PATH)
+    stats_dict = compute_extended_stats_from_csv(CSV_PATH)
     stats_msg = build_stats_message(stats_dict)
     explain = winrate_explanation(CSV_PATH)
     text = f"{prefix}\n" + "\n".join(extra_lines) + "\n\n" + stats_msg + f"<i>{explain}</i>"
@@ -7445,6 +7692,114 @@ def main_loop():
                         extra = [x for x in extra if x is not None]
                         send_round_snapshot(prefix=f"✅ <b>Bet</b> epoch={epoch}", extra_lines=extra)
 
+                        # ========== ВСТАВИТЬ СЮДА ==========
+                        # === ГЕНЕРАЦИЯ ОБЪЯСНЕНИЯ РЕШЕНИЯ META ===
+                        try:
+                            from meta_explainer import create_explanation_for_bet
+                            
+                            # Определяем текущий час UTC для time_of_day
+                            from datetime import datetime, timezone
+                            hour_utc = datetime.now(timezone.utc).hour
+                            if 0 <= hour_utc < 8:
+                                time_of_day = "asian"
+                            elif 8 <= hour_utc < 16:
+                                time_of_day = "european"
+                            elif 16 <= hour_utc < 24:
+                                time_of_day = "us"
+                            else:
+                                time_of_day = "quiet"
+                            
+                            # Определяем текущий streak из истории
+                            try:
+                                df_recent = _read_csv_df(CSV_PATH).tail(10)
+                                outcomes = df_recent[df_recent["outcome"].isin(["win", "loss"])]["outcome"].tolist()
+                                if outcomes:
+                                    last_outcome = outcomes[-1]
+                                    streak_count = 1
+                                    for i in range(len(outcomes)-2, -1, -1):
+                                        if outcomes[i] == last_outcome:
+                                            streak_count += 1
+                                        else:
+                                            break
+                                    current_streak = f"{streak_count}{'W' if last_outcome=='win' else 'L'}"
+                                else:
+                                    current_streak = "0"
+                            except Exception:
+                                current_streak = "0"
+                            
+                            # Определяем тренд из фич
+                            try:
+                                mom = feats.get("momentum_1h", 0) if hasattr(feats, 'get') else 0
+                                if mom > 0.02:
+                                    trend = "strong_up"
+                                elif mom > 0.005:
+                                    trend = "weak_up"
+                                elif mom < -0.02:
+                                    trend = "strong_down"
+                                elif mom < -0.005:
+                                    trend = "weak_down"
+                                else:
+                                    trend = "sideways"
+                            except Exception:
+                                trend = "sideways"
+                            
+                            # Собираем контекст
+                            context_for_explainer = {
+                                "volatility": "high" if feats.get("atr_norm", 0) > 0.015 else ("low" if feats.get("atr_norm", 0) < 0.005 else "medium"),
+                                "trend": trend,
+                                "volume": "high" if feats.get("volume_ratio", 1) > 1.5 else "normal",
+                                "time_of_day": time_of_day,
+                                "recent_streak": current_streak
+                            }
+                            
+                            # Получаем веса META (если доступны)
+                            meta_weights_dict = None
+                            if meta and hasattr(meta, 'w'):
+                                try:
+                                    weights_array = meta.w if isinstance(meta.w, np.ndarray) else np.array(meta.w)
+                                    if len(weights_array) >= 4:
+                                        # Нормализуем веса к сумме 1.0
+                                        weights_sum = weights_array[:4].sum()
+                                        if weights_sum > 0:
+                                            norm_weights = weights_array[:4] / weights_sum
+                                            meta_weights_dict = {
+                                                "xgb": float(norm_weights[0]),
+                                                "rf": float(norm_weights[1]),
+                                                "arf": float(norm_weights[2]),
+                                                "nn": float(norm_weights[3]),
+                                            }
+                                except Exception:
+                                    pass
+                            
+                            # Конвертируем feats в dict (если это pandas Series)
+                            feats_dict = {}
+                            try:
+                                if hasattr(feats, 'to_dict'):
+                                    feats_dict = feats.to_dict()
+                                elif isinstance(feats, dict):
+                                    feats_dict = feats
+                                else:
+                                    feats_dict = dict(feats)
+                            except Exception:
+                                feats_dict = {}
+                            
+                            explanation = create_explanation_for_bet(
+                                p_final=float(p_final) if p_final is not None else float(p_side),
+                                p_xgb=float(p_xgb) if p_xgb is not None else None,
+                                p_rf=float(p_rf) if p_rf is not None else None,
+                                p_arf=float(p_arf) if p_arf is not None else None,
+                                p_nn=float(p_nn) if p_nn is not None else None,
+                                meta_weights=meta_weights_dict,
+                                features=feats_dict,
+                                context=context_for_explainer
+                            )
+                            
+                            # Отправляем объяснение в Telegram
+                            tg_send(f"📊 <b>Анализ решения (epoch {epoch})</b>\n\n{explanation}")
+                            
+                        except Exception as e:
+                            print(f"[explainer] failed: {e}")
+                        # ========== КОНЕЦ ВСТАВКИ ==========
 
                         notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, ens_used, meta.mode)
 
@@ -7806,7 +8161,7 @@ def main_loop():
                             f"cap_after={capital:.6f} BNB, ratio={rd.payout_ratio if rd.payout_ratio else float('nan'):.3f}"
                         ]
                     )
-                    stats_dict = compute_stats_from_csv(CSV_PATH)
+                    stats_dict = compute_extended_stats_from_csv(CSV_PATH)
                     print_stats(stats_dict)
                     continue
 
@@ -8108,7 +8463,7 @@ def main_loop():
                             ]
                         )
 
-                        stats_dict = compute_stats_from_csv(CSV_PATH)
+                        stats_dict = compute_extended_stats_from_csv(CSV_PATH)
                         print_stats(stats_dict)
                         continue
 
