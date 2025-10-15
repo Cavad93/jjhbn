@@ -2423,7 +2423,7 @@ class MLConfig:
     use_phase_memory: bool = True
     phase_count: int = 6
     phase_memory_cap: int = 3000    # ИЗМЕНЕНО: было 10_000
-    phase_min_ready: int = 50
+    phase_min_ready: int = 150
     phase_mix_global_share: float = 0.30   # если < phase_min_ready: доля глобального хвоста
     phase_hysteresis_s: int = 300     
     meta_use_cma_es: bool = True  # ← включаем CMA-ES     # залипание фазы (анти-дрожь)
@@ -8187,5 +8187,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
-
-
