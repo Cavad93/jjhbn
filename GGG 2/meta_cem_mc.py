@@ -15,9 +15,9 @@ meta_cem_mc.py — META-стекинг на основе CEM/CMA-ES + Монте
 5. Режимы SHADOW/ACTIVE: переключение на основе валидированных метрик
 
 === АРХИТЕКТУРА ===
-- Вход: предсказания 4 экспертов + базовое предсказание + контекст
+- Вход: предсказания 4 экспертов + базовое предсказание + контекст (18 фичей)
 - Гейтинг: soft (softmax) или exp4 (EXP4 Hedge) режим
-- Выход: p_final = σ(w · φ), где φ — вектор фичей из логитов и мета-фичей
+- Выход: p_final = σ(w · φ), где φ — расширенный вектор фичей (логиты + мета + контекст)
 - Обучение: CEM/CMA-ES минимизирует log-loss на bootstrap выборках
 - Валидация: Walk-forward purged CV с embargo period
 
@@ -78,8 +78,6 @@ except Exception:
         os.replace(tmp, path)
 
 # Извлечение фазы из контекста
-# фазы/контекст
-# фазы/контекст
 try:
     from meta_ctx import phase_from_ctx
 except Exception:
@@ -127,13 +125,40 @@ class LambdaMARTMetaLite:
         self._X, self._y, self._g = [], [], []
         self._last_fit_n = 0
 
-    def _phi(self, p_xgb, p_rf, p_arf, p_nn, p_base):
+    def _phi(self, p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx=None):
+        """Расширенный вектор фичей с контекстом (18 элементов)"""
         lzs = [_safe_logit(p) for p in [p_xgb, p_rf, p_arf, p_nn]]
         lz_base = _safe_logit(p_base)
         plist = [p for p in [p_xgb, p_rf, p_arf, p_nn] if p is not None]
-        disagree = float(np.mean([abs(p - 0.5) for p in plist])) if plist else 0.0
+        disagree = float(np.std(plist)) if len(plist) > 1 else 0.0
         ent = _entropy4([p_xgb, p_rf, p_arf, p_nn])
-        return np.array([lzs[0], lzs[1], lzs[2], lzs[3], lz_base, disagree, ent, 1.0], dtype=float)
+        
+        # Контекстные фичи
+        if reg_ctx is not None and isinstance(reg_ctx, dict):
+            trend_sign = float(reg_ctx.get("trend_sign", 0.0))
+            trend_abs = float(reg_ctx.get("trend_abs", 0.0))
+            vol_ratio = float(reg_ctx.get("vol_ratio", 1.0))
+            jump_flag = float(reg_ctx.get("jump_flag", 0.0))
+            ofi_sign = float(reg_ctx.get("ofi_sign", 0.0))
+            book_imb = float(reg_ctx.get("book_imb", 0.0))
+            basis_sign = float(reg_ctx.get("basis_sign", 0.0))
+            funding_sign = float(reg_ctx.get("funding_sign", 0.0))
+        else:
+            trend_sign = trend_abs = vol_ratio = jump_flag = 0.0
+            ofi_sign = book_imb = basis_sign = funding_sign = 0.0
+        
+        # Взаимодействия
+        disagree_vol = disagree * vol_ratio
+        entropy_trend = ent * abs(trend_abs)
+        
+        return np.array([
+            lzs[0], lzs[1], lzs[2], lzs[3], lz_base,  # 0-4: логиты
+            disagree, ent,  # 5-6: агрегаты
+            trend_sign, trend_abs, vol_ratio, jump_flag,  # 7-10: контекст
+            ofi_sign, book_imb, basis_sign, funding_sign,  # 11-14: микроструктура
+            disagree_vol, entropy_trend,  # 15-16: взаимодействия
+            1.0  # 17: bias
+        ], dtype=float)
 
     def _phase_group(self, reg_ctx):
         try:
@@ -144,7 +169,7 @@ class LambdaMARTMetaLite:
     def predict(self, p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx=None):
         if not self.enabled or self.model is None:
             return None
-        x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base).reshape(1, -1)
+        x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx).reshape(1, -1)
         try:
             s = float(self.model.predict(x)[0])
             p = 1.0 / (1.0 + math.exp(-s))
@@ -155,7 +180,7 @@ class LambdaMARTMetaLite:
     def record_result(self, p_xgb, p_rf, p_arf, p_nn, p_base, y_up, reg_ctx=None, used_in_live=False):
         if not self.enabled:
             return
-        x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base)
+        x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
         g = self._phase_group(reg_ctx)
         self._X.append(x)
         self._y.append(int(y_up))
@@ -284,9 +309,14 @@ class MetaCEMMC:
         # У нас 6 фаз рынка, каждая имеет свою модель
         self.P = int(getattr(cfg, "meta_exp4_phases", 6))
         
-        # Веса для мета-фичей: [logit(base), disagree, entropy, bias]
-        # Каждая фаза имеет свой набор весов размерностью 4
-        self.w_meta_ph = np.zeros((self.P, 4), dtype=float)
+        # ИЗМЕНЕНО: Размерность вектора фичей увеличена с 8 до 18
+        # Включает: 4 логита экспертов + базовый логит + disagree + entropy
+        #           + 8 контекстных фичей + 2 взаимодействия + bias
+        self.D = 18
+        
+        # Веса для расширенного вектора фичей
+        # Каждая фаза имеет свой набор весов размерностью D=18
+        self.w_meta_ph = np.zeros((self.P, self.D), dtype=float)
         
         # Гиперпараметры оптимизации
         self.eta = float(getattr(cfg, "meta_eta", 0.05))  # learning rate
@@ -400,7 +430,7 @@ class MetaCEMMC:
         Процесс:
         1. Определяем текущую фазу из контекста
         2. Извлекаем веса для этой фазы
-        3. Строим вектор фичей φ из логитов экспертов и мета-фичей
+        3. Строим вектор фичей φ из логитов экспертов, мета-фичей и контекста
         4. Применяем гейтинг (если включен)
         5. Вычисляем взвешенную сумму и применяем сигмоид
         
@@ -414,7 +444,10 @@ class MetaCEMMC:
         
         Математика:
             φ = [logit(p_xgb), logit(p_rf), logit(p_arf), logit(p_nn),
-                 logit(p_base), disagree, entropy, 1]
+                 logit(p_base), disagree, entropy, 
+                 trend_sign, trend_abs, vol_ratio, jump_flag,
+                 ofi_sign, book_imb, basis_sign, funding_sign,
+                 disagree*vol, entropy*trend, 1]
             
             z = w · φ  (линейная комбинация)
             p_final = σ(z) = 1 / (1 + exp(-z))  (сигмоид)
@@ -426,8 +459,8 @@ class MetaCEMMC:
         if np.allclose(w, 0.0):
             return None  # Модель еще не обучена
 
-        # Строим вектор фичей из предсказаний экспертов
-        x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base)
+        # Строим вектор фичей из предсказаний экспертов и контекста
+        x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
         if x is None:
             return None
 
@@ -440,19 +473,22 @@ class MetaCEMMC:
         p_rf: Optional[float],
         p_arf: Optional[float],
         p_nn: Optional[float],
-        p_base: Optional[float]
+        p_base: Optional[float],
+        reg_ctx: Optional[dict] = None
     ) -> Optional[np.ndarray]:
         """
-        Строит вектор фичей для мета-модели
+        Строит расширенный вектор фичей для мета-модели
         
         Вектор включает:
         - Логиты предсказаний экспертов (4 значения)
         - Логит базового предсказания (1 значение)
         - Disagreement между экспертами (1 значение)
         - Энтропия распределения (1 значение)
+        - НОВОЕ: Контекстные фичи рыночного режима (8 значений)
+        - НОВОЕ: Взаимодействия между фичами (2 значения)
         - Bias term (1 значение) = 1.0
         
-        Всего 8 фичей
+        Всего 18 фичей (было 8)
         
         Почему логиты, а не вероятности?
         Логиты живут в (-∞, +∞), что удобнее для линейных операций.
@@ -461,9 +497,10 @@ class MetaCEMMC:
         Args:
             p_xgb, p_rf, p_arf, p_nn: вероятности экспертов
             p_base: базовое предсказание
+            reg_ctx: контекст с рыночными условиями
         
         Returns:
-            Вектор фичей размера 8 или None если недостаточно данных
+            Вектор фичей размера 18 или None если недостаточно данных
         """
         # Собираем доступные предсказания
         preds = []
@@ -486,7 +523,7 @@ class MetaCEMMC:
         lz_nn = safe_logit(p_nn) if p_nn is not None else 0.0
         lz_base = safe_logit(p_base) if p_base is not None else 0.0
 
-        # Мета-фичи для улучшения качества
+        # Базовые мета-фичи (как было)
         
         # Disagreement: насколько эксперты не согласны друг с другом
         # Высокое значение = эксперты дают разные предсказания = высокая неопределенность
@@ -498,16 +535,55 @@ class MetaCEMMC:
         p_mean = np.clip(p_mean, 1e-6, 1 - 1e-6)
         entropy = float(-(p_mean * np.log(p_mean) + (1 - p_mean) * np.log(1 - p_mean)))
 
-        # Собираем итоговый вектор фичей
+        # НОВОЕ: Добавляем контекстные фичи рыночного режима
+        if reg_ctx is not None and isinstance(reg_ctx, dict):
+            trend_sign = float(reg_ctx.get("trend_sign", 0.0))
+            trend_abs = float(reg_ctx.get("trend_abs", 0.0))
+            vol_ratio = float(reg_ctx.get("vol_ratio", 1.0))
+            jump_flag = float(reg_ctx.get("jump_flag", 0.0))
+            ofi_sign = float(reg_ctx.get("ofi_sign", 0.0))
+            book_imb = float(reg_ctx.get("book_imb", 0.0))
+            basis_sign = float(reg_ctx.get("basis_sign", 0.0))
+            funding_sign = float(reg_ctx.get("funding_sign", 0.0))
+        else:
+            # Если контекст не передан - заполняем нулями (обратная совместимость)
+            trend_sign = trend_abs = vol_ratio = jump_flag = 0.0
+            ofi_sign = book_imb = basis_sign = funding_sign = 0.0
+
+        # НОВОЕ: Добавляем взаимодействия между фичами
+        # Эти комбинации помогают модели уловить нелинейные паттерны
+        disagree_vol = disagree * vol_ratio  # дисагремент при высокой воле более важен
+        entropy_trend = entropy * abs(trend_abs)  # неопределенность в тренде
+
+        # Собираем расширенный вектор фичей (18 элементов)
         x = np.array([
-            lz_xgb,     # логит XGBoost
-            lz_rf,      # логит Random Forest
-            lz_arf,     # логит Adaptive Random Forest
-            lz_nn,      # логит Neural Network
-            lz_base,    # логит базового предсказания
-            disagree,   # стандартное отклонение предсказаний
-            entropy,    # энтропия среднего
-            1.0         # bias term
+            # Оригинальные логиты экспертов (0-4)
+            lz_xgb,
+            lz_rf,
+            lz_arf,
+            lz_nn,
+            lz_base,
+            
+            # Оригинальные агрегаты (5-6)
+            disagree,
+            entropy,
+            
+            # Контекстные фичи рыночного режима (7-14)
+            trend_sign,      # знак тренда (±1)
+            trend_abs,       # сила тренда (0-3)
+            vol_ratio,       # отношение текущей волы к средней
+            jump_flag,       # детекция скачка цены (0/1)
+            ofi_sign,        # знак order flow imbalance
+            book_imb,        # дисбаланс стакана [-1, 1]
+            basis_sign,      # знак базиса фьючерсов
+            funding_sign,    # знак ставки финансирования
+            
+            # Взаимодействия (15-16)
+            disagree_vol,    # взаимодействие неопределенности и волатильности
+            entropy_trend,   # взаимодействие энтропии и тренда
+            
+            # Bias term (17)
+            1.0
         ], dtype=float)
 
         return x
@@ -522,7 +598,7 @@ class MetaCEMMC:
         
         Args:
             ph: номер фазы (0-5)
-            x: вектор фичей размера 8
+            x: вектор фичей размера 18 (было 8)
         
         Returns:
             Вероятность ∈ [0, 1] или None если веса не обучены
@@ -559,7 +635,7 @@ class MetaCEMMC:
         
         Это центральная функция обучения. Что происходит:
         
-        1. Извлекаем фазу и строим вектор фичей
+        1. Извлекаем фазу и строим вектор фичей с контекстом (18 элементов)
         2. Сохраняем пример (x, y) в буфер фазы и в CSV (только если есть предсказания экспертов)
         3. ВСЕГДА обновляем метрики качества (hits) - даже если экспертов нет
         4. НОВОЕ: Сохраняем OOF predictions для CV
@@ -573,13 +649,16 @@ class MetaCEMMC:
             y_up: истинный результат (0 или 1)
             used_in_live: использовалось ли в реальной торговле
             p_final_used: какое итоговое предсказание использовалось (если отличается от predict)
-            reg_ctx: контекст с фазой и другой информацией
+            reg_ctx: контекст с фазой и рыночными условиями
         """
         # ===== ШАГ 1: ИЗВЛЕЧЕНИЕ ФАЗЫ И ПОСТРОЕНИЕ ФИЧЕЙ =====
         ph = phase_from_ctx(reg_ctx)
         
+        # Сохраняем последнюю виденную фазу для CV
+        self._last_phase = ph
+        
         # Строим вектор фичей (может быть None если эксперты не дали предсказаний)
-        x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base)
+        x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
         
         # ===== ШАГ 2: СОХРАНЕНИЕ ПРИМЕРА ДЛЯ ОБУЧЕНИЯ =====
         # Сохраняем ТОЛЬКО если есть предсказания экспертов
@@ -720,7 +799,6 @@ class MetaCEMMC:
             - n_folds: количество фолдов
             - oof_samples: количество OOF примеров
         """
-        # Загружаем накопленные данные фазы
         # Загружаем накопленные данные фазы с весами
         X_list, y_list, sample_weights = self._load_phase_buffer_from_disk(ph)
         
@@ -891,7 +969,7 @@ class MetaCEMMC:
         вместо CMA-ES, чтобы не тратить слишком много времени на каждый fold.
         
         Args:
-            X: матрица фичей (N × 8)
+            X: матрица фичей (N × 18)
             y: вектор меток (N,)
             ph: номер фазы
         
@@ -924,13 +1002,13 @@ class MetaCEMMC:
         Применяет линейную комбинацию с весами и сигмоид.
         
         Args:
-            weights: вектор весов (8,)
-            X: матрица фичей (N × 8)
+            weights: вектор весов (18,)
+            X: матрица фичей (N × 18)
         
         Returns:
             Вектор вероятностей (N,)
         """
-        z = X @ weights  # Матричное умножение: (N × 8) @ (8,) = (N,)
+        z = X @ weights  # Матричное умножение: (N × 18) @ (18,) = (N,)
         z = np.clip(z, -60.0, 60.0)  # Защита от overflow в exp
         probs = 1.0 / (1.0 + np.exp(-z))
         return probs
@@ -1053,7 +1131,7 @@ class MetaCEMMC:
         Returns:
             Лучший найденный вектор весов
         """
-        D = X.shape[1]  # Размерность (8 для META)
+        D = X.shape[1]  # Размерность (18 для расширенной META)
         n_elite = max(1, int(pop_size * elite_frac))
         
         # Если веса не заданы - все примеры равнозначны
@@ -1392,6 +1470,7 @@ class MetaCEMMC:
             "algo": "CEM+MC" if not getattr(self.cfg, "meta_use_cma_es", False) else "CMA-ES+MC",
             "mode": self.mode,
             "enabled": str(self.enabled),
+            "features": f"{self.D}D",  # Показываем размерность
             "wr_active": _fmt(wr_a),
             "n_active": str(len(self.active_hits or [])),
             "wr_shadow": _fmt(wr_s),
@@ -1419,7 +1498,7 @@ class MetaCEMMC:
         
         Args:
             ph: номер фазы
-            x: вектор фичей
+            x: вектор фичей (размер 18)
             y: метка
         
         Returns:
@@ -1595,7 +1674,18 @@ class MetaCEMMC:
             
             w_list = state.get("w_meta_ph")
             if w_list:
-                self.w_meta_ph = np.array(w_list, dtype=float)
+                loaded_w = np.array(w_list, dtype=float)
+                # Обратная совместимость: если загружены старые веса (4 элемента)
+                # расширяем до новой размерности (18 элементов)
+                if loaded_w.shape[1] != self.D:
+                    old_D = loaded_w.shape[1]
+                    new_w = np.zeros((self.P, self.D), dtype=float)
+                    # Копируем старые веса в начало
+                    new_w[:, :old_D] = loaded_w
+                    self.w_meta_ph = new_w
+                    print(f"[MetaCEMMC] Expanded weights from {old_D}D to {self.D}D")
+                else:
+                    self.w_meta_ph = loaded_w
             
             self.shadow_hits = state.get("shadow_hits", [])
             self.active_hits = state.get("active_hits", [])
@@ -1606,8 +1696,8 @@ class MetaCEMMC:
             self.validation_passed = state.get("validation_passed", {p: False for p in range(self.P)})
             self.cv_last_check = state.get("cv_last_check", {p: 0 for p in range(self.P)})
             
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[MetaCEMMC] Failed to load state: {e}")
 
     def _emit_report(
         self,
@@ -1662,4 +1752,4 @@ class MetaCEMMC:
 
 # ========== ЭКСПОРТ ==========
 
-__all__ = ["MetaCEMMC"]
+__all__ = ["MetaCEMMC", "LambdaMARTMetaLite", "ProbBlender"]
