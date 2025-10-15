@@ -1099,86 +1099,74 @@ class MetaCEMMC:
         y: np.ndarray,
         n_iter: int = 50,
         pop_size: int = 100,
-        elite_frac: float = 0.2,
-        sample_weights: Optional[np.ndarray] = None
+        elite_frac: float = 0.2
     ) -> np.ndarray:
         """
-        Cross-Entropy Method оптимизация с поддержкой взвешенных примеров
-        
-        CEM - это простой и эффективный алгоритм стохастической оптимизации.
-        
-        Идея:
-        1. Начинаем с нормального распределения N(μ, σ²)
-        2. Сэмплируем популяцию решений из этого распределения
-        3. Оцениваем каждое решение через Монте-Карло (с учётом весов примеров)
-        4. Отбираем top-k% лучших (элиту)
-        5. Обновляем μ и σ по элите
-        6. Повторяем
-        
-        Процесс постепенно сужает распределение вокруг оптимума.
-        
-        НОВОЕ: Параметр sample_weights позволяет придавать разный вес примерам.
-        Свежие данные влияют на fitness сильнее через экспоненциальное затухание.
-        
-        Args:
-            X: матрица фичей (N × D)
-            y: вектор меток (N,)
-            n_iter: количество итераций
-            pop_size: размер популяции
-            elite_frac: доля элиты (0.2 = top 20%)
-            sample_weights: веса примеров (None = все равны)
-        
-        Returns:
-            Лучший найденный вектор весов
+        Cross-Entropy Method оптимизация с визуализацией
         """
-        D = X.shape[1]  # Размерность (18 для расширенной META)
+        D = X.shape[1]
         n_elite = max(1, int(pop_size * elite_frac))
         
-        # Если веса не заданы - все примеры равнозначны
-        if sample_weights is None:
-            sample_weights = np.ones(len(X))
-        
-        # Инициализация распределения
         mu = np.zeros(D)
-        sigma = np.ones(D) * 2.0  # Начальная дисперсия
+        sigma = np.ones(D) * 2.0
         
         clip_val = float(getattr(self.cfg, "meta_w_clip", 8.0))
         best_loss = float('inf')
         best_w = mu.copy()
 
+        # НОВОЕ: Получаем визуализатор
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            viz_enabled = True
+        except Exception:
+            viz_enabled = False
+
         for iteration in range(n_iter):
-            # Сэмплируем популяцию из N(μ, σ²)
             population = []
             for _ in range(pop_size):
                 w = mu + sigma * np.random.randn(D)
                 w = np.clip(w, -clip_val, clip_val)
                 population.append(w)
             
-            # Оцениваем каждое решение через Монте-Карло с учётом весов
             scores = []
             for w in population:
-                loss = self._mc_eval(w, X, y, n_bootstrap=10, sample_weights=sample_weights)
+                loss = self._mc_eval(w, X, y, n_bootstrap=10)
                 scores.append(loss)
             
-            # Отбираем элиту (лучшие решения)
             elite_idx = np.argsort(scores)[:n_elite]
             elite = [population[i] for i in elite_idx]
             
-            # Обновляем лучшее решение
             if scores[elite_idx[0]] < best_loss:
                 best_loss = scores[elite_idx[0]]
                 best_w = population[elite_idx[0]].copy()
             
-            # Обновляем распределение по элите
             elite_arr = np.array(elite)
             mu = elite_arr.mean(axis=0)
-            sigma = elite_arr.std(axis=0) + 1e-6  # +epsilon для стабильности
+            current_sigma = elite_arr.std(axis=0) + 1e-6
+            sigma = current_sigma
+            
+            # НОВОЕ: Записываем метрики для визуализации
+            if viz_enabled and iteration % 5 == 0:
+                try:
+                    ph = getattr(self, "_last_phase", 0)
+                    median_loss = float(np.median(scores))
+                    avg_sigma = float(np.mean(sigma))
+                    viz.record_meta_training_step(
+                        phase=ph,
+                        iteration=iteration,
+                        best_loss=float(best_loss),
+                        median_loss=median_loss,
+                        sigma=avg_sigma
+                    )
+                except Exception:
+                    pass
 
         return best_w
 
     def _train_cma_es(self, X: np.ndarray, y: np.ndarray, ph: int, sample_weights: Optional[np.ndarray] = None) -> np.ndarray:
         """
-        CMA-ES оптимизация (более продвинутая версия)
+        CMA-ES оптимизация (более продвинутая версия) с визуализацией
         
         CMA-ES (Covariance Matrix Adaptation Evolution Strategy) - один из
         лучших алгоритмов для безградиентной оптимизации.
@@ -1224,6 +1212,14 @@ class MetaCEMMC:
         # История для графиков
         iters, best_hist, med_hist, sigma_hist = [], [], [], []
 
+        # НОВОЕ: Получаем визуализатор
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            viz_enabled = True
+        except Exception:
+            viz_enabled = False
+
         # Основной цикл оптимизации
         while not es.stop():
             # Получаем популяцию решений
@@ -1245,6 +1241,19 @@ class MetaCEMMC:
             best_hist.append(float(np.min(fitness)))
             med_hist.append(float(np.median(fitness)))
             sigma_hist.append(float(getattr(es, "sigma", sigma0)))
+            
+            # НОВОЕ: Записываем метрики для визуализации (каждые 5 итераций)
+            if viz_enabled and it % 5 == 0:
+                try:
+                    viz.record_meta_training_step(
+                        phase=ph,
+                        iteration=it,
+                        best_loss=float(best_hist[-1]),
+                        median_loss=float(med_hist[-1]),
+                        sigma=float(sigma_hist[-1])
+                    )
+                except Exception:
+                    pass
 
         # Лучшее найденное решение
         w_best = np.array(es.result.xbest, dtype=float)
