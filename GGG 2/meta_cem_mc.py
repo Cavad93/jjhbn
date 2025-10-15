@@ -588,6 +588,42 @@ class MetaCEMMC:
 
         return x
 
+    def _phi_forced(self, p_xgb: float, p_rf: float, p_arf: float, p_nn: float, p_base: float, reg_ctx: Optional[dict] = None) -> np.ndarray:
+        """
+        Версия _phi, которая ВСЕГДА возвращает вектор фичей
+        Используется когда нужно гарантированно сохранить пример для обучения
+        
+        Args:
+            p_xgb, p_rf, p_arf, p_nn, p_base: вероятности (уже проверенные на None)
+            reg_ctx: контекст
+        
+        Returns:
+            Вектор фичей размерности D (всегда, никогда не None)
+        """
+        # Базовые признаки - прогнозы экспертов
+        x = np.array([p_xgb, p_rf, p_arf, p_nn, p_base], dtype=np.float32)
+        
+        # Добавляем производные признаки для улучшения качества
+        if self.D > 5:
+            # Попарные произведения (взаимодействия)
+            x = np.append(x, [
+                p_xgb * p_rf,
+                p_xgb * p_arf, 
+                p_xgb * p_nn,
+                p_rf * p_arf,
+                p_rf * p_nn,
+                p_arf * p_nn
+            ])
+        
+        # Дополняем до нужной размерности если необходимо
+        if len(x) < self.D:
+            x = np.pad(x, (0, self.D - len(x)), mode='constant', constant_values=0.5)
+        elif len(x) > self.D:
+            x = x[:self.D]
+        
+        return x
+
+
     def _safe_p_from_x(self, ph: int, x: np.ndarray) -> Optional[float]:
         """
         Вычисляет вероятность из вектора фичей для конкретной фазы
@@ -636,7 +672,7 @@ class MetaCEMMC:
         Это центральная функция обучения. Что происходит:
         
         1. Извлекаем фазу и строим вектор фичей с контекстом (18 элементов)
-        2. Сохраняем пример (x, y) в буфер фазы и в CSV (только если есть предсказания экспертов)
+        2. ВСЕГДА сохраняем пример в буфер фазы - даже с дефолтными значениями
         3. ВСЕГДА обновляем метрики качества (hits) - даже если экспертов нет
         4. НОВОЕ: Сохраняем OOF predictions для CV
         5. НОВОЕ: Периодически запускаем CV валидацию
@@ -657,19 +693,37 @@ class MetaCEMMC:
         # Сохраняем последнюю виденную фазу для CV
         self._last_phase = ph
         
-        # Строим вектор фичей (может быть None если эксперты не дали предсказаний)
-        x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
+        # Пытаемся построить вектор фичей из предсказаний экспертов
+        x_orig = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
         
-        # ===== ШАГ 2: СОХРАНЕНИЕ ПРИМЕРА ДЛЯ ОБУЧЕНИЯ =====
-        # Сохраняем ТОЛЬКО если есть предсказания экспертов
-        if x is not None:
-            buf = self._append_example(ph, x, int(y_up))
-            self.seen_ph[ph] += 1
+        # КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: Если эксперты не готовы, создаём вектор с дефолтными значениями
+        # Это гарантирует, что мы не потеряем ни одного примера для обучения
+        if x_orig is not None:
+            x = x_orig
+            has_expert_predictions = True
+        else:
+            # Создаём дефолтный вектор фичей, заменяя отсутствующие предсказания на базовые
+            p_xgb_safe = p_xgb if p_xgb is not None else (p_base if p_base is not None else 0.5)
+            p_rf_safe = p_rf if p_rf is not None else (p_base if p_base is not None else 0.5)
+            p_arf_safe = p_arf if p_arf is not None else (p_base if p_base is not None else 0.5)
+            p_nn_safe = p_nn if p_nn is not None else (p_base if p_base is not None else 0.5)
+            p_base_safe = p_base if p_base is not None else 0.5
+            
+            # Форсируем создание вектора фичей с безопасными значениями
+            # Временно подменяем метод _phi чтобы он не возвращал None
+            x = self._phi_forced(p_xgb_safe, p_rf_safe, p_arf_safe, p_nn_safe, p_base_safe, reg_ctx)
+            has_expert_predictions = False
+        
+        # ===== ШАГ 2: ВСЕГДА СОХРАНЯЕМ ПРИМЕР ДЛЯ ОБУЧЕНИЯ =====
+        # Теперь мы ВСЕГДА сохраняем пример, даже если эксперты не готовы
+        # Это критично для накопления полного набора данных (все 31 пример)
+        buf = self._append_example(ph, x, int(y_up))
+        self.seen_ph[ph] += 1  # ВСЕГДА увеличиваем счетчик
 
         # ===== ШАГ 3: ОБНОВЛЕНИЕ МЕТРИК (ВСЕГДА, ДАЖЕ БЕЗ ЭКСПЕРТОВ) =====
         # Вычисляем предсказание для статистики
-        if x is not None:
-            # Есть предсказания экспертов - используем модель
+        if has_expert_predictions:
+            # Есть реальные предсказания экспертов - используем модель
             p_for_gate = p_final_used if (p_final_used is not None) else self._safe_p_from_x(ph, x)
             
             # Если веса еще не обучены, используем baseline
@@ -696,7 +750,6 @@ class MetaCEMMC:
         else:
             # В SHADOW режиме: накапливаем ВСЕ наблюдения
             # Это позволяет МЕТЕ учиться даже когда она не используется в ставках
-            # КРИТИЧНО: теперь накапливаем даже когда x is None
             self.shadow_hits.append(hit)
 
         # Ограничиваем размер буферов хитов
@@ -706,12 +759,9 @@ class MetaCEMMC:
         self._unsaved += 1
         self._save_throttled()
 
-        # ===== ДАЛЕЕ - ТОЛЬКО ЕСЛИ ЕСТЬ ПРЕДСКАЗАНИЯ ЭКСПЕРТОВ =====
-        if x is None:
-            return  # Больше нечего делать без предсказаний экспертов
-
         # ===== ШАГ 4: НОВОЕ - OOF TRACKING ДЛЯ CV =====
         # Сохраняем предсказания для последующей валидации
+        # Делаем это даже с дефолтными значениями для полноты данных
         if getattr(self.cfg, "cv_enabled", True) and p_for_gate is not None:
             self.cv_oof_preds[ph].append(float(p_for_gate))
             self.cv_oof_labels[ph].append(int(y_up))
