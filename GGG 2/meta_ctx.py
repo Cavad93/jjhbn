@@ -56,7 +56,9 @@ def build_regime_ctx(
             h_val = float(h.iloc[i-1])
             trend_sign = _sign(h_val)
             trend_abs = 0.0 if std == 0.0 else _clip(abs(h_val)/std, 0.0, 3.0)
-    except Exception:
+    except Exception as e:
+        # Добавляем минимальное логирование для отладки
+        # print(f"[regime_ctx] trend computation failed: {e}")
         trend_sign, trend_abs = 0.0, 0.0
 
     # --- 2) Вола
@@ -65,17 +67,26 @@ def build_regime_ctx(
         atr_now = float(feats["atr"].iloc[j])
         atr_sma = float(feats["atr_sma"].iloc[j])
         vol_ratio = 0.0 if atr_sma <= 0 else _clip(atr_now/atr_sma, 0.0, 5.0)
-    except Exception:
+    except Exception as e:
+        # print(f"[regime_ctx] vol_ratio computation failed: {e}")
         vol_ratio = 0.0
 
-    # --- 3) Микроструктура/лента
-    ofi15 = float(micro_feats.get("ofi_15s", 0.0))
-    ofi_sign = _sign(ofi15)
-    book_imb = _clip(float(micro_feats.get("book_imb", 0.0)), -1.0, 1.0)
+    # --- 3) Микроструктура/лента (с защитой от None)
+    if micro_feats is not None and isinstance(micro_feats, dict):
+        ofi15 = float(micro_feats.get("ofi_15s", 0.0))
+        ofi_sign = _sign(ofi15)
+        book_imb = _clip(float(micro_feats.get("book_imb", 0.0)), -1.0, 1.0)
+    else:
+        ofi_sign = 0.0
+        book_imb = 0.0
 
-    # --- 4) Фьючи
-    basis_sign = _sign(float(fut_feats.get("basis_now", 0.0)))
-    funding_sign = _sign(float(fut_feats.get("funding_sign", 0.0)))
+    # --- 4) Фьючи (с защитой от None)
+    if fut_feats is not None and isinstance(fut_feats, dict):
+        basis_sign = _sign(float(fut_feats.get("basis_now", 0.0)))
+        funding_sign = _sign(float(fut_feats.get("funding_sign", 0.0)))
+    else:
+        basis_sign = 0.0
+        funding_sign = 0.0
 
     # jump_flag уже посчитан снаружи (BN–S тест/прокси)
     jf = 1.0 if bool(jump_flag) else 0.0
