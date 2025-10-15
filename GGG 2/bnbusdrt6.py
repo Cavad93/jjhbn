@@ -3306,22 +3306,23 @@ class XGBExpert(_BaseExpert):
         # ========== БЛОК 7: ФАЗОВАЯ КАЛИБРОВКА ==========
         # Калибратор корректирует вероятности для каждой фазы отдельно
         # Это важно, потому что модель может быть по-разному откалибрована в разных режимах
+        # стало
         try:
             p_raw = self._predict_raw(x_raw)
             if p_raw is not None:
-                # Инициализируем калибратор для этой фазы, если его нет
                 if self.cal_ph[ph] is None:
-                    self.cal_ph[ph] = make_calibrator(self.cfg.xgb_calibration_method)
-                
-                # Показываем калибратору истинную пару (предсказание, результат)
-                self.cal_ph[ph].observe(float(p_raw), int(y_up))
-                
-                # Периодически пересчитываем калибровку
-                if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
-                    cal_path = self._cal_path(self.cfg.xgb_cal_path, ph)
-                    self.cal_ph[ph].save(cal_path)
-        except Exception:
-            pass
+                    from prob_calibrators import make_calibrator
+                    method = getattr(self.cfg, "xgb_calibration_method", "logistic")
+                    self.cal_ph[ph] = make_calibrator(method)
+                if self.cal_ph[ph] is not None:
+                    self.cal_ph[ph].observe(float(p_raw), int(y_up))
+                    if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
+                        cal_path = self._cal_path(self.cfg.xgb_cal_path, ph)
+                        self.cal_ph[ph].save(cal_path)
+        except Exception as e:
+            import logging
+            logging.getLogger("errors").error("[xgb] calibrator failed ph=%s: %s", ph, e, exc_info=True)
+
 
         # ========== БЛОК 8: НОВОЕ - ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
         # Каждые N примеров запускаем полную cross-validation для оценки реального качества
@@ -4141,22 +4142,23 @@ class RFCalibratedExpert(_BaseExpert):
         # ========== БЛОК 7: ФАЗОВАЯ КАЛИБРОВКА ==========
         # Калибратор корректирует вероятности для каждой фазы отдельно
         # Это важно, потому что модель может быть по-разному откалибрована в разных режимах
+        # стало
         try:
             p_raw = self._predict_raw(x_raw)
             if p_raw is not None:
-                # Инициализируем калибратор для этой фазы, если его нет
                 if self.cal_ph[ph] is None:
-                    self.cal_ph[ph] = make_calibrator(self.cfg.xgb_calibration_method)
-                
-                # Показываем калибратору истинную пару (предсказание, результат)
-                self.cal_ph[ph].observe(float(p_raw), int(y_up))
-                
-                # Периодически пересчитываем калибровку
-                if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
-                    cal_path = self._cal_path(self.cfg.xgb_cal_path, ph)
-                    self.cal_ph[ph].save(cal_path)
-        except Exception:
-            pass
+                    from prob_calibrators import make_calibrator
+                    method = getattr(self.cfg, "rf_calibration_method", "sigmoid")
+                    self.cal_ph[ph] = make_calibrator(method)
+                if self.cal_ph[ph] is not None:
+                    self.cal_ph[ph].observe(float(p_raw), int(y_up))
+                    if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
+                        cal_path = self._cal_path(getattr(self.cfg, "rf_cal_path", self.cfg.xgb_cal_path), ph)
+                        self.cal_ph[ph].save(cal_path)
+        except Exception as e:
+            import logging
+            logging.getLogger("errors").error("[rf ] calibrator failed ph=%s: %s", ph, e, exc_info=True)
+
 
         # ========== БЛОК 8: НОВОЕ - ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
         # Каждые N примеров запускаем полную cross-validation для оценки реального качества
@@ -4584,24 +4586,23 @@ class RiverARFExpert(_BaseExpert):
             self.cv_oof_labels[ph].append(int(y_up))
 
         # === ФАЗОВАЯ КАЛИБРОВКА ===
+        # стало
         try:
             p_raw = self._predict_raw(x_raw)
             if p_raw is not None:
                 if self.cal_ph[ph] is None:
-                    try:
-                        from prob_calibrators import make_calibrator
-                        cal_method = getattr(self.cfg, "arf_calibration_method", "logistic")
-                        self.cal_ph[ph] = make_calibrator(cal_method)
-                    except Exception:
-                        pass
-                
+                    from prob_calibrators import make_calibrator
+                    method = getattr(self.cfg, "arf_calibration_method", "logistic")
+                    self.cal_ph[ph] = make_calibrator(method)
                 if self.cal_ph[ph] is not None:
                     self.cal_ph[ph].observe(float(p_raw), int(y_up))
                     if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
                         cal_path = self._cal_path(self.cfg.arf_cal_path, ph)
                         self.cal_ph[ph].save(cal_path)
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.getLogger("errors").error("[arf] calibrator failed ph=%s: %s", ph, e, exc_info=True)
+
 
         # === ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ===
         self.cv_last_check[ph] = self.cv_last_check.get(ph, 0) + 1
@@ -5110,6 +5111,30 @@ class NNExpert(_BaseExpert):
         except Exception:
             return (None, self.mode)
 
+    def _predict_raw(self, x_raw: np.ndarray) -> Optional[float]:
+        """
+        Сырое (некалиброванное) p_up из текущей NN без температуры.
+        Использует фазовую сеть/скейлер, если есть; иначе — глобальные.
+        """
+        if not self.enabled:
+            return None
+
+        # берём последнюю «стабильную» фазу, которую фиксируем в proba_up/record_result
+        ph = int(getattr(self, "_last_seen_phase", 0))
+
+        net = (self.net_ph.get(ph) if hasattr(self, "net_ph") else None) or self.net
+        scaler = (self.scaler_ph.get(ph) if hasattr(self, "scaler_ph") else None) or self.scaler
+        if net is None:
+            return None
+
+        try:
+            X = x_raw.reshape(1, -1).astype(np.float32)
+            Xt = scaler.transform(X) if scaler is not None else X
+            # НЕ используем температуру: это сырое p для калибратора
+            p = float(net.predict_proba(Xt, T=1.0)[0])
+            return self._clip01(p)
+        except Exception:
+            return None
 
     def record_result(self, x_raw: np.ndarray, y_up: int, used_in_live: bool,
                     p_pred: Optional[float] = None, reg_ctx: Optional[dict] = None) -> None:
@@ -5201,17 +5226,21 @@ class NNExpert(_BaseExpert):
             if p_raw is not None:
                 # Инициализируем калибратор для этой фазы, если его нет
                 if self.cal_ph[ph] is None:
-                    self.cal_ph[ph] = make_calibrator(self.cfg.xgb_calibration_method)
-                
+                    from prob_calibrators import make_calibrator
+                    method = getattr(self.cfg, "nn_calibration_method",
+                                    getattr(self.cfg, "xgb_calibration_method", "logistic"))
+                    self.cal_ph[ph] = make_calibrator(method)
+
                 # Показываем калибратору истинную пару (предсказание, результат)
                 self.cal_ph[ph].observe(float(p_raw), int(y_up))
-                
+
                 # Периодически пересчитываем калибровку
                 if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
-                    cal_path = self._cal_path(self.cfg.xgb_cal_path, ph)
+                    cal_path = self._cal_path(getattr(self.cfg, "nn_cal_path", self.cfg.xgb_cal_path), ph)
                     self.cal_ph[ph].save(cal_path)
         except Exception:
             pass
+
 
         # ========== БЛОК 8: НОВОЕ - ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
         # Каждые N примеров запускаем полную cross-validation для оценки реального качества
@@ -5376,6 +5405,7 @@ class NNExpert(_BaseExpert):
             self.new_since_train_ph[ph] = 0
         except Exception as e:
             print(f"[nn  ] train error (ph={ph}): {e}")
+
     def _run_cv_validation(self, ph: int) -> Dict:
         """
         Walk-forward purged cross-validation для фазы ph.
@@ -5481,48 +5511,42 @@ class NNExpert(_BaseExpert):
 
     def _train_fold_model(self, X: np.ndarray, y: np.ndarray, ph: int):
         """
-        Обучает временную модель для CV fold.
-        Реализация зависит от типа эксперта (XGB/RF/ARF/NN).
+        Обучает временную NN (MLP) для CV fold по данным фазы ph.
         """
-        # Пример для XGB
-        if not HAVE_XGB:
-            return None
-        
+        # скейлер (если sklearn есть — норм; иначе «заглушка» уже задана выше)
         scaler = StandardScaler().fit(X) if HAVE_SKLEARN else None
-        X_scaled = scaler.transform(X) if scaler else X
-        
-        dtrain = xgb.DMatrix(X_scaled, label=y)
-        model = xgb.train(
-            params={
-                "objective": "binary:logistic",
-                "max_depth": self.cfg.xgb_max_depth,
-                "eta": self.cfg.xgb_eta,
-                "subsample": self.cfg.xgb_subsample,
-                "colsample_bytree": self.cfg.xgb_colsample_bytree,
-                "min_child_weight": self.cfg.xgb_min_child_weight,
-                "eval_metric": "logloss",
-            },
-            dtrain=dtrain,
-            num_boost_round=self.cfg.xgb_rounds_warm,
-            verbose_eval=False
+        X_scaled = scaler.transform(X) if scaler is not None else X
+
+        # гиперпараметры те же, что у основного эксперта
+        n_in = X_scaled.shape[1]
+        net = _SimpleMLP(
+            n_in=n_in,
+            n_h=int(getattr(self.cfg, "nn_hidden", 32)),
+            eta=float(getattr(self.cfg, "nn_eta", 0.01)),
+            l2=float(getattr(self.cfg, "nn_l2", 0.0)),
         )
-        
-        return {"model": model, "scaler": scaler}
+
+        # обучение небольшим числом эпох
+        y_float = y.astype(np.float32)
+        epochs = int(getattr(self.cfg, "nn_epochs_cv", max(1, int(getattr(self.cfg, "nn_epochs", 1)))))
+        for _ in range(max(1, epochs)):
+            net.fit_epoch(X_scaled, y_float, batch_size=128)
+
+        return {"model": net, "scaler": scaler}
 
     def _predict_fold(self, fold_model, X: np.ndarray, ph: int) -> np.ndarray:
         """
-        Предсказания временной модели CV fold.
+        Предсказания временной NN для CV fold (с температурой фазы).
         """
         if fold_model is None:
-            return np.full(len(X), 0.5)
-        
+            return np.full(len(X), 0.5, dtype=np.float32)
+
         scaler = fold_model.get("scaler")
-        model = fold_model.get("model")
-        
-        X_scaled = scaler.transform(X) if scaler else X
-        dtest = xgb.DMatrix(X_scaled)
-        preds = model.predict(dtest)
-        
+        net = fold_model.get("model")
+        X_scaled = scaler.transform(X) if scaler is not None else X
+
+        T = float(self.T_ph.get(ph, 1.0))
+        preds = net.predict_proba(X_scaled, T=T).astype(np.float32)
         return preds
 
 
@@ -8031,12 +8055,15 @@ def main_loop():
                             # Сначала — МЕТА (не зависит от x_ml, чтобы опыт рос всегда)
                             try:
                                 meta.settle(
-                                    p_xgb, p_rf, p_arf, p_nn,
+                                    p_xgb=p_xgb,
+                                    p_rf=p_rf,
+                                    p_arf=p_arf,
+                                    p_nn=p_nn,
                                     p_base=p_base,
                                     y_up=y_up_int,
+                                    reg_ctx=reg_ctx,
                                     used_in_live=used_flag,
                                     p_final_used=p_fin,
-                                    reg_ctx=reg_ctx
                                 )
                             except Exception as e:
                                 print(f"[ens ] meta.settle error: {e}")
@@ -8373,12 +8400,15 @@ def main_loop():
                                 # 1) СНАЧАЛА — МЕТА. Всегда пытаемся заселить, даже если x_ml пустой или эксперты упадут.
                                 try:
                                     meta.settle(
-                                        p_xgb, p_rf, p_arf, p_nn,
-                                        p_base=p_base,                 # МЕТА сама форсирует φ при None
+                                        p_xgb=p_xgb,
+                                        p_rf=p_rf,
+                                        p_arf=p_arf,
+                                        p_nn=p_nn,
+                                        p_base=p_base,
                                         y_up=y_up_int,
+                                        reg_ctx=reg_ctx,
                                         used_in_live=used_flag,
                                         p_final_used=p_fin,
-                                        reg_ctx=reg_ctx
                                     )
                                 except Exception as e:
                                     print(f"[ens ] meta.settle error: {e}")
