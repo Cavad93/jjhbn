@@ -24,17 +24,22 @@ meta_cem_mc.py — META-стекинг на основе CEM/CMA-ES + Монте
 Файл состояния: cfg.meta_state_path (JSON)
 """
 from __future__ import annotations
+
 import os
 import json
 import time
 import math
 import random
 import csv
+import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from collections import deque
 
+# meta_cem_mc.py (импорты)
 import numpy as np
+from collections import defaultdict
+
 
 # ========== ВНЕШНИЕ ЗАВИСИМОСТИ ==========
 
@@ -84,14 +89,32 @@ except Exception:
     def phase_from_ctx(ctx: Optional[dict]) -> int:
         return int(ctx.get("phase", 0) if isinstance(ctx, dict) else 0)
 
-# === NEW: LambdaMART в роли второй МЕТА + блендер вероятностей ===
-def _safe_logit(p):
+# ---- безопасные хелперы (общие) ----
+def _safe_prob(v, default=0.5) -> float:
+    try:
+        v = float(v)
+        if not math.isfinite(v):
+            return default
+        return float(min(max(v, 1e-6), 1.0 - 1e-6))
+    except Exception:
+        return float(default)
+
+def _safe_logit(p) -> float:
     try:
         p = float(p)
     except Exception:
         return 0.0
     p = max(min(p, 1.0 - 1e-6), 1e-6)
     return math.log(p / (1.0 - p))
+
+def _safe_reg_ctx(ctx) -> dict:
+    return ctx if isinstance(ctx, dict) else {}
+
+def _safe_phase(ctx) -> int:
+    try:
+        return int(phase_from_ctx(_safe_reg_ctx(ctx)))
+    except Exception:
+        return 0
 
 def _entropy4(p_list):
     vals = [float(p) for p in p_list if p is not None]
@@ -101,6 +124,7 @@ def _entropy4(p_list):
     hist = hist / (hist.sum() + 1e-12)
     return float(-(hist * np.log(hist + 1e-12)).sum())
 
+# === NEW: LambdaMART в роли второй МЕТА + блендер вероятностей ===
 class LambdaMARTMetaLite:
     """
     Обучает LGBMRanker на φ-признаках мета-уровня и отдаёт «сырую» вероятность через сигмоиду.
@@ -132,7 +156,7 @@ class LambdaMARTMetaLite:
         plist = [p for p in [p_xgb, p_rf, p_arf, p_nn] if p is not None]
         disagree = float(np.std(plist)) if len(plist) > 1 else 0.0
         ent = _entropy4([p_xgb, p_rf, p_arf, p_nn])
-        
+
         # Контекстные фичи
         if reg_ctx is not None and isinstance(reg_ctx, dict):
             trend_sign = float(reg_ctx.get("trend_sign", 0.0))
@@ -146,18 +170,18 @@ class LambdaMARTMetaLite:
         else:
             trend_sign = trend_abs = vol_ratio = jump_flag = 0.0
             ofi_sign = book_imb = basis_sign = funding_sign = 0.0
-        
+
         # Взаимодействия
         disagree_vol = disagree * vol_ratio
         entropy_trend = ent * abs(trend_abs)
-        
+
         return np.array([
             lzs[0], lzs[1], lzs[2], lzs[3], lz_base,  # 0-4: логиты
-            disagree, ent,  # 5-6: агрегаты
+            disagree, ent,                             # 5-6: агрегаты
             trend_sign, trend_abs, vol_ratio, jump_flag,  # 7-10: контекст
             ofi_sign, book_imb, basis_sign, funding_sign,  # 11-14: микроструктура
-            disagree_vol, entropy_trend,  # 15-16: взаимодействия
-            1.0  # 17: bias
+            disagree_vol, entropy_trend,               # 15-16: взаимодействия
+            1.0                                        # 17: bias
         ], dtype=float)
 
     def _phase_group(self, reg_ctx):
@@ -177,36 +201,52 @@ class LambdaMARTMetaLite:
         except Exception:
             return None
 
-    def record_result(self, p_xgb, p_rf, p_arf, p_nn, p_base, y_up, reg_ctx=None, used_in_live=False):
+    def record_result(
+        self,
+        p_xgb,
+        p_rf,
+        p_arf,
+        p_nn,
+        p_base,
+        y_up,
+        reg_ctx=None,
+        used_in_live=False,
+        p_final_used=None,  # ← добавлено, может приходить из вызова, внутри не обязателен
+    ):
         if not self.enabled:
             return
-        x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
-        g = self._phase_group(reg_ctx)
-        self._X.append(x)
-        self._y.append(int(y_up))
-        self._g.append(g)
-        if len(self._X) > self.max_buf:
-            drop = len(self._X) - self.max_buf
-            self._X = self._X[drop:]
-            self._y = self._y[drop:]
-            self._g = self._g[drop:]
-        if len(self._X) >= self.min_ready and (len(self._X) - self._last_fit_n) >= self.retrain_every:
-            try:
+        try:
+            x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
+            g = self._phase_group(reg_ctx)
+
+            self._X.append(x)
+            self._y.append(int(y_up))
+            self._g.append(g)
+
+            if len(self._X) > self.max_buf:
+                drop = len(self._X) - self.max_buf
+                self._X = self._X[drop:]
+                self._y = self._y[drop:]
+                self._g = self._g[drop:]
+
+            if len(self._X) >= self.min_ready and (len(self._X) - self._last_fit_n) >= self.retrain_every:
                 X = np.vstack(self._X)
                 y = np.asarray(self._y, dtype=int)
                 g = np.asarray(self._g, dtype=int)
+
                 order = np.argsort(g)
                 X = X[order]
                 y = y[order]
                 g = g[order]
+
                 _, counts = np.unique(g, return_counts=True)
                 mdl = _LMCore(self.params) if _LMCore else None
                 if mdl is not None:
                     mdl.fit(X, y, groups=counts.tolist())
                     self.model = mdl.model
                     self._last_fit_n = len(self._X)
-            except Exception:
-                pass
+        except Exception as e:
+            print(f"[ens ] lmeta.record_result error: {e.__class__.__name__}: {e}\n{traceback.format_exc()}")
 
     def status(self) -> str:
         if not self.enabled:
@@ -287,65 +327,47 @@ class MetaCEMMC:
     def __init__(self, cfg):
         """
         Инициализация META-стекинга
-        
-        Args:
-            cfg: конфигурация с параметрами оптимизации, CV, путями файлов
-        
-        Что происходит при инициализации:
-        1. Загружаем параметры оптимизации (CEM/CMA-ES)
-        2. Инициализируем веса для каждой фазы
-        3. Настраиваем гейтинг (soft или EXP4)
-        4. Создаем структуры для хранения CV метрик
-        5. Загружаем сохраненное состояние (если есть)
         """
         self.cfg = cfg
         self.enabled = True
         self.mode = "SHADOW"  # Начинаем в shadow режиме для накопления данных
-        
+        self._last_phase = 0  # безопасная инициализация для статусов/логов
+
         # ADWIN для детекции дрейфа концепции
         self.adwin = ADWIN(delta=self.cfg.adwin_delta) if HAVE_RIVER else None
 
         # ===== ФАЗОВАЯ АРХИТЕКТУРА =====
-        # У нас 6 фаз рынка, каждая имеет свою модель
         self.P = int(getattr(cfg, "meta_exp4_phases", 6))
         
         # ИЗМЕНЕНО: Размерность вектора фичей увеличена с 8 до 18
-        # Включает: 4 логита экспертов + базовый логит + disagree + entropy
-        #           + 8 контекстных фичей + 2 взаимодействия + bias
         self.D = 18
         
-        # Веса для расширенного вектора фичей
-        # Каждая фаза имеет свой набор весов размерностью D=18
+        # Веса для расширенного вектора фичей (на фазу)
         self.w_meta_ph = np.zeros((self.P, self.D), dtype=float)
         
         # Гиперпараметры оптимизации
-        self.eta = float(getattr(cfg, "meta_eta", 0.05))  # learning rate
-        self.l2 = float(getattr(cfg, "meta_l2", 0.001))   # L2 регуляризация
-        self.w_clip = float(getattr(cfg, "meta_w_clip", 8.0))   # клиппинг весов
-        self.g_clip = float(getattr(cfg, "meta_g_clip", 1.0))   # клиппинг градиентов
+        self.eta = float(getattr(cfg, "meta_eta", 0.05))
+        self.l2 = float(getattr(cfg, "meta_l2", 0.001))
+        self.w_clip = float(getattr(cfg, "meta_w_clip", 8.0))
+        self.g_clip = float(getattr(cfg, "meta_g_clip", 1.0))
 
         # ===== КОНТЕКСТНЫЙ ГЕЙТИНГ =====
-        # Веса экспертов могут зависеть от контекста (волатильность, тренд и т.д.)
         self.gating_mode = getattr(cfg, "meta_gating_mode", "soft")  # "soft" или "exp4"
-        self.alpha_mix = float(getattr(cfg, "meta_alpha_mix", 1.0))  # вес смеси логитов
-        
-        # Для soft-гейтинга: матрица весов (K экспертов × D контекстных фичей)
-        self.Wg = None  # Инициализируется при первом использовании
+        self.alpha_mix = float(getattr(cfg, "meta_alpha_mix", 1.0))
+        self.Wg = None
         self.g_eta = float(getattr(cfg, "meta_gate_eta", 0.02))
         self.g_l2 = float(getattr(cfg, "meta_gate_l2", 0.0005))
         self.gate_clip = float(getattr(cfg, "meta_gate_clip", 5.0))
 
-        # Для EXP4 гейтинга: веса экспертов по фазам
+        # Для EXP4
         self.exp4_eta = float(getattr(cfg, "meta_exp4_eta", 0.10))
-        self.exp4_w = None  # np.ndarray (P × K), нормированные веса
+        self.exp4_w = None  # np.ndarray (P × K)
 
         # ===== ТРЕКИНГ МЕТРИК ДЛЯ РЕЖИМОВ =====
-        # Накапливаем хиты для оценки winrate
-        self.shadow_hits: List[int] = []  # предсказания в shadow режиме
-        self.active_hits: List[int] = []  # предсказания в active режиме
+        self.shadow_hits: List[int] = []
+        self.active_hits: List[int] = []
 
         # ===== БУФЕРЫ ДАННЫХ ПО ФАЗАМ =====
-        # Для каждой фазы храним in-memory буфер примеров
         self.buf_ph: Dict[int, List[Tuple]] = {p: [] for p in range(self.P)}
         self.seen_ph: Dict[int, int] = {p: 0 for p in range(self.P)}
         
@@ -359,62 +381,51 @@ class MetaCEMMC:
             self._phase_csv_paths[p] = os.path.join(base_dir, f"{base_name}_ph{p}_data.csv")
 
         # ===== НОВОЕ: CROSS-VALIDATION СТРУКТУРЫ =====
-        # Для каждой фазы храним CV метрики и OOF predictions
-        
-        # Out-of-fold predictions для текущего окна
         cv_window = int(getattr(cfg, "cv_oof_window", 500))
-        self.cv_oof_preds: Dict[int, deque] = {
-            p: deque(maxlen=cv_window) for p in range(self.P)
-        }
-        self.cv_oof_labels: Dict[int, deque] = {
-            p: deque(maxlen=cv_window) for p in range(self.P)
-        }
-        
-        # Метрики последней CV проверки для каждой фазы
+        self.cv_oof_preds: Dict[int, deque] = {p: deque(maxlen=cv_window) for p in range(self.P)}
+        self.cv_oof_labels: Dict[int, deque] = {p: deque(maxlen=cv_window) for p in range(self.P)}
         self.cv_metrics: Dict[int, Dict] = {p: {} for p in range(self.P)}
-        
-        # Счетчик для периодической CV проверки
         self.cv_last_check: Dict[int, int] = {p: 0 for p in range(self.P)}
-        
-        # Флаг валидации: прошла ли фаза CV проверку
         self.validation_passed: Dict[int, bool] = {p: False for p in range(self.P)}
 
         # ===== ТРЕКИНГ ДЛЯ СОХРАНЕНИЯ =====
-        self._unsaved = 0  # счетчик несохраненных изменений
+        self._unsaved = 0
         self._last_save_ts = time.time()
         
-        # Ссылки на экспертов (опционально, для логирования)
+        # Ссылки на экспертов (опционально)
         self._experts: List = []
 
         # ===== ЗАГРУЗКА СОСТОЯНИЯ =====
+        # ===== ЗАГРУЗКА СОСТОЯНИЯ =====
         self._load()
+
+        # Доп. страховка: нормализация seen_ph даже если в save был старый формат
+        if isinstance(self.seen_ph, list):
+            self.seen_ph = {p: int(self.seen_ph[p] if p < len(self.seen_ph) else 0) for p in range(self.P)}
+        elif isinstance(self.seen_ph, dict):
+            self.seen_ph = {int(k): int(v) for k, v in self.seen_ph.items()}
+            for p in range(self.P):
+                self.seen_ph.setdefault(p, 0)
+
 
     # ========== СВЯЗЫВАНИЕ С ЭКСПЕРТАМИ ==========
     def settle(self, *args, **kwargs):
         """
         Алиас для record_result() (обратная совместимость с legacy кодом).
-        Просто перенаправляет вызов на record_result().
         """
-        return self.record_result(*args, **kwargs)
+        try:
+            return self.record_result(*args, **kwargs)
+        except Exception as e:
+            print(f"[ens ] meta.settle error: {e.__class__.__name__}: {e}\n{traceback.format_exc()}")
 
     def bind_experts(self, *experts):
         """
         Сохраняет ссылки на экспертов для логирования и диагностики
-        
-        Args:
-            *experts: список экспертов (XGB, RF, ARF, NN)
-        
-        Returns:
-            self для chain-style вызовов
-        
-        Пример:
-            meta.bind_experts(xgb_expert, rf_expert, arf_expert, nn_expert)
         """
         self._experts = list(experts)
         return self
 
     # ========== ПРЕДСКАЗАНИЕ ==========
-    
     def predict(
         self,
         p_xgb: Optional[float],
@@ -426,31 +437,6 @@ class MetaCEMMC:
     ) -> Optional[float]:
         """
         Создает финальное предсказание из предсказаний экспертов
-        
-        Процесс:
-        1. Определяем текущую фазу из контекста
-        2. Извлекаем веса для этой фазы
-        3. Строим вектор фичей φ из логитов экспертов, мета-фичей и контекста
-        4. Применяем гейтинг (если включен)
-        5. Вычисляем взвешенную сумму и применяем сигмоид
-        
-        Args:
-            p_xgb, p_rf, p_arf, p_nn: вероятности от экспертов
-            p_base: базовое предсказание (до ансамбля)
-            reg_ctx: контекст с информацией о фазе и других параметрах
-        
-        Returns:
-            Финальная вероятность p_final ∈ [0, 1] или None если недостаточно данных
-        
-        Математика:
-            φ = [logit(p_xgb), logit(p_rf), logit(p_arf), logit(p_nn),
-                 logit(p_base), disagree, entropy, 
-                 trend_sign, trend_abs, vol_ratio, jump_flag,
-                 ofi_sign, book_imb, basis_sign, funding_sign,
-                 disagree*vol, entropy*trend, 1]
-            
-            z = w · φ  (линейная комбинация)
-            p_final = σ(z) = 1 / (1 + exp(-z))  (сигмоид)
         """
         ph = phase_from_ctx(reg_ctx)
         
@@ -459,12 +445,10 @@ class MetaCEMMC:
         if np.allclose(w, 0.0):
             return None  # Модель еще не обучена
 
-        # Строим вектор фичей из предсказаний экспертов и контекста
         x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
         if x is None:
             return None
 
-        # Вычисляем финальное предсказание
         return self._safe_p_from_x(ph, x)
 
     def _phi(
@@ -477,183 +461,92 @@ class MetaCEMMC:
         reg_ctx: Optional[dict] = None
     ) -> Optional[np.ndarray]:
         """
-        Строит расширенный вектор фичей для мета-модели
-        
-        Вектор включает:
-        - Логиты предсказаний экспертов (4 значения)
-        - Логит базового предсказания (1 значение)
-        - Disagreement между экспертами (1 значение)
-        - Энтропия распределения (1 значение)
-        - НОВОЕ: Контекстные фичи рыночного режима (8 значений)
-        - НОВОЕ: Взаимодействия между фичами (2 значения)
-        - Bias term (1 значение) = 1.0
-        
-        Всего 18 фичей (было 8)
-        
-        Почему логиты, а не вероятности?
-        Логиты живут в (-∞, +∞), что удобнее для линейных операций.
-        Вероятности сжаты в [0,1] и теряют информацию об уверенности модели.
-        
-        Args:
-            p_xgb, p_rf, p_arf, p_nn: вероятности экспертов
-            p_base: базовое предсказание
-            reg_ctx: контекст с рыночными условиями
-        
-        Returns:
-            Вектор фичей размера 18 или None если недостаточно данных
+        Строит расширенный вектор фичей для мета-модели (18D)
         """
-        # Собираем доступные предсказания
         preds = []
         for p in [p_xgb, p_rf, p_arf, p_nn]:
             if p is not None:
                 preds.append(float(p))
-        
         if len(preds) == 0:
             return None  # Нет предсказаний от экспертов
 
-        # Преобразуем в логиты
         def safe_logit(p: float) -> float:
-            """Безопасное вычисление logit с клиппингом"""
             p = np.clip(p, 1e-6, 1 - 1e-6)
             return float(np.log(p / (1 - p)))
 
-        lz_xgb = safe_logit(p_xgb) if p_xgb is not None else 0.0
-        lz_rf = safe_logit(p_rf) if p_rf is not None else 0.0
-        lz_arf = safe_logit(p_arf) if p_arf is not None else 0.0
-        lz_nn = safe_logit(p_nn) if p_nn is not None else 0.0
+        lz_xgb  = safe_logit(p_xgb)  if p_xgb  is not None else 0.0
+        lz_rf   = safe_logit(p_rf)   if p_rf   is not None else 0.0
+        lz_arf  = safe_logit(p_arf)  if p_arf  is not None else 0.0
+        lz_nn   = safe_logit(p_nn)   if p_nn   is not None else 0.0
         lz_base = safe_logit(p_base) if p_base is not None else 0.0
 
-        # Базовые мета-фичи (как было)
-        
-        # Disagreement: насколько эксперты не согласны друг с другом
-        # Высокое значение = эксперты дают разные предсказания = высокая неопределенность
         disagree = float(np.std(preds)) if len(preds) > 1 else 0.0
 
-        # Entropy: энтропия среднего распределения экспертов
-        # Высокая энтропия = модель неуверена (p близко к 0.5)
         p_mean = float(np.mean(preds))
         p_mean = np.clip(p_mean, 1e-6, 1 - 1e-6)
         entropy = float(-(p_mean * np.log(p_mean) + (1 - p_mean) * np.log(1 - p_mean)))
 
-        # НОВОЕ: Добавляем контекстные фичи рыночного режима
         if reg_ctx is not None and isinstance(reg_ctx, dict):
-            trend_sign = float(reg_ctx.get("trend_sign", 0.0))
-            trend_abs = float(reg_ctx.get("trend_abs", 0.0))
-            vol_ratio = float(reg_ctx.get("vol_ratio", 1.0))
-            jump_flag = float(reg_ctx.get("jump_flag", 0.0))
-            ofi_sign = float(reg_ctx.get("ofi_sign", 0.0))
-            book_imb = float(reg_ctx.get("book_imb", 0.0))
-            basis_sign = float(reg_ctx.get("basis_sign", 0.0))
-            funding_sign = float(reg_ctx.get("funding_sign", 0.0))
+            trend_sign  = float(reg_ctx.get("trend_sign", 0.0))
+            trend_abs   = float(reg_ctx.get("trend_abs", 0.0))
+            vol_ratio   = float(reg_ctx.get("vol_ratio", 1.0))
+            jump_flag   = float(reg_ctx.get("jump_flag", 0.0))
+            ofi_sign    = float(reg_ctx.get("ofi_sign", 0.0))
+            book_imb    = float(reg_ctx.get("book_imb", 0.0))
+            basis_sign  = float(reg_ctx.get("basis_sign", 0.0))
+            funding_sign= float(reg_ctx.get("funding_sign", 0.0))
         else:
-            # Если контекст не передан - заполняем нулями (обратная совместимость)
             trend_sign = trend_abs = vol_ratio = jump_flag = 0.0
             ofi_sign = book_imb = basis_sign = funding_sign = 0.0
 
-        # НОВОЕ: Добавляем взаимодействия между фичами
-        # Эти комбинации помогают модели уловить нелинейные паттерны
-        disagree_vol = disagree * vol_ratio  # дисагремент при высокой воле более важен
-        entropy_trend = entropy * abs(trend_abs)  # неопределенность в тренде
+        disagree_vol  = disagree * vol_ratio
+        entropy_trend = entropy * abs(trend_abs)
 
-        # Собираем расширенный вектор фичей (18 элементов)
         x = np.array([
-            # Оригинальные логиты экспертов (0-4)
-            lz_xgb,
-            lz_rf,
-            lz_arf,
-            lz_nn,
-            lz_base,
-            
-            # Оригинальные агрегаты (5-6)
-            disagree,
-            entropy,
-            
-            # Контекстные фичи рыночного режима (7-14)
-            trend_sign,      # знак тренда (±1)
-            trend_abs,       # сила тренда (0-3)
-            vol_ratio,       # отношение текущей волы к средней
-            jump_flag,       # детекция скачка цены (0/1)
-            ofi_sign,        # знак order flow imbalance
-            book_imb,        # дисбаланс стакана [-1, 1]
-            basis_sign,      # знак базиса фьючерсов
-            funding_sign,    # знак ставки финансирования
-            
-            # Взаимодействия (15-16)
-            disagree_vol,    # взаимодействие неопределенности и волатильности
-            entropy_trend,   # взаимодействие энтропии и тренда
-            
-            # Bias term (17)
-            1.0
+            lz_xgb, lz_rf, lz_arf, lz_nn, lz_base,       # 0-4
+            disagree, entropy,                            # 5-6
+            trend_sign, trend_abs, vol_ratio, jump_flag,  # 7-10
+            ofi_sign, book_imb, basis_sign, funding_sign, # 11-14
+            disagree_vol, entropy_trend,                  # 15-16
+            1.0                                           # 17 (bias)
         ], dtype=float)
 
         return x
 
     def _phi_forced(self, p_xgb: float, p_rf: float, p_arf: float, p_nn: float, p_base: float, reg_ctx: Optional[dict] = None) -> np.ndarray:
         """
-        Версия _phi, которая ВСЕГДА возвращает вектор фичей
-        Используется когда нужно гарантированно сохранить пример для обучения
-        
-        Args:
-            p_xgb, p_rf, p_arf, p_nn, p_base: вероятности (уже проверенные на None)
-            reg_ctx: контекст
-        
-        Returns:
-            Вектор фичей размерности D (всегда, никогда не None)
+        Версия _phi, которая ВСЕГДА возвращает вектор фичей (заполняет и паддингует до D)
         """
-        # Базовые признаки - прогнозы экспертов
         x = np.array([p_xgb, p_rf, p_arf, p_nn, p_base], dtype=np.float32)
-        
-        # Добавляем производные признаки для улучшения качества
         if self.D > 5:
-            # Попарные произведения (взаимодействия)
             x = np.append(x, [
                 p_xgb * p_rf,
                 p_xgb * p_arf, 
                 p_xgb * p_nn,
-                p_rf * p_arf,
-                p_rf * p_nn,
+                p_rf  * p_arf,
+                p_rf  * p_nn,
                 p_arf * p_nn
             ])
-        
-        # Дополняем до нужной размерности если необходимо
         if len(x) < self.D:
             x = np.pad(x, (0, self.D - len(x)), mode='constant', constant_values=0.5)
         elif len(x) > self.D:
             x = x[:self.D]
-        
         return x
-
 
     def _safe_p_from_x(self, ph: int, x: np.ndarray) -> Optional[float]:
         """
         Вычисляет вероятность из вектора фичей для конкретной фазы
-        
-        Применяет линейную комбинацию с весами фазы и сигмоид:
-        z = w · x
-        p = σ(z) = 1 / (1 + exp(-z))
-        
-        Args:
-            ph: номер фазы (0-5)
-            x: вектор фичей размера 18 (было 8)
-        
-        Returns:
-            Вероятность ∈ [0, 1] или None если веса не обучены
         """
         w = self.w_meta_ph[ph]
         if np.allclose(w, 0.0):
             return None
 
-        # Линейная комбинация
         z = float(np.dot(w, x))
-        
-        # Сигмоид с защитой от overflow
         z = np.clip(z, -60.0, 60.0)
         p = 1.0 / (1.0 + math.exp(-z))
-        
         return float(np.clip(p, 0.0, 1.0))
 
     # ========== ЗАПИСЬ РЕЗУЛЬТАТА И ОБУЧЕНИЕ ==========
-        
     def record_result(
         self,
         p_xgb: Optional[float],
@@ -668,196 +561,113 @@ class MetaCEMMC:
     ) -> None:
         """
         Записывает результат предсказания и триггерит обучение при необходимости
-        
-        Это центральная функция обучения. Что происходит:
-        
-        1. Извлекаем фазу и строим вектор фичей с контекстом (18 элементов)
-        2. ВСЕГДА сохраняем пример в буфер фазы - даже с дефолтными значениями
-        3. ВСЕГДА обновляем метрики качества (hits) - даже если экспертов нет
-        4. НОВОЕ: Сохраняем OOF predictions для CV
-        5. НОВОЕ: Периодически запускаем CV валидацию
-        6. Если накопилось достаточно данных - запускаем обучение CEM/CMA-ES
-        7. Проверяем условия переключения SHADOW↔ACTIVE
-        
-        Args:
-            p_xgb, p_rf, p_arf, p_nn: вероятности от экспертов
-            p_base: базовое предсказание
-            y_up: истинный результат (0 или 1)
-            used_in_live: использовалось ли в реальной торговле
-            p_final_used: какое итоговое предсказание использовалось (если отличается от predict)
-            reg_ctx: контекст с фазой и рыночными условиями
         """
-        # ===== ШАГ 1: ИЗВЛЕЧЕНИЕ ФАЗЫ И ПОСТРОЕНИЕ ФИЧЕЙ =====
-        ph = phase_from_ctx(reg_ctx)
-        
-        # Сохраняем последнюю виденную фазу для CV
-        self._last_phase = ph
-        
-        # Пытаемся построить вектор фичей из предсказаний экспертов
-        x_orig = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
-        
-        # КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: Если эксперты не готовы, создаём вектор с дефолтными значениями
-        # Это гарантирует, что мы не потеряем ни одного примера для обучения
-        if x_orig is not None:
-            x = x_orig
-            has_expert_predictions = True
-        else:
-            # Создаём дефолтный вектор фичей, заменяя отсутствующие предсказания на базовые
-            p_xgb_safe = p_xgb if p_xgb is not None else (p_base if p_base is not None else 0.5)
-            p_rf_safe = p_rf if p_rf is not None else (p_base if p_base is not None else 0.5)
-            p_arf_safe = p_arf if p_arf is not None else (p_base if p_base is not None else 0.5)
-            p_nn_safe = p_nn if p_nn is not None else (p_base if p_base is not None else 0.5)
-            p_base_safe = p_base if p_base is not None else 0.5
-            
-            # Форсируем создание вектора фичей с безопасными значениями
-            # Временно подменяем метод _phi чтобы он не возвращал None
-            x = self._phi_forced(p_xgb_safe, p_rf_safe, p_arf_safe, p_nn_safe, p_base_safe, reg_ctx)
-            has_expert_predictions = False
-        
-        # ===== ШАГ 2: ВСЕГДА СОХРАНЯЕМ ПРИМЕР ДЛЯ ОБУЧЕНИЯ =====
-        # Теперь мы ВСЕГДА сохраняем пример, даже если эксперты не готовы
-        # Это критично для накопления полного набора данных (все 31 пример)
-        buf = self._append_example(ph, x, int(y_up))
-        self.seen_ph[ph] += 1  # ВСЕГДА увеличиваем счетчик
-
-        # ===== ШАГ 3: ОБНОВЛЕНИЕ МЕТРИК (ВСЕГДА, ДАЖЕ БЕЗ ЭКСПЕРТОВ) =====
-        # Вычисляем предсказание для статистики
-        if has_expert_predictions:
-            # Есть реальные предсказания экспертов - используем модель
-            p_for_gate = p_final_used if (p_final_used is not None) else self._safe_p_from_x(ph, x)
-            
-            # Если веса еще не обучены, используем baseline
-            if p_for_gate is None:
-                p_for_gate = p_base if p_base is not None else 0.5
-        else:
-            # Нет предсказаний экспертов - используем baseline для статистики
-            p_for_gate = p_base if p_base is not None else 0.5
-
-        # Вычисляем корректность предсказания
-        hit = int((p_for_gate >= 0.5) == bool(y_up))
-
-        # Обновляем метрики в зависимости от режима
-        if self.mode == "ACTIVE" and used_in_live:
-            # В ACTIVE режиме: отслеживаем только реальные ставки
-            self.active_hits.append(hit)
-            
-            # ADWIN детектирует концептуальный дрейф
-            if self.adwin is not None:
-                in_drift = self.adwin.update(1 - hit)
-                if in_drift:
-                    self.mode = "SHADOW"
-                    self.active_hits = []
-        else:
-            # В SHADOW режиме: накапливаем ВСЕ наблюдения
-            # Это позволяет МЕТЕ учиться даже когда она не используется в ставках
-            self.shadow_hits.append(hit)
-
-        # Ограничиваем размер буферов хитов
-        self.active_hits = self.active_hits[-2000:]
-        self.shadow_hits = self.shadow_hits[-2000:]
-
-        self._unsaved += 1
-        self._save_throttled()
-
-        # ===== ШАГ 4: НОВОЕ - OOF TRACKING ДЛЯ CV =====
-        # Сохраняем предсказания для последующей валидации
-        # Делаем это даже с дефолтными значениями для полноты данных
-        if getattr(self.cfg, "cv_enabled", True) and p_for_gate is not None:
-            self.cv_oof_preds[ph].append(float(p_for_gate))
-            self.cv_oof_labels[ph].append(int(y_up))
-
-        # ===== ШАГ 5: НОВОЕ - ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА =====
-        # Каждые N примеров запускаем полную cross-validation
-        cv_check_every = int(getattr(self.cfg, "cv_check_every", 50))
-        self.cv_last_check[ph] += 1
-        
-        if getattr(self.cfg, "cv_enabled", True) and self.cv_last_check[ph] >= cv_check_every:
-            self.cv_last_check[ph] = 0
-            
-            try:
-                cv_results = self._run_cv_validation(ph)
-                self.cv_metrics[ph] = cv_results
-                
-                if cv_results.get("status") == "ok":
-                    self.validation_passed[ph] = True
-                    
-                    # Логируем результаты CV
-                    print(f"[MetaCEMMC] CV ph={ph}: "
-                        f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
-                        f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
-                        f"folds={cv_results['n_folds']}")
-            except Exception as e:
-                print(f"[MetaCEMMC] CV failed for phase {ph}: {e}")
-
-        # ===== ШАГ 6: ЛЕНИВОЕ ОБУЧЕНИЕ =====
-        # Если в фазе накопилось достаточно данных - запускаем CEM/CMA-ES обучение
-        if self._phase_ready(ph):
-            try:
-                self._train_phase(ph)
-                
-                # После обучения очищаем буферы для следующего раунда
-                self._clear_phase_storage(ph)
-                self.buf_ph[ph] = []
-                
-                self._save()
-            except Exception as e:
-                # Не падаем в production, только логируем
-                print(f"[MetaCEMMC] Training failed for phase {ph}: {e}")
-
-        # ===== ШАГ 7: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ =====
-        # Проверяем метрики (включая CV) и решаем о переключении SHADOW↔ACTIVE
         try:
-            self._maybe_flip_modes()
-        except Exception:
-            pass
+            # ===== ШАГ 1: ИЗВЛЕЧЕНИЕ ФАЗЫ И ПОСТРОЕНИЕ ФИЧЕЙ =====
+            ph = phase_from_ctx(reg_ctx)
+            self._last_phase = ph
+
+            x_orig = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
+
+            if x_orig is not None:
+                x = x_orig
+                has_expert_predictions = True
+            else:
+                p_xgb_safe  = p_xgb  if p_xgb  is not None else (p_base if p_base is not None else 0.5)
+                p_rf_safe   = p_rf   if p_rf   is not None else (p_base if p_base is not None else 0.5)
+                p_arf_safe  = p_arf  if p_arf  is not None else (p_base if p_base is not None else 0.5)
+                p_nn_safe   = p_nn   if p_nn   is not None else (p_base if p_base is not None else 0.5)
+                p_base_safe = p_base if p_base is not None else 0.5
+                x = self._phi_forced(p_xgb_safe, p_rf_safe, p_arf_safe, p_nn_safe, p_base_safe, reg_ctx)
+                has_expert_predictions = False
+
+            # ===== ШАГ 2: ВСЕГДА СОХРАНЯЕМ ПРИМЕР =====
+            # ===== ШАГ 2: ВСЕГДА СОХРАНЯЕМ ПРИМЕР =====
+            buf = self._append_example(ph, x, int(y_up))
+            self.seen_ph[ph] = int(self.seen_ph.get(ph, 0)) + 1
+
+
+            # ===== ШАГ 3: ОБНОВЛЕНИЕ МЕТРИК =====
+            if has_expert_predictions:
+                p_for_gate = p_final_used if (p_final_used is not None) else self._safe_p_from_x(ph, x)
+                if p_for_gate is None:
+                    p_for_gate = p_base if p_base is not None else 0.5
+            else:
+                p_for_gate = p_base if p_base is not None else 0.5
+
+            hit = int((p_for_gate >= 0.5) == bool(y_up))
+
+            if self.mode == "ACTIVE" and used_in_live:
+                self.active_hits.append(hit)
+                if self.adwin is not None:
+                    in_drift = self.adwin.update(1 - hit)
+                    if in_drift:
+                        self.mode = "SHADOW"
+                        self.active_hits = []
+            else:
+                self.shadow_hits.append(hit)
+
+            self.active_hits = self.active_hits[-2000:]
+            self.shadow_hits = self.shadow_hits[-2000:]
+
+            self._unsaved += 1
+            self._save_throttled()
+
+            # ===== ШАГ 4: OOF ДЛЯ CV =====
+            if getattr(self.cfg, "cv_enabled", True) and p_for_gate is not None:
+                self.cv_oof_preds[ph].append(float(p_for_gate))
+                self.cv_oof_labels[ph].append(int(y_up))
+
+            # ===== ШАГ 5: ПЕРИОДИЧЕСКАЯ CV =====
+            # стало (meta_cem_mc.py, тот же блок — безопасный инкремент и чтение)
+            cv_check_every = int(getattr(self.cfg, "cv_check_every", 50))
+            self.cv_last_check[ph] = int(self.cv_last_check.get(ph, 0)) + 1
+
+            if getattr(self.cfg, "cv_enabled", True) and int(self.cv_last_check.get(ph, 0)) >= cv_check_every:
+                self.cv_last_check[ph] = 0
+                try:
+                    cv_results = self._run_cv_validation(ph)
+                    self.cv_metrics[ph] = cv_results
+                    if cv_results.get("status") == "ok":
+                        self.validation_passed[ph] = True
+                        print(
+                            f"[MetaCEMMC] CV ph={ph}: "
+                            f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
+                            f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
+                            f"folds={cv_results['n_folds']}"
+                        )
+                except Exception as e:
+                    print(f"[MetaCEMMC] CV failed for phase {ph}: {e.__class__.__name__}: {e}\n{traceback.format_exc()}")
+
+
+            # ===== ШАГ 6: ЛЕНИВОЕ ОБУЧЕНИЕ =====
+            if self._phase_ready(ph):
+                try:
+                    self._train_phase(ph)
+                    self._clear_phase_storage(ph)
+                    self.buf_ph[ph] = []
+                    self._save()
+                except Exception as e:
+                    print(f"[MetaCEMMC] Training failed for phase {ph}: {e.__class__.__name__}: {e}\n{traceback.format_exc()}")
+
+            # ===== ШАГ 7: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ =====
+            try:
+                self._maybe_flip_modes()
+            except Exception as e:
+                print(f"[MetaCEMMC] flip-modes error: {e.__class__.__name__}: {e}\n{traceback.format_exc()}")
+
+        except Exception as e:
+            print(f"[ens ] meta.record_result error: {e.__class__.__name__}: {e}\n{traceback.format_exc()}")
 
     # ========== НОВОЕ: CROSS-VALIDATION ФУНКЦИИ ==========
-    
     def _run_cv_validation(self, ph: int) -> Dict:
         """
         Запускает walk-forward purged cross-validation для фазы
-        
-        Почему walk-forward?
-        Мы работаем с временными рядами, где порядок данных важен. Обычная
-        k-fold CV нарушает временную структуру. Walk-forward CV симулирует
-        реальную ситуацию: обучаемся на прошлом, предсказываем будущее.
-        
-        Почему purged?
-        Между train и test должен быть gap (purge + embargo), чтобы избежать
-        information leakage. Если модель видела цену в момент T, она косвенно
-        знает цену в T+1 через автокорреляцию.
-        
-        Процесс:
-        1. Загружаем накопленные данные фазы из CSV
-        2. Разбиваем на N временных фолдов
-        3. Для каждого фолда:
-           - Train на всех данных до фолда (минус purge)
-           - Test на данных фолда
-           - Сохраняем out-of-fold predictions
-        4. Вычисляем метрики на всех OOF predictions
-        5. Bootstrap для доверительных интервалов
-        
-        Args:
-            ph: номер фазы (0-5)
-        
-        Returns:
-            Словарь с метриками:
-            - status: "ok" или причина неудачи
-            - oof_accuracy: точность на OOF данных
-            - ci_lower, ci_upper: границы 95% доверительного интервала
-            - fold_scores: список точностей по фолдам
-            - n_folds: количество фолдов
-            - oof_samples: количество OOF примеров
         """
-        # Загружаем накопленные данные фазы с весами
         X_list, y_list, sample_weights = self._load_phase_buffer_from_disk(ph)
         
         if len(X_list) < int(getattr(self.cfg, "cv_min_train_size", 200)):
-            return {
-                "status": "insufficient_data",
-                "oof_accuracy": 0.0,
-                "n_samples": len(X_list)
-            }
+            return {"status": "insufficient_data", "oof_accuracy": 0.0, "n_samples": len(X_list)}
 
         X_all = np.array(X_list, dtype=float)
         y_all = np.array(y_list, dtype=int)
@@ -869,73 +679,47 @@ class MetaCEMMC:
         )
         
         if n_splits < 2:
-            return {
-                "status": "insufficient_splits",
-                "oof_accuracy": 0.0,
-                "n_samples": n_samples
-            }
+            return {"status": "insufficient_splits", "oof_accuracy": 0.0, "n_samples": n_samples}
 
-        # Параметры purging и embargo
         embargo_pct = float(getattr(self.cfg, "cv_embargo_pct", 0.02))
-        purge_pct = float(getattr(self.cfg, "cv_purge_pct", 0.01))
+        purge_pct   = float(getattr(self.cfg, "cv_purge_pct", 0.01))
         
         embargo_size = max(1, int(n_samples * embargo_pct))
-        purge_size = max(1, int(n_samples * purge_pct))
+        purge_size   = max(1, int(n_samples * purge_pct))
         
         fold_size = n_samples // n_splits
         
-        # Массивы для out-of-fold predictions
         oof_preds = np.zeros(n_samples)
-        oof_mask = np.zeros(n_samples, dtype=bool)
+        oof_mask  = np.zeros(n_samples, dtype=bool)
         fold_scores = []
 
-        # Walk-forward cross-validation
         for fold_idx in range(n_splits):
-            # Определяем границы test fold
             test_start = fold_idx * fold_size
-            test_end = min(test_start + fold_size, n_samples)
-            
-            # Train на всех данных ДО test fold (минус purge gap)
-            train_end = max(0, test_start - purge_size)
-            
+            test_end   = min(test_start + fold_size, n_samples)
+            train_end  = max(0, test_start - purge_size)
             if train_end < int(getattr(self.cfg, "cv_min_train_size", 200)):
-                continue  # Недостаточно данных для обучения
+                continue
+
+            X_train, y_train = X_all[:train_end], y_all[:train_end]
+            X_test,  y_test  = X_all[test_start:test_end], y_all[test_start:test_end]
             
-            X_train = X_all[:train_end]
-            y_train = y_all[:train_end]
-            X_test = X_all[test_start:test_end]
-            y_test = y_all[test_start:test_end]
-            
-            # Обучаем временную модель на train fold
             temp_weights = self._train_fold_model(X_train, y_train, ph)
-            
             if temp_weights is None:
                 continue
             
-            # Предсказания на test fold
             preds = self._predict_fold(temp_weights, X_test)
-            
-            # Сохраняем OOF predictions
             oof_preds[test_start:test_end] = preds
-            oof_mask[test_start:test_end] = True
+            oof_mask[test_start:test_end]  = True
             
-            # Метрики фолда
             fold_acc = 100.0 * np.mean((preds >= 0.5) == y_test)
             fold_scores.append(fold_acc)
 
-        # Итоговые OOF метрики
-        oof_valid = oof_mask.sum()
-        
+        oof_valid = int(oof_mask.sum())
         if oof_valid < int(getattr(self.cfg, "cv_min_train_size", 200)):
-            return {
-                "status": "insufficient_oof",
-                "oof_accuracy": 0.0,
-                "oof_samples": int(oof_valid)
-            }
+            return {"status": "insufficient_oof", "oof_accuracy": 0.0, "oof_samples": oof_valid}
         
         oof_accuracy = 100.0 * np.mean((oof_preds[oof_mask] >= 0.5) == y_all[oof_mask])
         
-        # Bootstrap confidence intervals
         ci_lower, ci_upper = self._bootstrap_ci(
             oof_preds[oof_mask],
             y_all[oof_mask],
@@ -950,7 +734,7 @@ class MetaCEMMC:
             "ci_upper": float(ci_upper),
             "fold_scores": fold_scores,
             "n_folds": len(fold_scores),
-            "oof_samples": int(oof_valid)
+            "oof_samples": oof_valid
         }
 
     def _bootstrap_ci(
@@ -962,48 +746,19 @@ class MetaCEMMC:
     ) -> Tuple[float, float]:
         """
         Вычисляет bootstrap доверительные интервалы для accuracy
-        
-        Bootstrap - это метод оценки статистической неопределенности через
-        многократное пересэмплирование данных с возвратом. Это позволяет понять,
-        насколько стабильна наша метрика.
-        
-        Процесс:
-        1. N раз пересэмплируем данные с возвратом (одни примеры могут повторяться)
-        2. Для каждой бутстрэп выборки считаем accuracy
-        3. Из N значений accuracy вычисляем перцентили
-        
-        Например, если 95% доверительный интервал = [52%, 58%], это значит,
-        что мы на 95% уверены, что истинная accuracy находится в этом диапазоне.
-        
-        Args:
-            preds: предсказания (вероятности)
-            labels: истинные метки
-            n_bootstrap: количество бутстрэп итераций
-            confidence: уровень доверия (0.95 = 95%)
-        
-        Returns:
-            (ci_lower, ci_upper): границы доверительного интервала в процентах
         """
         accuracies = []
         n = len(preds)
-        
         for _ in range(n_bootstrap):
-            # Resample с возвратом (одни индексы могут повторяться)
             idx = np.random.choice(n, size=n, replace=True)
-            boot_preds = preds[idx]
+            boot_preds  = preds[idx]
             boot_labels = labels[idx]
-            
-            # Accuracy на бутстрэп выборке
             boot_acc = 100.0 * np.mean((boot_preds >= 0.5) == boot_labels)
             accuracies.append(boot_acc)
-        
         accuracies = np.array(accuracies)
-        
-        # Вычисляем перцентили для доверительного интервала
         alpha = 1.0 - confidence
         ci_lower = np.percentile(accuracies, 100 * alpha / 2)
         ci_upper = np.percentile(accuracies, 100 * (1 - alpha / 2))
-        
         return float(ci_lower), float(ci_upper)
 
     def _train_fold_model(
@@ -1013,28 +768,15 @@ class MetaCEMMC:
         ph: int
     ) -> Optional[np.ndarray]:
         """
-        Обучает временную модель для CV fold
-        
-        Это упрощенная версия основного обучения. Мы используем CEM (более быстрый)
-        вместо CMA-ES, чтобы не тратить слишком много времени на каждый fold.
-        
-        Args:
-            X: матрица фичей (N × 18)
-            y: вектор меток (N,)
-            ph: номер фазы
-        
-        Returns:
-            Вектор весов или None если обучение не удалось
+        Обучает временную модель для CV fold (упрощённый CEM)
         """
         if len(X) < 50:
-            return None  # Слишком мало данных
-
-        # Используем упрощенный CEM с меньшим числом итераций
+            return None
         try:
             weights = self._train_cem(
                 X, y,
-                n_iter=20,  # Меньше итераций чем в основном обучении
-                pop_size=50,  # Меньше популяция
+                n_iter=20,
+                pop_size=50,
                 elite_frac=0.2
             )
             return weights
@@ -1048,99 +790,48 @@ class MetaCEMMC:
     ) -> np.ndarray:
         """
         Предсказания временной модели на fold
-        
-        Применяет линейную комбинацию с весами и сигмоид.
-        
-        Args:
-            weights: вектор весов (18,)
-            X: матрица фичей (N × 18)
-        
-        Returns:
-            Вектор вероятностей (N,)
         """
-        z = X @ weights  # Матричное умножение: (N × 18) @ (18,) = (N,)
-        z = np.clip(z, -60.0, 60.0)  # Защита от overflow в exp
+        z = X @ weights
+        z = np.clip(z, -60.0, 60.0)
         probs = 1.0 / (1.0 + np.exp(-z))
         return probs
 
     # ========== ОБУЧЕНИЕ CEM/CMA-ES ==========
-    
     def _phase_ready(self, ph: int) -> bool:
         """
         Проверяет, готова ли фаза к обучению
-        
-        Условия:
-        - Минимальное количество примеров в буфере
-        - Минимальное количество уникальных меток (нужны и 0, и 1)
-        
-        Args:
-            ph: номер фазы
-        
-        Returns:
-            True если можно обучать
         """
         buf = self.buf_ph.get(ph, [])
         min_samples = int(getattr(self.cfg, "meta_min_train", 100))
-        
         if len(buf) < min_samples:
             return False
-        
-        # Проверяем, что есть примеры обоих классов
         labels = [y for (_, y) in buf]
         if len(set(labels)) < 2:
-            return False  # Все примеры одного класса
-        
+            return False
         return True
 
     def _train_phase(self, ph: int) -> None:
         """
         Обучает модель для конкретной фазы через CEM или CMA-ES
-        
-        Это основная функция обучения. Она:
-        1. Загружает все накопленные данные фазы из CSV (теперь с весами по времени)
-        2. Готовит X, y массивы и веса экспоненциального забывания
-        3. Запускает CEM или CMA-ES оптимизацию с учётом весов
-        4. Сохраняет лучшие веса
-        5. Генерирует отчет с графиками (опционально)
-        
-        НОВОЕ: Экспоненциальное взвешивание означает, что свежие паттерны
-        влияют на обучение сильнее, чем старые. Это позволяет модели адаптироваться
-        к изменяющимся рыночным условиям, не теряя при этом долгосрочную память.
-        
-        Почему CEM/CMA-ES, а не градиентный спуск?
-        - Не требует дифференцируемости (можем использовать любую метрику)
-        - Более устойчив к шуму в данных
-        - Лучше работает с малыми выборками
-        - Естественная регуляризация через популяцию решений
-        
-        Args:
-            ph: номер фазы для обучения
         """
-        # Загружаем все данные фазы с весами по времени
         X_list, y_list, sample_weights = self._load_phase_buffer_from_disk(ph)
-        
         if len(X_list) < int(getattr(self.cfg, "meta_min_train", 100)):
-            return  # Недостаточно данных
+            return
 
         X = np.array(X_list, dtype=float)
         y = np.array(y_list, dtype=float)
         sample_weights = np.array(sample_weights, dtype=float)
-        
-        # Нормализуем веса так, чтобы их сумма равнялась количеству примеров
-        # Это сохраняет баланс между взвешенными и невзвешенными примерами
+
+        # нормировка весов
         sample_weights = sample_weights * len(sample_weights) / (sample_weights.sum() + 1e-12)
 
-        # Выбираем оптимизатор
         use_cma = getattr(self.cfg, "meta_use_cma_es", False) and HAVE_CMA
-        
         if use_cma:
-            # CMA-ES: более мощный, но требует внешней библиотеки
             w_best = self._train_cma_es(X, y, ph, sample_weights=sample_weights)
         else:
-            # CEM: проще, без зависимостей
+            # фикс сигнатуры: поддерживаем sample_weights и здесь
             w_best = self._train_cem(X, y, sample_weights=sample_weights)
 
-        # Сохраняем обученные веса для этой фазы
         self.w_meta_ph[ph] = w_best
 
     def _train_cem(
@@ -1149,7 +840,8 @@ class MetaCEMMC:
         y: np.ndarray,
         n_iter: int = 50,
         pop_size: int = 100,
-        elite_frac: float = 0.2
+        elite_frac: float = 0.2,
+        sample_weights: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """
         Cross-Entropy Method оптимизация с визуализацией
@@ -1164,7 +856,7 @@ class MetaCEMMC:
         best_loss = float('inf')
         best_w = mu.copy()
 
-        # НОВОЕ: Получаем визуализатор
+        # НОВОЕ: визуализатор
         try:
             from training_visualizer import get_visualizer
             viz = get_visualizer()
@@ -1181,7 +873,7 @@ class MetaCEMMC:
             
             scores = []
             for w in population:
-                loss = self._mc_eval(w, X, y, n_bootstrap=10)
+                loss = self._mc_eval(w, X, y, n_bootstrap=10, sample_weights=sample_weights)
                 scores.append(loss)
             
             elite_idx = np.argsort(scores)[:n_elite]
@@ -1196,7 +888,6 @@ class MetaCEMMC:
             current_sigma = elite_arr.std(axis=0) + 1e-6
             sigma = current_sigma
             
-            # НОВОЕ: Записываем метрики для визуализации
             if viz_enabled and iteration % 5 == 0:
                 try:
                     ph = getattr(self, "_last_phase", 0)
@@ -1217,37 +908,14 @@ class MetaCEMMC:
     def _train_cma_es(self, X: np.ndarray, y: np.ndarray, ph: int, sample_weights: Optional[np.ndarray] = None) -> np.ndarray:
         """
         CMA-ES оптимизация (более продвинутая версия) с визуализацией
-        
-        CMA-ES (Covariance Matrix Adaptation Evolution Strategy) - один из
-        лучших алгоритмов для безградиентной оптимизации.
-        
-        Отличия от CEM:
-        - Адаптирует полную ковариационную матрицу (не только диагональ)
-        - Использует rank-mu update для быстрой сходимости
-        - Автоматически настраивает step-size (sigma)
-        - Более устойчив к плохой инициализации
-        
-        Недостатки:
-        - Требует внешнюю библиотеку cma
-        - Медленнее чем CEM
-        
-        Args:
-            X: матрица фичей
-            y: вектор меток
-            ph: номер фазы (для логирования)
-        
-        Returns:
-            Лучший найденный вектор весов
         """
         if not HAVE_CMA:
-            # Fallback на CEM если CMA недоступен
-            return self._train_cem(X, y)
+            return self._train_cem(X, y, sample_weights=sample_weights)
 
         D = X.shape[1]
-        sigma0 = 2.0  # Начальный step-size
+        sigma0 = 2.0
         clip_val = float(getattr(self.cfg, "meta_w_clip", 8.0))
         
-        # Создаем CMA-ES оптимизатор
         es = cma.CMAEvolutionStrategy(
             x0=np.zeros(D),
             sigma0=sigma0,
@@ -1255,14 +923,12 @@ class MetaCEMMC:
                 'bounds': [-clip_val, clip_val],
                 'popsize': 50,
                 'maxiter': 100,
-                'verbose': -1  # Отключаем вывод
+                'verbose': -1
             }
         )
 
-        # История для графиков
         iters, best_hist, med_hist, sigma_hist = [], [], [], []
 
-        # НОВОЕ: Получаем визуализатор
         try:
             from training_visualizer import get_visualizer
             viz = get_visualizer()
@@ -1270,29 +936,21 @@ class MetaCEMMC:
         except Exception:
             viz_enabled = False
 
-        # Основной цикл оптимизации
         while not es.stop():
-            # Получаем популяцию решений
             solutions = es.ask()
-            
-            # Оцениваем через Монте-Карло
             fitness = []
             for w in solutions:
                 w_clipped = np.clip(w, -clip_val, clip_val)
                 loss = self._mc_eval(w_clipped, X, y, n_bootstrap=20, sample_weights=sample_weights)
                 fitness.append(loss)
-            
-            # Обновляем распределение
             es.tell(solutions, fitness)
             
-            # Логируем прогресс
             it = len(best_hist) + 1
             iters.append(it)
             best_hist.append(float(np.min(fitness)))
             med_hist.append(float(np.median(fitness)))
             sigma_hist.append(float(getattr(es, "sigma", sigma0)))
             
-            # НОВОЕ: Записываем метрики для визуализации (каждые 5 итераций)
             if viz_enabled and it % 5 == 0:
                 try:
                     viz.record_meta_training_step(
@@ -1305,11 +963,9 @@ class MetaCEMMC:
                 except Exception:
                     pass
 
-        # Лучшее найденное решение
         w_best = np.array(es.result.xbest, dtype=float)
         w_best = np.clip(w_best, -clip_val, clip_val)
 
-        # Генерируем отчет (график + Telegram)
         if HAVE_PLOTTING:
             try:
                 self._emit_report(
@@ -1321,7 +977,7 @@ class MetaCEMMC:
                     sigma=sigma_hist
                 )
             except Exception:
-                pass  # Не падаем если отчет не удался
+                pass
 
         return w_best
 
@@ -1335,140 +991,78 @@ class MetaCEMMC:
     ) -> float:
         """
         Монте-Карло оценка качества весов через взвешенный bootstrap
-        
-        Вместо того чтобы считать loss на всей выборке (что может дать
-        переоптимистичную оценку), мы:
-        1. Многократно пересэмплируем данные с учётом весов
-        2. Считаем взвешенный loss на каждой бутстрэп выборке
-        3. Усредняем
-        
-        Это дает более устойчивую оценку, особенно на малых выборках.
-        
-        НОВОЕ: При наличии sample_weights более свежие примеры:
-        - Чаще попадают в bootstrap выборки (weighted sampling)
-        - Сильнее влияют на итоговый loss (weighted loss)
-        Это позволяет модели быстрее адаптироваться к новым паттернам.
-        
-        Args:
-            w: веса для оценки
-            X: матрица фичей
-            y: вектор меток
-            n_bootstrap: количество бутстрэп итераций
-            sample_weights: веса примеров для взвешенного sampling
-        
-        Returns:
-            Средний взвешенный log-loss с L2 регуляризацией
         """
         n = len(X)
         losses = []
         l2_reg = float(getattr(self.cfg, "meta_l2", 0.001))
-        
-        # Если веса не заданы - все примеры равнозначны
         if sample_weights is None:
             sample_weights = np.ones(n)
-        
-        # Нормализуем веса для использования в качестве вероятностей
         probs = sample_weights / (sample_weights.sum() + 1e-12)
 
         for _ in range(n_bootstrap):
-            # Resample с возвратом, учитывая веса примеров
-            # Свежие данные (с большим весом) будут чаще попадать в выборку
             idx = np.random.choice(n, size=n, replace=True, p=probs)
             Xb = X[idx]
             yb = y[idx]
             weights_b = sample_weights[idx]
             
-            # Предсказания
             z = Xb @ w
             z = np.clip(z, -60, 60)
             p = 1.0 / (1.0 + np.exp(-z))
             p = np.clip(p, 1e-6, 1 - 1e-6)
             
-            # Взвешенный Log-loss
-            # Свежие примеры влияют на loss сильнее через weights_b
             sample_losses = -(yb * np.log(p) + (1 - yb) * np.log(1 - p))
             weighted_loss = np.sum(sample_losses * weights_b) / (weights_b.sum() + 1e-12)
-            
-            # L2 регуляризация
             reg = l2_reg * np.sum(w**2)
-            
             losses.append(weighted_loss + reg)
 
         return float(np.mean(losses))
 
     # ========== ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ С УЧЕТОМ CV ==========
-    
     def _maybe_flip_modes(self):
         """
         Переключение режимов SHADOW ↔ ACTIVE с учетом CV метрик
-        
-        СТАРАЯ ЛОГИКА (только winrate):
-        - SHADOW → ACTIVE: если winrate на shadow_hits > порога
-        - ACTIVE → SHADOW: если winrate на active_hits < порога
-        
-        НОВАЯ ЛОГИКА (winrate + CV):
-        - SHADOW → ACTIVE: требуем winrate > порога И CV validation passed
-          И нижняя граница CI тоже выше порога
-        - ACTIVE → SHADOW: если winrate < порога ИЛИ CV метрики деградировали
-        
-        Это предотвращает переключение в ACTIVE на основе случайного везения
-        или переобучения.
         """
         def wr(arr: List[int], n: int) -> Optional[float]:
-            """Вычисляет winrate на последних n примерах"""
             if len(arr) < n:
                 return None
             window = arr[-n:]
             return 100.0 * (sum(window) / float(len(window)))
 
-        # Параметры переключения
         try:
             enter_wr = float(getattr(self.cfg, "enter_wr", 53.0))
-            exit_wr = float(getattr(self.cfg, "exit_wr", 49.0))
+            exit_wr  = float(getattr(self.cfg, "exit_wr", 49.0))
             min_ready = int(getattr(self.cfg, "min_ready", 80))
             cv_enabled = bool(getattr(self.cfg, "cv_enabled", True))
         except Exception:
             enter_wr, exit_wr, min_ready = 53.0, 49.0, 80
             cv_enabled = True
 
-        # Текущие метрики
         wr_shadow = wr(self.shadow_hits, min_ready)
         wr_active = wr(self.active_hits, max(30, min_ready // 2))
 
-        # SHADOW → ACTIVE: строгая проверка
+        # SHADOW → ACTIVE
         if self.mode == "SHADOW" and wr_shadow is not None:
             basic_threshold_met = wr_shadow >= enter_wr
-
             if cv_enabled:
-                # Требуем CV validation для всех активных фаз
-                # Берем текущую фазу (последнюю виденную)
                 ph = getattr(self, "_last_phase", 0)
                 cv_metrics = self.cv_metrics.get(ph, {})
                 cv_passed = self.validation_passed.get(ph, False)
-
                 if basic_threshold_met and cv_passed:
                     cv_wr = cv_metrics.get("oof_accuracy", 0.0)
                     ci_lower = cv_metrics.get("ci_lower", 0.0)
-                    
-                    # Минимальное улучшение для значимости
                     min_improvement = float(getattr(self.cfg, "cv_min_improvement", 2.0))
-
-                    # Проверяем CV метрики
                     if cv_wr >= enter_wr and ci_lower >= (enter_wr - min_improvement):
                         self.mode = "ACTIVE"
                         print(f"[MetaCEMMC] SHADOW→ACTIVE: WR={wr_shadow:.2f}%, "
                               f"CV_WR={cv_wr:.2f}% (CI: [{ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
             else:
-                # Без CV используем старую логику
                 if basic_threshold_met:
                     self.mode = "ACTIVE"
                     print(f"[MetaCEMMC] SHADOW→ACTIVE: WR={wr_shadow:.2f}% (CV disabled)")
 
-        # ACTIVE → SHADOW: детектируем деградацию
+        # ACTIVE → SHADOW
         if self.mode == "ACTIVE" and wr_active is not None:
             basic_threshold_failed = wr_active < exit_wr
-
-            # Также проверяем CV метрики на деградацию
             cv_degraded = False
             if cv_enabled:
                 ph = getattr(self, "_last_phase", 0)
@@ -1480,26 +1074,13 @@ class MetaCEMMC:
                 self.mode = "SHADOW"
                 reason = "WR dropped" if basic_threshold_failed else "CV degraded"
                 print(f"[MetaCEMMC] ACTIVE→SHADOW: {reason} (WR={wr_active:.2f}%)")
-                
-                # Сбрасываем валидацию
                 if cv_enabled:
                     self.validation_passed[ph] = False
 
     # ========== СТАТУС И ДИАГНОСТИКА ==========
-    
     def status(self) -> Dict[str, str]:
         """
         Возвращает текущий статус META с метриками
-        
-        Включает:
-        - Алгоритм оптимизации (CEM/CMA-ES)
-        - Режим (SHADOW/ACTIVE)
-        - Winrate на active и shadow хитах
-        - Количество примеров
-        - CV метрики последней проверки
-        
-        Returns:
-            Словарь со строковыми значениями для отображения
         """
         def _wr(xs: List[int]):
             if not xs:
@@ -1514,22 +1095,20 @@ class MetaCEMMC:
         all_hits = (self.active_hits or []) + (self.shadow_hits or [])
         wr_all = _wr(all_hits)
 
-        # CV метрики последней фазы
         ph = getattr(self, "_last_phase", 0)
         cv_metrics = self.cv_metrics.get(ph, {})
         cv_status = cv_metrics.get("status", "N/A")
         cv_wr = cv_metrics.get("oof_accuracy", 0.0)
         cv_ci = (
             f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]"
-            if cv_status == "ok"
-            else "N/A"
+            if cv_status == "ok" else "N/A"
         )
 
         return {
             "algo": "CEM+MC" if not getattr(self.cfg, "meta_use_cma_es", False) else "CMA-ES+MC",
             "mode": self.mode,
             "enabled": str(self.enabled),
-            "features": f"{self.D}D",  # Показываем размерность
+            "features": f"{self.D}D",
             "wr_active": _fmt(wr_a),
             "n_active": str(len(self.active_hits or [])),
             "wr_shadow": _fmt(wr_s),
@@ -1542,80 +1121,37 @@ class MetaCEMMC:
         }
 
     # ========== РАБОТА С ФАЙЛАМИ ==========
-    
     def _append_example(self, ph: int, x: np.ndarray, y: int) -> List:
         """
         Добавляет пример в буфер фазы и сохраняет в CSV с временной меткой
-        
-        Мы используем двухуровневое хранение:
-        1. In-memory буфер (быстрый доступ, ограниченный размер)
-        2. CSV файл на диске (долгосрочное хранение)
-        
-        При обучении мы загружаем все данные из CSV.
-        НОВОЕ: Каждая запись теперь имеет timestamp для экспоненциального взвешивания.
-        Старые паттерны постепенно теряют вес, позволяя модели адаптироваться к новым условиям.
-        
-        Args:
-            ph: номер фазы
-            x: вектор фичей (размер 18)
-            y: метка
-        
-        Returns:
-            Обновленный буфер фазы
         """
-        # Добавляем в in-memory буфер
         self.buf_ph[ph].append((x.tolist(), int(y)))
         
-        # Записываем в CSV (append mode)
         csv_path = self._phase_csv_paths.get(ph)
         if csv_path:
             try:
                 file_exists = os.path.isfile(csv_path)
                 current_timestamp = time.time()
-                
                 with open(csv_path, "a", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
-                    # Заголовок только для нового файла - теперь с timestamp
                     if not file_exists:
                         header = [f"x{i}" for i in range(len(x))] + ["y", "timestamp"]
                         writer.writerow(header)
-                    # Данные с временной меткой
                     row = list(x) + [int(y), current_timestamp]
                     writer.writerow(row)
             except Exception:
-                pass  # Не падаем если запись не удалась
-
+                pass
         return self.buf_ph[ph]
 
     def _load_phase_buffer_from_disk(self, ph: int, max_age_days: Optional[float] = None) -> Tuple[List, List, List]:
         """
         Загружает накопленные данные фазы из CSV с экспоненциальным взвешиванием
-        
-        Механизм экспоненциального забывания работает следующим образом:
-        - Каждому примеру присваивается вес w = exp(-age_days / tau)
-        - Свежие данные (age ≈ 0) имеют вес ≈ 1.0
-        - Данные возрастом tau дней имеют вес ≈ 0.37 (1/e)
-        - Данные возрастом 2*tau дней имеют вес ≈ 0.14 (1/e²)
-        
-        Это позволяет модели:
-        - Адаптироваться к новым рыночным условиям
-        - Постепенно забывать устаревшие паттерны
-        - Сохранять полезные долгосрочные закономерности
-        
-        Args:
-            ph: номер фазы
-            max_age_days: период полураспада в днях (tau), по умолчанию из конфига
-        
-        Returns:
-            (X_list, y_list, weights): списки фичей, меток и временных весов
         """
         X_list, y_list, weights = [], [], []
-        
         csv_path = self._phase_csv_paths.get(ph)
         if not csv_path or not os.path.isfile(csv_path):
             return X_list, y_list, weights
 
-        # Получаем период полураспада из конфига
         if max_age_days is None:
             max_age_days = float(getattr(self.cfg, "meta_weight_decay_days", 30.0))
         
@@ -1625,43 +1161,26 @@ class MetaCEMMC:
             with open(csv_path, "r", encoding="utf-8") as f:
                 reader = csv.reader(f)
                 header = next(reader, None)
-                
-                # Проверяем, есть ли колонка timestamp в CSV
                 has_timestamp = header and "timestamp" in header
-                
                 for row in reader:
                     if len(row) < 2:
                         continue
-                    
                     try:
-                        # Обрабатываем как новый формат (с timestamp), так и старый
                         if has_timestamp and len(row) >= 3:
-                            # Новый формат: [x0, x1, ..., xN, y, timestamp]
                             x = [float(v) for v in row[:-2]]
                             y = int(float(row[-2]))
                             row_time = float(row[-1])
                         else:
-                            # Старый формат без timestamp: [x0, x1, ..., xN, y]
-                            # Даём старым данным максимальный вес, чтобы не потерять их
                             x = [float(v) for v in row[:-1]]
                             y = int(float(row[-1]))
                             row_time = current_time
-                        
-                        # Вычисляем возраст записи в днях
                         age_days = (current_time - row_time) / 86400.0
-                        
-                        # Экспоненциальное затухание: вес падает с возрастом
-                        # При age = tau: вес = e^(-1) ≈ 0.368
-                        # При age = 2*tau: вес = e^(-2) ≈ 0.135
                         weight = math.exp(-age_days / max_age_days)
-                        
                         X_list.append(x)
                         y_list.append(y)
                         weights.append(weight)
-                        
                     except (ValueError, IndexError):
-                        continue  # Пропускаем повреждённые строки
-                        
+                        continue
         except Exception:
             pass
 
@@ -1670,12 +1189,6 @@ class MetaCEMMC:
     def _clear_phase_storage(self, ph: int):
         """
         Очищает CSV файл фазы после обучения
-        
-        После успешного обучения мы начинаем новый цикл накопления данных.
-        Старые данные больше не нужны (модель уже обучена на них).
-        
-        Args:
-            ph: номер фазы
         """
         csv_path = self._phase_csv_paths.get(ph)
         if csv_path and os.path.isfile(csv_path):
@@ -1687,13 +1200,9 @@ class MetaCEMMC:
     def _save_throttled(self):
         """
         Сохраняет состояние с ограничением частоты
-        
-        Чтобы не перегружать диск, сохраняем не чаще раза в минуту
-        или при накоплении 100+ несохраненных изменений.
         """
         now = time.time()
-        throttle_s = 60  # 1 минута
-        
+        throttle_s = 60
         if self._unsaved >= 100 or (now - self._last_save_ts) >= throttle_s:
             self._save()
             self._unsaved = 0
@@ -1711,7 +1220,6 @@ class MetaCEMMC:
             "validation_passed": self.validation_passed,
             "cv_last_check": self.cv_last_check,
         }
-        
         path = getattr(self.cfg, "meta_state_path", "meta_state.json")
         try:
             atomic_save_json(path, state)
@@ -1721,42 +1229,69 @@ class MetaCEMMC:
     def _load(self):
         """Загружает состояние META из JSON"""
         path = getattr(self.cfg, "meta_state_path", "meta_state.json")
-        
         if not os.path.isfile(path):
             return
-
         try:
             with open(path, "r", encoding="utf-8") as f:
                 state = json.load(f)
-            
             self.mode = state.get("mode", "SHADOW")
-            
             w_list = state.get("w_meta_ph")
             if w_list:
                 loaded_w = np.array(w_list, dtype=float)
-                # Обратная совместимость: если загружены старые веса (4 элемента)
-                # расширяем до новой размерности (18 элементов)
                 if loaded_w.shape[1] != self.D:
                     old_D = loaded_w.shape[1]
                     new_w = np.zeros((self.P, self.D), dtype=float)
-                    # Копируем старые веса в начало
                     new_w[:, :old_D] = loaded_w
                     self.w_meta_ph = new_w
                     print(f"[MetaCEMMC] Expanded weights from {old_D}D to {self.D}D")
                 else:
                     self.w_meta_ph = loaded_w
-            
-            self.shadow_hits = state.get("shadow_hits", [])
-            self.active_hits = state.get("active_hits", [])
-            self.seen_ph = state.get("seen_ph", {p: 0 for p in range(self.P)})
-            
-            # Загружаем CV состояние
-            self.cv_metrics = state.get("cv_metrics", {p: {} for p in range(self.P)})
-            self.validation_passed = state.get("validation_passed", {p: False for p in range(self.P)})
-            self.cv_last_check = state.get("cv_last_check", {p: 0 for p in range(self.P)})
-            
+                # стало (meta_cem_mc.py, _load — полная нормализация ключей под int для всех фазовых словарей)
+                self.shadow_hits = state.get("shadow_hits", [])
+                self.active_hits = state.get("active_hits", [])
+
+                # НОРМАЛИЗАЦИЯ seen_ph
+                sp = state.get("seen_ph", {p: 0 for p in range(self.P)})
+                if isinstance(sp, list):
+                    sp = {i: int(v) for i, v in enumerate(sp)}
+                elif isinstance(sp, dict):
+                    sp = {int(k): int(v) for k, v in sp.items()}
+                for p in range(self.P):
+                    sp.setdefault(p, 0)
+                self.seen_ph = sp
+
+                # НОРМАЛИЗАЦИЯ cv_metrics
+                cm = state.get("cv_metrics", {p: {} for p in range(self.P)})
+                if isinstance(cm, list):
+                    cm = {i: v for i, v in enumerate(cm)}
+                elif isinstance(cm, dict):
+                    cm = {int(k): v for k, v in cm.items()}
+                for p in range(self.P):
+                    cm.setdefault(p, {})
+                self.cv_metrics = cm
+
+                # НОРМАЛИЗАЦИЯ validation_passed
+                vp = state.get("validation_passed", {p: False for p in range(self.P)})
+                if isinstance(vp, list):
+                    vp = {i: bool(v) for i, v in enumerate(vp)}
+                elif isinstance(vp, dict):
+                    vp = {int(k): bool(v) for k, v in vp.items()}
+                for p in range(self.P):
+                    vp.setdefault(p, False)
+                self.validation_passed = vp
+
+                # НОРМАЛИЗАЦИЯ cv_last_check
+                clc = state.get("cv_last_check", {p: 0 for p in range(self.P)})
+                if isinstance(clc, list):
+                    clc = {i: int(v) for i, v in enumerate(clc)}
+                elif isinstance(clc, dict):
+                    clc = {int(k): int(v) for k, v in clc.items()}
+                for p in range(self.P):
+                    clc.setdefault(p, 0)
+                self.cv_last_check = clc
         except Exception as e:
-            print(f"[MetaCEMMC] Failed to load state: {e}")
+            pass
+
 
     def _emit_report(
         self,
@@ -1769,19 +1304,10 @@ class MetaCEMMC:
     ):
         """
         Генерирует и отправляет отчет об обучении
-        
-        Создает график с историей оптимизации и отправляет в Telegram.
-        
-        Args:
-            ph: номер фазы
-            algo: название алгоритма
-            iters, best, median, sigma: данные для графика
         """
         if not HAVE_PLOTTING:
             return
-
         try:
-            # Создаем график
             fig = plot_cma_like(
                 iters=iters,
                 best=best,
@@ -1789,25 +1315,17 @@ class MetaCEMMC:
                 sigma=sigma,
                 title=f"META {algo} Training - Phase {ph}"
             )
-            
-            # Сохраняем во временный файл
             tmp_path = f"/tmp/meta_train_ph{ph}.png"
             fig.savefig(tmp_path, dpi=100, bbox_inches='tight')
             plt.close(fig)
-            
-            # Отправляем в Telegram
             if send_telegram_photo:
                 send_telegram_photo(tmp_path, caption=f"META training completed for phase {ph}")
-            
-            # Удаляем временный файл
             try:
                 os.remove(tmp_path)
             except Exception:
                 pass
-                
         except Exception as e:
-            print(f"[MetaCEMMC] Report generation failed: {e}")
-
+            print(f"[MetaCEMMC] Report generation failed: {e.__class__.__name__}: {e}")
 
 # ========== ЭКСПОРТ ==========
 
