@@ -3464,6 +3464,25 @@ class XGBExpert(_BaseExpert):
         cv_wr = cv_metrics.get("oof_accuracy", 0.0)
         cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
         
+        # НОВОЕ: Отправляем метрики в визуализатор
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            
+            expert_name = "XGB"
+            
+            viz.record_expert_metrics(
+                expert_name=expert_name,
+                accuracy=wr_all if wr_all is not None else 0.0,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_wr / 100.0 if cv_wr > 0 else None,
+                cv_ci_lower=cv_metrics.get('ci_lower') if cv_status == "ok" else None,
+                cv_ci_upper=cv_metrics.get('ci_upper') if cv_status == "ok" else None,
+                mode=self.mode
+            )
+        except Exception:
+            pass
+        
         return {
             "mode": self.mode,
             "enabled": self.enabled,
@@ -4279,6 +4298,25 @@ class RFCalibratedExpert(_BaseExpert):
         cv_wr = cv_metrics.get("oof_accuracy", 0.0)
         cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
         
+        # НОВОЕ: Отправляем метрики в визуализатор
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            
+            expert_name = "RF"
+            
+            viz.record_expert_metrics(
+                expert_name=expert_name,
+                accuracy=wr_all if wr_all is not None else 0.0,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_wr / 100.0 if cv_wr > 0 else None,
+                cv_ci_lower=cv_metrics.get('ci_lower') if cv_status == "ok" else None,
+                cv_ci_upper=cv_metrics.get('ci_upper') if cv_status == "ok" else None,
+                mode=self.mode
+            )
+        except Exception:
+            pass
+        
         return {
             "mode": self.mode,
             "enabled": self.enabled,
@@ -4760,12 +4798,9 @@ class RiverARFExpert(_BaseExpert):
                 print(f"[ARF] ACTIVE→SHADOW ph={ph}: WR={wr_active:.2f}%, CV={cv_wr:.2f}%")
 
     def status(self):
-        """Статус эксперта с метриками"""
         def _wr(xs):
-            if not xs:
-                return None
+            if not xs: return None
             return sum(xs) / float(len(xs))
-        
         def _fmt_pct(p):
             return "—" if p is None else f"{100.0*p:.2f}%"
         
@@ -4774,17 +4809,31 @@ class RiverARFExpert(_BaseExpert):
         all_hits = (self.active_hits or []) + (self.shadow_hits or [])
         wr_all = _wr(all_hits)
         
-        # CV метрики
+        # CV метрики текущей фазы
         ph = self._last_seen_phase
         cv_metrics = self.cv_metrics.get(ph, {})
         cv_status = cv_metrics.get("status", "N/A")
         cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+        cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
         
-        cv_ci = "N/A"
-        if cv_status == "ok":
-            ci_l = cv_metrics.get('ci_lower', 0)
-            ci_u = cv_metrics.get('ci_upper', 0)
-            cv_ci = f"[{ci_l:.1f}%, {ci_u:.1f}%]"
+        # НОВОЕ: Отправляем метрики в визуализатор
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            
+            expert_name = "ARF"
+            
+            viz.record_expert_metrics(
+                expert_name=expert_name,
+                accuracy=wr_all if wr_all is not None else 0.0,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_wr / 100.0 if cv_wr > 0 else None,
+                cv_ci_lower=cv_metrics.get('ci_lower') if cv_status == "ok" else None,
+                cv_ci_upper=cv_metrics.get('ci_upper') if cv_status == "ok" else None,
+                mode=self.mode
+            )
+        except Exception:
+            pass
         
         return {
             "mode": self.mode,
@@ -5679,6 +5728,25 @@ class NNExpert(_BaseExpert):
         cv_status = cv_metrics.get("status", "N/A")
         cv_wr = cv_metrics.get("oof_accuracy", 0.0)
         cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
+        
+        # НОВОЕ: Отправляем метрики в визуализатор
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            
+            expert_name = "NN"
+            
+            viz.record_expert_metrics(
+                expert_name=expert_name,
+                accuracy=wr_all if wr_all is not None else 0.0,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_wr / 100.0 if cv_wr > 0 else None,
+                cv_ci_lower=cv_metrics.get('ci_lower') if cv_status == "ok" else None,
+                cv_ci_upper=cv_metrics.get('ci_upper') if cv_status == "ok" else None,
+                mode=self.mode
+            )
+        except Exception:
+            pass
         
         return {
             "mode": self.mode,
@@ -8542,3 +8610,5 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise
+
+
