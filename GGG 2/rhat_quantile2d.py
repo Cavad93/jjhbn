@@ -67,7 +67,8 @@ class RHat2D:
                 json.dump(pend, f, ensure_ascii=False)
             os.replace(tmp, self.pending_path)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to load JSON")
 
     def _key(self, i: int, j: int) -> str:
         return f"{i}:{j}"
