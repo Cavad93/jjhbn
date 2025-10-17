@@ -61,7 +61,8 @@ def p_ctx_calibrated(p_raw: float,
         try:
             df = df[df["epoch"] < int(max_epoch_exclusive)]
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
     if df.empty:
         return float(_clip01(p_raw))
 
