@@ -234,7 +234,8 @@ class EvolutionTracker:
             with open(self.evolution_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to save JSON")
     
     def _load_state(self):
         """Загружает состояние"""
@@ -245,7 +246,8 @@ class EvolutionTracker:
                 self.levels = data.get("levels", self.levels)
                 self.last_notified = data.get("last_notified", self.last_notified)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to load JSON")
 
 # Глобальный экземпляр
 _evolution_tracker: Optional[EvolutionTracker] = None
