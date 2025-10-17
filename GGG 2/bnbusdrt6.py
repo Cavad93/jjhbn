@@ -149,7 +149,8 @@ def _get_proj_tz():
         try:
             return ZoneInfo("Europe/Berlin")
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to import ZoneInfo")
     # предупреждение можно убрать, если не нужно
     print("[proj] warning: tz database unavailable; using UTC")
     return timezone.utc
@@ -482,7 +483,8 @@ try:
     import xgboost as xgb  # бустинг + загрузка/сохранение
     HAVE_XGB = True
 except Exception:
-    pass
+    from error_logger import log_exception
+    log_exception("Failed to import StatsTracker")
 
 try:
     from river.drift import ADWIN  # детектор дрейфа
@@ -715,7 +717,8 @@ def connect_web3() -> Web3:
             if ok:
                 return w3
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
     raise RuntimeError("не удалось подключиться к BSC RPC")
 
 
@@ -1060,14 +1063,16 @@ class OnlineLogReg:
             if isinstance(w, list) and len(w) == len(self.w):
                 self.w = np.array(w, dtype=float)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to load JSON")
 
     def save(self):
         try:
             with open(self.state_path, "w") as f:
                 json.dump({"w": self.w.tolist()}, f)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to load JSON")
 
     def predict(self, phi: np.ndarray) -> float:
         z = float(np.dot(self.w, phi))
@@ -1098,14 +1103,16 @@ class WalkForwardWeighter:
                 if "w" in data and len(data["w"]) == 4:
                     self.w = np.array(data["w"], dtype=float)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to load state")
 
     def save(self):
         try:
             with open(self.path, "w") as f:
                 json.dump({"w": self.w.tolist()}, f)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to load state")
 
     def predict_prob(self, phi_diff: np.ndarray) -> float:
         z = float(np.dot(self.w, phi_diff))
@@ -1347,7 +1354,8 @@ def features_for_symbols(df_map: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str,
             try:
                 out[sym] = features_from_binance(df)
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Error in features_for_symbols")
     return out
 
 def _idx_with_shift(series: pd.Series, tstamp: pd.Timestamp, shift_bars: int = 0) -> Optional[int]:
@@ -1693,7 +1701,8 @@ def try_settle_shadow_rows(path: str, w3: Web3, c, cur_epoch: int) -> None:
                         settled_ts = int(time.time())
                         globals()["_CALIB_MGR"].update(p_logged_raw, 1 if outcome=="win" else 0, settled_ts)
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Failed to update")
 
 
             # --- Заполняем
@@ -1859,7 +1868,8 @@ def compute_extended_stats_from_csv(path: str) -> Dict[str, Any]:
                     break
             current_streak = f"{count}{'W' if last == 'win' else 'L'}"
     except Exception:
-        pass
+        from error_logger import log_exception
+        log_exception("Unhandled exception")
     
     # 4. Average Edge
     avg_edge = None
@@ -1873,7 +1883,8 @@ def compute_extended_stats_from_csv(path: str) -> Dict[str, Any]:
                 expected_wr = (edges.mean() + 0.5) * 100  # грубая оценка
                 edge_realized = winrate - expected_wr
     except Exception:
-        pass
+        from error_logger import log_exception
+        log_exception("Unhandled exception")
     
     # 5. Avg Win/Loss
     avg_win = None
@@ -1890,7 +1901,8 @@ def compute_extended_stats_from_csv(path: str) -> Dict[str, Any]:
         if avg_win and avg_loss and avg_loss != 0:
             win_loss_ratio = avg_win / abs(avg_loss)
     except Exception:
-        pass
+        from error_logger import log_exception
+        log_exception("Unhandled exception")
     
     # 6. Sharpe Ratio (24h, annualized)
     sharpe = None
@@ -1906,7 +1918,8 @@ def compute_extended_stats_from_csv(path: str) -> Dict[str, Any]:
                     periods_per_year = 365 * 24 * 60 / 5
                     sharpe = (returns.mean() / returns.std()) * np.sqrt(periods_per_year)
     except Exception:
-        pass
+        from error_logger import log_exception
+        log_exception("Unhandled exception")
     
     # 7. Last Trade Time
     last_trade_ago_min = None
@@ -1914,7 +1927,8 @@ def compute_extended_stats_from_csv(path: str) -> Dict[str, Any]:
         last_ts = pd.to_numeric(df_tr["settled_ts"], errors="coerce").dropna().iloc[-1]
         last_trade_ago_min = (now_ts - last_ts) / 60.0
     except Exception:
-        pass
+        from error_logger import log_exception
+        log_exception("Unhandled exception")
     
     # 8. Skip Statistics
     skip_stats = None
@@ -1933,7 +1947,8 @@ def compute_extended_stats_from_csv(path: str) -> Dict[str, Any]:
             # Подсчёт по причинам (если есть колонка reason)
             # Это требует модификации CSV, пока пропустим детали
     except Exception:
-        pass
+        from error_logger import log_exception
+        log_exception("Unhandled exception")
     
     # 9. Gas Efficiency
     gas_efficiency = None
@@ -1950,7 +1965,8 @@ def compute_extended_stats_from_csv(path: str) -> Dict[str, Any]:
                     "gas_stake_ratio": float(total_gas / avg_stake * 100)
                 }
     except Exception:
-        pass
+        from error_logger import log_exception
+        log_exception("Unhandled exception")
     
     return dict(
         total=total, wins=wins, losses=losses, winrate=winrate,
@@ -2056,7 +2072,8 @@ def r_tod_percentile(path: str, side_up: bool, hour_utc: Optional[int] = None, q
         try:
             df = df[df["epoch"] < int(max_epoch_exclusive)]
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
     if df.empty:
         return None
     side_series = df.get("side", pd.Series(dtype="string")).astype(str).str.upper()
@@ -2115,7 +2132,8 @@ def rolling_winrate_laplace(path: str, n: int = 50, max_epoch_exclusive: Optiona
         try:
             df = df[df["epoch"] < int(max_epoch_exclusive)]
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
     if df.empty:
         return None
     tail = df.tail(int(n))
@@ -2508,7 +2526,8 @@ def build_stats_message(stats: Dict[str, Optional[float]]) -> str:
             n = acc["n_samples"]
             r_hat_line = f"r̂ accuracy: MAE={mae:.1f}%, bias={bias:+.1f}% (n={n})\n"
     except Exception:
-        pass
+        from error_logger import log_exception
+        log_exception("Failed to import analyze_r_hat_accuracy")
     
     # === НОВЫЕ МЕТРИКИ ===
     
@@ -2826,7 +2845,8 @@ class XGBExpert(_BaseExpert):
                         try:
                             self.new_since_train_ph[int(k)] = int(v)
                         except Exception:
-                            pass
+                            from error_logger import log_exception
+                            log_exception("Unhandled exception")
 
                 self._last_seen_phase = int(st.get("_last_seen_phase", 0))
 
@@ -2842,7 +2862,8 @@ class XGBExpert(_BaseExpert):
                         self.X_ph[p] = self.X_ph[p][-cap:]
                         self.y_ph[p] = self.y_ph[p][-cap:]
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
 
         # scaler/booster — без изменений
         try:
@@ -3194,7 +3215,8 @@ class XGBExpert(_BaseExpert):
             try:
                 self._ensure_dim(x_raw)
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Failed to predict")
             return (None, self.mode)
 
         try:
@@ -3214,7 +3236,8 @@ class XGBExpert(_BaseExpert):
                 try:
                     p = float(cal.transform(p))
                 except Exception:
-                    pass
+                    from error_logger import log_exception
+                    log_exception("Failed to predict")
 
             p = float(min(max(p, 1e-6), 1.0 - 1e-6))
             return (p, self.mode)
@@ -3294,7 +3317,8 @@ class XGBExpert(_BaseExpert):
                     # В shadow режиме накапливаем "что было бы, если бы входили"
                     self.shadow_hits.append(hit)
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Failed to update")
 
         # ========== БЛОК 6: НОВОЕ - СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
         # Out-of-fold predictions нужны для расчета метрик cross-validation
@@ -3482,7 +3506,8 @@ class XGBExpert(_BaseExpert):
                 mode=self.mode
             )
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
         
         return {
             "mode": self.mode,
@@ -3913,7 +3938,8 @@ class RFCalibratedExpert(_BaseExpert):
                         try:
                             self.new_since_train_ph[int(k)] = int(v)
                         except Exception:
-                            pass
+                            from error_logger import log_exception
+                            log_exception("Unhandled exception")
 
                 # NEW: последняя увиденная фаза (для maybe_train без reg_ctx)
                 try:
@@ -4026,7 +4052,8 @@ class RFCalibratedExpert(_BaseExpert):
         try:
             self._ensure_dim(x_raw)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to save pickle")
 
         # выбрать модель фазы, при отсутствии — глобальную
         model = None
@@ -4130,7 +4157,8 @@ class RFCalibratedExpert(_BaseExpert):
                     # В shadow режиме накапливаем "что было бы, если бы входили"
                     self.shadow_hits.append(hit)
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Failed to update")
 
         # ========== БЛОК 6: НОВОЕ - СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
         # Out-of-fold predictions нужны для расчета метрик cross-validation
@@ -4317,7 +4345,8 @@ class RFCalibratedExpert(_BaseExpert):
                 mode=self.mode
             )
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
         
         return {
             "mode": self.mode,
@@ -4430,7 +4459,8 @@ class RiverARFExpert(_BaseExpert):
                 self.active_hits = st.get("active_hits", [])[-1000:]
                 self.n_feats = st.get("n_feats")
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to load JSON")
         
         if self.enabled:
             try:
@@ -4438,7 +4468,8 @@ class RiverARFExpert(_BaseExpert):
                     with open(self.cfg.arf_model_path, "rb") as f:
                         self.clf = pickle.load(f)
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Failed to load pickle")
 
     def _save_all(self):
         """Сохранение состояния"""
@@ -4451,14 +4482,16 @@ class RiverARFExpert(_BaseExpert):
                     "n_feats": self.n_feats,
                 }, f)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to save JSON")
 
         if self.enabled and self.clf is not None:
             try:
                 with open(self.cfg.arf_model_path, "wb") as f:
                     pickle.dump(self.clf, f)
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Failed to save JSON")
 
         # Сохранение калибраторов
         try:
@@ -4468,9 +4501,11 @@ class RiverARFExpert(_BaseExpert):
                     try:
                         cal.save(cal_path)
                     except Exception:
-                        pass
+                        from error_logger import log_exception
+                        log_exception("Failed to save pickle")
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to save pickle")
 
     def _to_dict(self, x_raw: np.ndarray) -> Dict[str, float]:
         """Преобразует numpy массив в dict для River"""
@@ -4508,7 +4543,8 @@ class RiverARFExpert(_BaseExpert):
                 try:
                     p = float(cal.transform(float(p)))
                 except Exception:
-                    pass
+                    from error_logger import log_exception
+                    log_exception("Failed to transform")
 
             p = float(min(max(p, 1e-6), 1.0 - 1e-6))
             return (p, self.mode)
@@ -4542,7 +4578,8 @@ class RiverARFExpert(_BaseExpert):
         try:
             self.clf.learn_one(self._to_dict(x_raw), bool(y_up))
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
 
         # === СОХРАНЕНИЕ В БУФЕРЫ (для CV и метрик) ===
         self.X.append(x_raw.astype(np.float32).ravel().tolist())
@@ -4574,11 +4611,13 @@ class RiverARFExpert(_BaseExpert):
                                 self.mode = "SHADOW"
                                 self.active_hits = []
                         except Exception:
-                            pass
+                            from error_logger import log_exception
+                            log_exception("Failed to update")
                 else:
                     self.shadow_hits.append(hit)
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Failed to update")
 
         # === OOF PREDICTIONS ДЛЯ CV ===
         if getattr(self.cfg, "cv_enabled", False) and p_pred is not None:
@@ -4834,7 +4873,8 @@ class RiverARFExpert(_BaseExpert):
                 mode=self.mode
             )
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
         
         return {
             "mode": self.mode,
@@ -5087,7 +5127,8 @@ class NNExpert(_BaseExpert):
         try:
             self._ensure_dim(x_raw)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Error in proba_up")
 
         # стабильная фаза приходит в reg_ctx["phase"] (гистерезис выше по коду)
         ph = 0
@@ -5209,7 +5250,8 @@ class NNExpert(_BaseExpert):
                     # В shadow режиме накапливаем "что было бы, если бы входили"
                     self.shadow_hits.append(hit)
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Failed to update")
 
         # ========== БЛОК 6: НОВОЕ - СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
         # Out-of-fold predictions нужны для расчета метрик cross-validation
@@ -5239,7 +5281,8 @@ class NNExpert(_BaseExpert):
                     cal_path = self._cal_path(getattr(self.cfg, "nn_cal_path", self.cfg.xgb_cal_path), ph)
                     self.cal_ph[ph].save(cal_path)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to observe")
 
 
         # ========== БЛОК 8: НОВОЕ - ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
@@ -5770,7 +5813,8 @@ class NNExpert(_BaseExpert):
                 mode=self.mode
             )
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
         
         return {
             "mode": self.mode,
@@ -5884,7 +5928,8 @@ class MetaStacking:
                     "exp4_w": (self.exp4_w.tolist() if self.exp4_w is not None else []),
                 })
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
 
     def _load(self):
         try:
@@ -5918,7 +5963,8 @@ class MetaStacking:
                 if exp4_w:
                     self.exp4_w = np.array(exp4_w, dtype=float)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
 
     # ---------- гейтеры ----------
     def _ensure_Wg(self, d_ctx: int, K: int):
@@ -6121,7 +6167,8 @@ class MetaStacking:
                         self.mode = "SHADOW"
                         self.active_hits = []
                 except Exception:
-                    pass
+                    from error_logger import log_exception
+                    log_exception("Failed to update")
         else:
             self.shadow_hits.append(hit)
 
@@ -6338,7 +6385,8 @@ def main_loop():
             phase_filter.last_phase = st.get("last_phase", None)
             phase_filter.last_change_ts = st.get("last_change_ts", None)
     except Exception:
-        pass
+        from error_logger import log_exception
+        log_exception("Failed to load JSON")
         # === δ: суточный подбор по последним 100 сделкам ===
     try:
         # Проверяем количество доступных сделок
@@ -6530,7 +6578,8 @@ def main_loop():
                     if mask.sum() >= int(os.getenv("CALIB_MIN_N","300")):
                         _CALIB_MGR.fit_global(p_hist[mask], y_hist[mask])
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
 
     # Оставляем только первый калибратор для упрощения
     _CALIB_MGR2 = None
@@ -6554,7 +6603,8 @@ def main_loop():
         signal.signal(signal.SIGTERM, _meta_flush)              # OK: мягко флашим при SIGTERM
         signal.signal(signal.SIGINT,  signal.default_int_handler)  # ← вернуть дефолт
     except Exception:
-        pass
+        from error_logger import log_exception
+        log_exception("Failed to import atexit")
  
 
     def _status_line(name, st):
@@ -6638,7 +6688,8 @@ def main_loop():
                         + _status_line("NN ", s_n) + "\n"
                         + _status_line("META", s_m))
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to send Telegram notification")
 
     while True:
         try:
@@ -6665,7 +6716,8 @@ def main_loop():
                         try:
                             tg_send(evt["message"])
                         except Exception:
-                            pass
+                            from error_logger import log_exception
+                            log_exception("Failed to send Telegram notification")
                         capital = new_capital  # обновляем capital в самом конце
             except Exception as e:
                 print(f"[reserve] eod rebalance failed: {e}")
@@ -6717,7 +6769,8 @@ def main_loop():
                                 "<i>* по подмножеству исторически взятых сделок</i>"
                             )
                         except Exception:
-                            pass
+                            from error_logger import log_exception
+                            log_exception("Unhandled exception")
 
                     elif (meta.mode != "ACTIVE") or (not had_trade_in_last_hours(CSV_PATH, 1.0)):
                         DELTA_PROTECT = 0.0
@@ -6733,7 +6786,8 @@ def main_loop():
                                 "<i>* по подмножеству исторически взятых сделок</i>"
                             )
                         except Exception:
-                            pass
+                            from error_logger import log_exception
+                            log_exception("Unhandled exception")
 
                     else:
                         DELTA_PROTECT = float(st["delta"])
@@ -6748,7 +6802,8 @@ def main_loop():
                                 "<i>* по подмножеству исторически взятых сделок</i>"
                             )
                         except Exception:
-                            pass
+                            from error_logger import log_exception
+                            log_exception("Unhandled exception")
             except Exception as e:
                 print(f"[delta] update failed: {e}")
 
@@ -6897,7 +6952,8 @@ def main_loop():
                             z_up = float(np.dot(w_dbg, phi_dbg))
                             print(f"[base] ||w||={np.linalg.norm(w_dbg):.3f} logit={z_up:+.4f} P_up_raw={P_up:.4f}")
                         except Exception:
-                            pass
+                            from error_logger import log_exception
+                            log_exception("Unhandled exception")
 
 
                         if USE_SUPER_SMOOTHER and p_ss is not None:
@@ -7082,7 +7138,8 @@ def main_loop():
                                     "last_change_ts": int(t_lock.timestamp()),
                                 }, f)
                         except Exception:
-                            pass
+                            from error_logger import log_exception
+                            log_exception("Failed to save JSON")
                        
 
                         p_xgb, m_xgb = xgb_exp.proba_up(x_ml, reg_ctx=reg_ctx)
@@ -7174,7 +7231,8 @@ def main_loop():
                         try:
                             r2d.ingest_settled(CSV_PATH)
                         except Exception:
-                            pass
+                            from error_logger import log_exception
+                            log_exception("Failed to ingest settled data")
                         
                         _now_ts = int(time.time())
                         t_rem_s = max(0, int(_as_float(getattr(rd, "lock_ts", _now_ts), _now_ts) - _now_ts))
@@ -7188,7 +7246,8 @@ def main_loop():
                         try:
                             r2d.observe_epoch(epoch=int(epoch), t_rem_s=int(t_rem_s), pool_total_bnb=float(pool_tot))
                         except Exception:
-                            pass
+                            from error_logger import log_exception
+                            log_exception("Failed to observe epoch")
                         
                         # НОВАЯ ФУНКЦИЯ из модуля: приоритет IMPLIED → историческим методам
                         # НОВАЯ ФУНКЦИЯ из модуля: приоритет IMPLIED → историческим методам
@@ -7861,7 +7920,8 @@ def main_loop():
                                                 "nn": float(norm_weights[3]),
                                             }
                                 except Exception:
-                                    pass
+                                    from error_logger import log_exception
+                                    log_exception("Unhandled exception")
                             
                             # Конвертируем feats в dict (если это pandas Series)
                             feats_dict = {}
@@ -7929,7 +7989,8 @@ def main_loop():
                         pool.observe(epoch, rd.lock_ts, rd.bull_amount, rd.bear_amount)
                         pool.finalize_epoch(epoch, rd.lock_ts)
                     except Exception:
-                        pass
+                        from error_logger import log_exception
+                        log_exception("Failed to observe")
                     # Фолбэк для газа на случай сбоя RPC — НЕ прерываем сеттл из-за газа
                     fallback_wei = 0
                     try:
@@ -7983,7 +8044,8 @@ def main_loop():
                             logreg.update(np.array(b["phi"], dtype=float), 1 if up_won else 0)
                             logreg.save()
                         except Exception:
-                            pass
+                            from error_logger import log_exception
+                            log_exception("Failed to save state")
 
                     capital_before = capital
                     
@@ -8031,7 +8093,8 @@ def main_loop():
                                 # до 500 сделок WF не трогаем
                                 pass
                     except Exception:
-                        pass
+                        from error_logger import log_exception
+                        log_exception("Failed to save state")
 
 
                     # Ансамбль: апдейт экспертов и меты
@@ -8098,7 +8161,8 @@ def main_loop():
                                 if CM1 and ("p_meta_raw" in b) and _is_finite_num(b["p_meta_raw"]):
                                     CM1.update(_as_float(b["p_meta_raw"]), int(y_up_int), int(time.time()))
                             except Exception:
-                                pass
+                                from error_logger import log_exception
+                                log_exception("Failed to update")
 
 
 
@@ -8193,7 +8257,8 @@ def main_loop():
                                 error_pct = abs(r_actual - r_pred) / r_actual * 100.0
                                 row["r_hat_error_pct"] = float(error_pct)
                     except Exception:
-                        pass
+                        from error_logger import log_exception
+                        log_exception("Unhandled exception")
 
                     capital = update_capital_atomic(capital_state, new_capital, now, row)
 
@@ -8377,7 +8442,8 @@ def main_loop():
                                 wf.save()
                                 print(f"[wf  ] updated weights = {wf.w}")
                         except Exception:
-                            pass
+                            from error_logger import log_exception
+                            log_exception("Failed to save state")
 
                         try:
                             ens_info = b.get("ens") or {}
@@ -8449,7 +8515,8 @@ def main_loop():
                                             used_in_live=used_flag
                                         )
                                 except Exception:
-                                    pass
+                                    from error_logger import log_exception
+                                    log_exception("Unhandled exception")
 
 
                                 # УПРОЩЕНО: обновляем только первый калибратор
@@ -8458,7 +8525,8 @@ def main_loop():
                                     if CM1 and ("p_meta_raw" in b) and _is_finite_num(b["p_meta_raw"]):
                                         CM1.update(_as_float(b["p_meta_raw"]), int(y_up_int), int(time.time()))
                                 except Exception:
-                                    pass
+                                    from error_logger import log_exception
+                                    log_exception("Failed to update")
 
 
                         except Exception as _e:
@@ -8507,7 +8575,8 @@ def main_loop():
                                     error_pct = abs(r_actual - r_pred) / r_actual * 100.0
                                     row["r_hat_error_pct"] = float(error_pct)
                         except Exception:
-                            pass
+                            from error_logger import log_exception
+                            log_exception("Unhandled exception")
 
                         capital = update_capital_atomic(capital_state, new_capital, now, row)
 
@@ -8578,7 +8647,8 @@ def main_loop():
                     gc.collect()
                     _last_gc = now
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Failed to import gc")
 
             time.sleep(1.0)
 
@@ -8635,14 +8705,16 @@ if __name__ == "__main__":
         try:
             tg_send("⚠️ Bot stopped (KeyboardInterrupt).", html=False)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to send Telegram notification")
     except Exception as e:
         # пишем стек в GGG/errors.log и даём процессу завершиться с кодом ошибки
         log_exception("Fatal error in main()")
         try:
             tg_send("🔴 Bot crashed: см. GGG/errors.log", html=False)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to send Telegram notification")
         raise
 
 
