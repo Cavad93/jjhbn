@@ -11,6 +11,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from error_logger import log_exception
 
 
 def estimate_late_money_direction(pool, rd, our_side_up: bool) -> float:
@@ -225,7 +226,7 @@ def estimate_r_hat_improved(
                     r_base = r_adjusted
                     source_parts.append(f"late_adj={r_adjusted:.3f}(frac={late_fraction:.2f})")
             except Exception:
-                pass
+                log_exception("r_hat: late_adj calc failed")
         
         # ШАГ 3: Blend с исторической EWMA (30% веса истории)
         try:
@@ -242,7 +243,7 @@ def estimate_r_hat_improved(
                 source_parts.append(f"blend70/30={r_blended:.3f}")
                 r_base = r_blended
         except Exception:
-            pass
+            log_exception("r_hat: ewma blend failed")
         
         # ШАГ 4: Penalty за волатильность
         try:
@@ -316,7 +317,7 @@ def estimate_r_hat_improved(
             return float(r_imp), f"implied_fallback={r_imp:.3f}"
         
     except Exception:
-        pass
+        log_exception("r_hat: all methods failed; using hardcoded fallback 1.90")
     
     # Финальный fallback
     return 1.90, "hardcoded_fallback=1.90"
