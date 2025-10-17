@@ -517,7 +517,8 @@ def test_meta_hit_tracking(meta):
                 n = int(st[k])
                 break
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Error in test_meta_hit_tracking")
     if n is None:
         pytest.skip("Meta.status() не содержит счётчика наблюдений")
     assert n >= 0
