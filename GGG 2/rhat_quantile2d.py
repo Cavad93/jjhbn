@@ -6,6 +6,7 @@ from typing import Dict, Tuple, Optional, List
 import numpy as np
 import pandas as pd
 import json, math, os, time
+from error_logger import log_exception
 
 def _safe_float(x, default=np.nan):
     try:
@@ -50,7 +51,7 @@ class RHat2D:
                 json.dump({"buckets": buckets}, f, ensure_ascii=False)
             os.replace(tmp, self.state_path)
         except Exception:
-            pass
+            log_exception(f"RHat2D: failed to save state to {self.state_path}")
 
     def _load_pending(self) -> Dict[str, Dict[str, float]]:
         try:
@@ -127,7 +128,7 @@ class RHat2D:
             try:
                 return float(np.quantile(np.array(buckets[key], dtype=float), 0.25))
             except Exception:
-                pass
+                log_exception("RHat2D: quantile compute failed")
 
         try:
             df = pd.read_csv(csv_path, encoding="utf-8-sig")
