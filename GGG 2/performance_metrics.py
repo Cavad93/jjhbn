@@ -330,7 +330,7 @@ class PerfMonitor:
         try:
             tg_send_fn(text, html=True)
         except Exception:
-            pass
+            log_exception("PerfMonitor: telegram send failed")
 
         # обновим состояние
         self.state.last_hour_bucket = hour_bucket
