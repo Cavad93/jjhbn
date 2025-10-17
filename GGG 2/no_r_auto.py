@@ -71,7 +71,8 @@ def _read_last_hour_rows(csv_path: str, now_utc: Optional[int]=None) -> List[Dic
                     continue
                 rows.append(row)
     except Exception:
-        pass
+        from error_logger import log_exception
+        log_exception("Failed to read file")
     return rows
 
 def _mode_score_for_row(mode: str, row: Dict, delta_eff: float) -> Optional[float]:
@@ -137,7 +138,8 @@ def _save_state(path: str, obj: Dict) -> None:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=2)
     except Exception:
-        pass
+        from error_logger import log_exception
+        log_exception("Failed to load JSON")
 
 def pick_no_r_mode(
     csv_path: str,
