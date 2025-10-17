@@ -54,15 +54,15 @@ class FuturesContext:
             try:
                 self.mark_price = float(pi.get("markPrice", self.mark_price or 0.0))
             except Exception:
-                pass
+                log_exception("FuturesContext: markPrice parse failed")
             try:
                 self.last_funding_rate = float(pi.get("lastFundingRate", self.last_funding_rate or 0.0))
             except Exception:
-                pass
+                log_exception("FuturesContext: lastFundingRate parse failed")
             try:
                 self.next_funding_time_ms = int(pi.get("nextFundingTime", self.next_funding_time_ms or 0))
             except Exception:
-                pass
+                log_exception("FuturesContext: nextFundingTime parse failed")
         oi = self._get_open_interest()
         if oi:
             self.oi_hist.append(oi)
