@@ -30,7 +30,8 @@ def main():
             try:
                 proc.terminate()
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Failed to terminate process")
             break
         except Exception:
             log_exception("Watchdog: ошибка при запуске дочернего процесса")
