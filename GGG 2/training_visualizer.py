@@ -112,7 +112,8 @@ class TrainingVisualizer:
                 if stage is not None and evo.should_notify(expert_name):
                     self._send_evolution_notification(expert_name, stage, accuracy)
             except Exception as e:
-                pass
+                from error_logger import log_exception
+                log_exception("Failed to import get_evolution_tracker")
             
             self._save_data()
     
