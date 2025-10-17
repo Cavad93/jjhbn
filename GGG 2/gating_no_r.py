@@ -15,6 +15,7 @@ from __future__ import annotations
 import os, csv, math, time
 from collections import deque
 from typing import Tuple, List, Optional
+from error_logger import log_exception
 
 try:
     import numpy as np
@@ -35,11 +36,11 @@ class _Hist:
         try:
             mt_main = os.stat(csv_path).st_mtime
         except Exception:
-            pass
+            log_exception(f"gating_no_r: stat failed for {csv_path}")
         try:
             mt_shadow = os.stat(shadow_path).st_mtime
         except Exception:
-            pass
+            log_exception(f"gating_no_r: stat failed for {shadow_path}")
 
         mt = max(mt_main, mt_shadow)
         if mt <= self.mt:
@@ -74,7 +75,7 @@ class _Hist:
                             if ep:
                                 seen_epochs.add(ep)
             except Exception:
-                pass
+                log_exception("gating_no_r: CSV parse item failed")
 
         if mt_main > 0.0:
             append_from(csv_path)        # реально закрытые сделки (как было)
