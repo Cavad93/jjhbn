@@ -30,7 +30,8 @@ def loss_margin_q(csv_path: str, max_epoch_exclusive: Optional[int] = None, q: f
         try:
             df = df[df["epoch"] < int(max_epoch_exclusive)]
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
     if df.empty:
         return 0.0
 
