@@ -962,7 +962,8 @@ class MetaCEMMC:
                         sigma=float(sigma_hist[-1])
                     )
                 except Exception:
-                    pass
+                    from error_logger import log_exception
+                    log_exception("Unhandled exception")
 
         w_best = np.array(es.result.xbest, dtype=float)
         w_best = np.clip(w_best, -clip_val, clip_val)
@@ -978,7 +979,8 @@ class MetaCEMMC:
                     sigma=sigma_hist
                 )
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Unhandled exception")
 
         return w_best
 
@@ -1141,7 +1143,8 @@ class MetaCEMMC:
                     row = list(x) + [int(y), current_timestamp]
                     writer.writerow(row)
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Unhandled exception")
         return self.buf_ph[ph]
 
     def _load_phase_buffer_from_disk(self, ph: int, max_age_days: Optional[float] = None) -> Tuple[List, List, List]:
@@ -1183,7 +1186,8 @@ class MetaCEMMC:
                     except (ValueError, IndexError):
                         continue
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
 
         return X_list, y_list, weights
 
@@ -1196,7 +1200,8 @@ class MetaCEMMC:
             try:
                 os.remove(csv_path)
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Failed to remove file")
 
     def _save_throttled(self):
         """
@@ -1225,7 +1230,8 @@ class MetaCEMMC:
         try:
             atomic_save_json(path, state)
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
 
     def _load(self):
         """Загружает состояние META из JSON"""
@@ -1291,7 +1297,8 @@ class MetaCEMMC:
                     clc.setdefault(p, 0)
                 self.cv_last_check = clc
         except Exception as e:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
 
 
     def _emit_report(
