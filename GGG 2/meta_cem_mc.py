@@ -35,6 +35,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from collections import deque
+from error_logger import log_exception
 
 # meta_cem_mc.py (импорты)
 import numpy as np
@@ -901,7 +902,7 @@ class MetaCEMMC:
                         sigma=avg_sigma
                     )
                 except Exception:
-                    pass
+                    log_exception("MetaCEMMC: record_meta_training_step failed")
 
         return best_w
 
@@ -1323,7 +1324,7 @@ class MetaCEMMC:
             try:
                 os.remove(tmp_path)
             except Exception:
-                pass
+                log_exception(f"MetaCEMMC: failed to remove {tmp_path}")
         except Exception as e:
             print(f"[MetaCEMMC] Report generation failed: {e.__class__.__name__}: {e}")
 
