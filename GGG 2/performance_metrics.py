@@ -44,7 +44,8 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         if math.isfinite(v):
             return v
     except Exception:
-        pass
+        from error_logger import log_exception
+        log_exception("Error in _tcrit_975")
     return float(default)
 
 def _clip01(p: float) -> float:
