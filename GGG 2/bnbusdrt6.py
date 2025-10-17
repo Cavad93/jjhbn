@@ -103,7 +103,7 @@ gas_price_history = []  # история последних 20 успешных 
 MAX_GAS_HISTORY = 20    # размер скользящего окна для медианы
 
 # инициализируем отдельный error-лог (GGG/errors.log)
-setup_error_logging(log_dir=".", filename="errors.log")
+setup_error_logging(log_dir="logs", filename="errors.log")
 
 
 
@@ -120,7 +120,7 @@ def _proj_mark_once(path: str, day: str) -> bool:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(st, f)
     except Exception:
-        pass
+        log_exception("daily_once_state: failed to read/write last_day")
     return True
 
 
@@ -1832,7 +1832,7 @@ def compute_extended_stats_from_csv(path: str) -> Dict[str, Any]:
             dd_peak = float(peak_val)
             dd_trough = float(trough_val)
     except Exception:
-        pass
+        log_exception("metrics_dashboard: drawdown calc failed")
     
     # 2. Profit Factor
     profit_factor = None
@@ -1843,7 +1843,7 @@ def compute_extended_stats_from_csv(path: str) -> Dict[str, Any]:
         if losses_sum > 0:
             profit_factor = wins_sum / losses_sum
     except Exception:
-        pass
+        log_exception("metrics_dashboard: profit factor calc failed")
     
     # 3. Current Streak
     current_streak = None
@@ -2023,7 +2023,7 @@ def r_ewma_by_side(path: str, side_up: bool, alpha: float = 0.25,
         try:
             df = df[df["epoch"] < int(max_epoch_exclusive)]
         except Exception:
-            pass
+            log_exception("r_ewma_by_side: invalid max_epoch_exclusive")
     if df.empty:
         return None
     side_series = df.get("side", pd.Series(dtype="string")).astype(str).str.upper()
@@ -2899,12 +2899,12 @@ class XGBExpert(_BaseExpert):
                 with open(self.cfg.xgb_scaler_path, "wb") as f:
                     pickle.dump(self.scaler, f)
         except Exception:
-            pass
+            log_exception(f"xgb: failed to save scaler to {self.cfg.xgb_scaler_path}")
         try:
             if HAVE_XGB and self.booster is not None:
                 self.booster.save_model(self.cfg.xgb_model_path)
         except Exception:
-            pass
+            log_exception(f"xgb: failed to save booster to {self.cfg.xgb_model_path}")
 
 
 
@@ -5591,7 +5591,7 @@ class NNExpert(_BaseExpert):
                         try:
                             self.new_since_train_ph[int(k)] = int(v)
                         except Exception:
-                            pass
+                            log_exception("state_load: new_since_train_ph cast failed")
 
                 # температуры по фазам + счётчики для перекалибровки
                 T_ph = st.get("T_ph")
@@ -5601,7 +5601,7 @@ class NNExpert(_BaseExpert):
                         try:
                             self.T_ph[int(k)] = float(v)
                         except Exception:
-                            pass
+                            log_exception("state_load: T_ph cast failed")
                 ssc = st.get("seen_since_calib_ph")
                 self.seen_since_calib_ph = {p: 0 for p in range(self.P)}
                 if isinstance(ssc, dict):
@@ -5609,7 +5609,7 @@ class NNExpert(_BaseExpert):
                         try:
                             self.seen_since_calib_ph[int(k)] = int(v)
                         except Exception:
-                            pass
+                            log_exception("state_load: seen_since_calib_ph cast failed")
 
                 self._last_seen_phase = int(st.get("_last_seen_phase", 0))
                 # старое поле T (для обратной совместимости)
@@ -8337,7 +8337,7 @@ def main_loop():
                                 logreg.update(np.array(b["phi"], dtype=float), 1 if up_won else 0)
                                 logreg.save()
                             except Exception:
-                                pass
+                                log_exception("nn_calibrator: update/save failed")
 
                         ratio_imp = implied_payout_ratio(bet_up, rd, TREASURY_FEE)
                         ratio_use = ratio_imp if (ratio_imp is not None and math.isfinite(ratio_imp) and ratio_imp > 1.0) else 1.90
