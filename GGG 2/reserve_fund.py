@@ -18,7 +18,8 @@ reserve_fund.py — учёт «резервного фонда» с ежедне
         try:
             tg_send(event["message"])
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Failed to import ReserveFund")
 
     # в сообщении статистики после каждого раунда:
     # резерв уже появится (мы добавим одну строку в build_stats_message).
