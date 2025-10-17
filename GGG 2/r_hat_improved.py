@@ -254,7 +254,8 @@ def estimate_r_hat_improved(
                     r_base *= vol_mult
                     source_parts.append(f"vol_penalty={vol_mult:.3f}")
         except Exception:
-            pass
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
         
         r_final = float(max(1.01, r_base))  # минимум 1.01
         source = " | ".join(source_parts)
@@ -304,7 +305,8 @@ def estimate_r_hat_improved(
                 if r_hat and math.isfinite(r_hat) and r_hat > 1.0:
                     return float(r_hat), f"r2d={r_hat:.3f}"
             except Exception:
-                pass
+                from error_logger import log_exception
+                log_exception("Unhandled exception")
         
         # 4) Медиана последних 3
         r_med, _, _ = last3_ev_estimates(csv_path)
