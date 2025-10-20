@@ -1035,22 +1035,25 @@ class MetaCEMMC:
             return 100.0 * (sum(window) / float(len(window)))
 
         try:
-            enter_wr = float(getattr(self.cfg, "enter_wr", 53.0))
-            exit_wr  = float(getattr(self.cfg, "exit_wr", 49.0))
-            min_ready = int(getattr(self.cfg, "min_ready", 80))
+            enter_wr = float(getattr(self.cfg, "meta_enter_wr", 58.0))
+            exit_wr  = float(getattr(self.cfg, "meta_exit_wr", 52.0))
+            min_ready = int(getattr(self.cfg, "meta_min_ready", 100))
             cv_enabled = bool(getattr(self.cfg, "cv_enabled", True))
         except Exception:
-            enter_wr, exit_wr, min_ready = 53.0, 49.0, 80
+            enter_wr, exit_wr, min_ready = 58.0, 52.0, 100
             cv_enabled = True
 
         wr_shadow = wr(self.shadow_hits, min_ready)
         wr_active = wr(self.active_hits, max(30, min_ready // 2))
+        
+        # Получаем текущую фазу с валидацией диапазона
+        ph = getattr(self, "_last_phase", 0)
+        ph = max(0, min(ph, self.P - 1))
 
         # SHADOW → ACTIVE
         if self.mode == "SHADOW" and wr_shadow is not None:
             basic_threshold_met = wr_shadow >= enter_wr
             if cv_enabled:
-                ph = getattr(self, "_last_phase", 0)
                 cv_metrics = self.cv_metrics.get(ph, {})
                 cv_passed = self.validation_passed.get(ph, False)
                 if basic_threshold_met and cv_passed:
@@ -1059,29 +1062,28 @@ class MetaCEMMC:
                     min_improvement = float(getattr(self.cfg, "cv_min_improvement", 2.0))
                     if cv_wr >= enter_wr and ci_lower >= (enter_wr - min_improvement):
                         self.mode = "ACTIVE"
-                        print(f"[MetaCEMMC] SHADOW→ACTIVE: WR={wr_shadow:.2f}%, "
-                              f"CV_WR={cv_wr:.2f}% (CI: [{ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
+                        print(f"[MetaCEMMC] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}%, "
+                            f"CV_WR={cv_wr:.2f}% (CI: [{ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
             else:
                 if basic_threshold_met:
                     self.mode = "ACTIVE"
-                    print(f"[MetaCEMMC] SHADOW→ACTIVE: WR={wr_shadow:.2f}% (CV disabled)")
+                    print(f"[MetaCEMMC] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}% (CV disabled)")
 
         # ACTIVE → SHADOW
         if self.mode == "ACTIVE" and wr_active is not None:
             basic_threshold_failed = wr_active < exit_wr
             cv_degraded = False
             if cv_enabled:
-                ph = getattr(self, "_last_phase", 0)
                 cv_metrics = self.cv_metrics.get(ph, {})
                 cv_wr = cv_metrics.get("oof_accuracy", 100.0)
                 cv_degraded = cv_wr < exit_wr
 
             if basic_threshold_failed or cv_degraded:
                 self.mode = "SHADOW"
-                reason = "WR dropped" if basic_threshold_failed else "CV degraded"
-                print(f"[MetaCEMMC] ACTIVE→SHADOW: {reason} (WR={wr_active:.2f}%)")
                 if cv_enabled:
                     self.validation_passed[ph] = False
+                reason = "WR dropped" if basic_threshold_failed else "CV degraded"
+                print(f"[MetaCEMMC] ACTIVE→SHADOW ph={ph}: {reason} (WR={wr_active:.2f}%)")
 
     # ========== СТАТУС И ДИАГНОСТИКА ==========
     def status(self) -> Dict[str, str]:
@@ -1253,23 +1255,24 @@ class MetaCEMMC:
             self._last_save_ts = now
 
     def _save(self):
-        """Сохраняет полное состояние META в JSON"""
-        state = {
-            "mode": self.mode,
-            "w_meta_ph": self.w_meta_ph.tolist(),
-            "shadow_hits": self.shadow_hits[-2000:],
-            "active_hits": self.active_hits[-2000:],
-            "seen_ph": self.seen_ph,
-            "cv_metrics": self.cv_metrics,
-            "validation_passed": self.validation_passed,
-            "cv_last_check": self.cv_last_check,
-        }
-        path = getattr(self.cfg, "meta_state_path", "meta_state.json")
+        """Сохранение состояния META в JSON"""
         try:
-            atomic_save_json(path, state)
-        except Exception:
-            from error_logger import log_exception
-            log_exception("Unhandled exception")
+            st = {
+                "w_meta_ph": {int(k): v.tolist() for k, v in self.w_meta_ph.items()},
+                "mode": self.mode,
+                "shadow_hits": list(self.shadow_hits)[-2000:],
+                "active_hits": list(self.active_hits)[-2000:],
+                "seen_ph": {int(k): int(v) for k, v in self.seen_ph.items()},
+                "cv_metrics": {int(k): v for k, v in self.cv_metrics.items()},
+                "validation_passed": {int(k): bool(v) for k, v in self.validation_passed.items()},
+                "cv_oof_window": int(getattr(self.cfg, "cv_oof_window", 500)),
+                "cv_last_check": {int(k): int(v) for k, v in self.cv_last_check.items()},
+                "_last_phase": int(getattr(self, "_last_phase", 0)),
+                "phase_csv_paths": {int(k): str(v) for k, v in self._phase_csv_paths.items()}
+            }
+            atomic_save_json(self.state_path, st)
+        except Exception as e:
+            print(f"[MetaCEMMC] Save error: {e}")
 
     def _load(self):
         """Загружает состояние META из JSON"""
@@ -1291,49 +1294,58 @@ class MetaCEMMC:
                     print(f"[MetaCEMMC] Expanded weights from {old_D}D to {self.D}D")
                 else:
                     self.w_meta_ph = loaded_w
-                # стало (meta_cem_mc.py, _load — полная нормализация ключей под int для всех фазовых словарей)
-                self.shadow_hits = state.get("shadow_hits", [])
-                self.active_hits = state.get("active_hits", [])
+            
+            self.shadow_hits = state.get("shadow_hits", [])
+            self.active_hits = state.get("active_hits", [])
 
-                # НОРМАЛИЗАЦИЯ seen_ph
-                sp = state.get("seen_ph", {p: 0 for p in range(self.P)})
-                if isinstance(sp, list):
-                    sp = {i: int(v) for i, v in enumerate(sp)}
-                elif isinstance(sp, dict):
-                    sp = {int(k): int(v) for k, v in sp.items()}
-                for p in range(self.P):
-                    sp.setdefault(p, 0)
-                self.seen_ph = sp
+            # НОРМАЛИЗАЦИЯ seen_ph
+            sp = state.get("seen_ph", {p: 0 for p in range(self.P)})
+            if isinstance(sp, list):
+                sp = {i: int(v) for i, v in enumerate(sp)}
+            elif isinstance(sp, dict):
+                sp = {int(k): int(v) for k, v in sp.items()}
+            for p in range(self.P):
+                sp.setdefault(p, 0)
+            self.seen_ph = sp
 
-                # НОРМАЛИЗАЦИЯ cv_metrics
-                cm = state.get("cv_metrics", {p: {} for p in range(self.P)})
-                if isinstance(cm, list):
-                    cm = {i: v for i, v in enumerate(cm)}
-                elif isinstance(cm, dict):
-                    cm = {int(k): v for k, v in cm.items()}
-                for p in range(self.P):
-                    cm.setdefault(p, {})
-                self.cv_metrics = cm
+            # НОРМАЛИЗАЦИЯ cv_metrics
+            cm = state.get("cv_metrics", {p: {} for p in range(self.P)})
+            if isinstance(cm, list):
+                cm = {i: v for i, v in enumerate(cm)}
+            elif isinstance(cm, dict):
+                cm = {int(k): v for k, v in cm.items()}
+            for p in range(self.P):
+                cm.setdefault(p, {})
+            self.cv_metrics = cm
 
-                # НОРМАЛИЗАЦИЯ validation_passed
-                vp = state.get("validation_passed", {p: False for p in range(self.P)})
-                if isinstance(vp, list):
-                    vp = {i: bool(v) for i, v in enumerate(vp)}
-                elif isinstance(vp, dict):
-                    vp = {int(k): bool(v) for k, v in vp.items()}
-                for p in range(self.P):
-                    vp.setdefault(p, False)
-                self.validation_passed = vp
+            # НОРМАЛИЗАЦИЯ validation_passed
+            vp = state.get("validation_passed", {p: False for p in range(self.P)})
+            if isinstance(vp, list):
+                vp = {i: bool(v) for i, v in enumerate(vp)}
+            elif isinstance(vp, dict):
+                vp = {int(k): bool(v) for k, v in vp.items()}
+            for p in range(self.P):
+                vp.setdefault(p, False)
+            self.validation_passed = vp
 
-                # НОРМАЛИЗАЦИЯ cv_last_check
-                clc = state.get("cv_last_check", {p: 0 for p in range(self.P)})
-                if isinstance(clc, list):
-                    clc = {i: int(v) for i, v in enumerate(clc)}
-                elif isinstance(clc, dict):
-                    clc = {int(k): int(v) for k, v in clc.items()}
-                for p in range(self.P):
-                    clc.setdefault(p, 0)
-                self.cv_last_check = clc
+            # НОРМАЛИЗАЦИЯ cv_last_check
+            clc = state.get("cv_last_check", {p: 0 for p in range(self.P)})
+            if isinstance(clc, list):
+                clc = {i: int(v) for i, v in enumerate(clc)}
+            elif isinstance(clc, dict):
+                clc = {int(k): int(v) for k, v in clc.items()}
+            for p in range(self.P):
+                clc.setdefault(p, 0)
+            self.cv_last_check = clc
+            
+            # ВОССТАНОВЛЕНИЕ _last_phase
+            self._last_phase = int(state.get("_last_phase", 0))
+            
+            # ВОССТАНОВЛЕНИЕ phase_csv_paths
+            saved_paths = state.get("phase_csv_paths", {})
+            if saved_paths:
+                self._phase_csv_paths = {int(k): str(v) for k, v in saved_paths.items()}
+                
         except Exception as e:
             from error_logger import log_exception
             log_exception("Unhandled exception")
