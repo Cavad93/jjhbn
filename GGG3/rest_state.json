@@ -1,0 +1,8 @@
+{
+  "state": "ACTIVE",
+  "rest_until_utc": null,
+  "last_exit_to_active_utc": null,
+  "last_rest_start_utc": null,
+  "trades_since_last_rest4h_exit": 0,
+  "decided_at_utc": "2025-10-20T21:20:43.069860+00:00"
+}

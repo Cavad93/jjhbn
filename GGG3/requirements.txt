@@ -1,0 +1,26 @@
+# === Core runtime ===
+numpy
+pandas
+scipy
+scikit-learn
+requests
+urllib3
+python-dotenv
+web3
+river
+matplotlib
+cma
+
+# === ML models (используются экспертами/МЕТОЙ) ===
+xgboost
+lightgbm
+
+# === NN head (опционально; нужно, если используете nn/nn_auc_head.py) ===
+torch
+libauc
+
+# === Testing (опционально) ===
+pytest
+
+# === Совместимость (только для старых версий Python) ===
+backports.zoneinfo; python_version < "3.9"
