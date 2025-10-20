@@ -330,6 +330,7 @@ class MetaCEMMC:
         Инициализация META-стекинга
         """
         self.cfg = cfg
+        self.state_path = getattr(cfg, "meta_state_path", "meta_state.json")
         self.enabled = True
         self.mode = "SHADOW"  # Начинаем в shadow режиме для накопления данных
         self._last_phase = 0  # безопасная инициализация для статусов/логов
