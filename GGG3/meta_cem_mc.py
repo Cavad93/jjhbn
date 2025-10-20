@@ -800,15 +800,17 @@ class MetaCEMMC:
     # ========== ОБУЧЕНИЕ CEM/CMA-ES ==========
     def _phase_ready(self, ph: int) -> bool:
         """
-        Проверяет, готова ли фаза к обучению
+        Проверяет, готова ли фаза к обучению (читает из CSV)
         """
-        buf = self.buf_ph.get(ph, [])
+        X_list, y_list, _ = self._load_phase_buffer_from_disk(ph)
+        
         min_samples = int(getattr(self.cfg, "meta_min_train", 100))
-        if len(buf) < min_samples:
+        if len(X_list) < min_samples:
             return False
-        labels = [y for (_, y) in buf]
-        if len(set(labels)) < 2:
+        
+        if len(set(y_list)) < 2:
             return False
+        
         return True
 
     def _train_phase(self, ph: int) -> None:
