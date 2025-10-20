@@ -642,10 +642,11 @@ class MetaCEMMC:
 
 
             # ===== ШАГ 6: ЛЕНИВОЕ ОБУЧЕНИЕ =====
+            # ===== ШАГ 6: ЛЕНИВОЕ ОБУЧЕНИЕ =====
             if self._phase_ready(ph):
                 try:
                     self._train_phase(ph)
-                    self._clear_phase_storage(ph)
+                    self._trim_phase_storage(ph)
                     self.buf_ph[ph] = []
                     self._save()
                 except Exception as e:
@@ -1204,6 +1205,41 @@ class MetaCEMMC:
             except Exception:
                 from error_logger import log_exception
                 log_exception("Failed to remove file")
+
+
+    def _trim_phase_storage(self, ph: int):
+        """
+        Обрезает CSV файл фазы до phase_memory_cap последних записей
+        """
+        csv_path = self._phase_csv_paths.get(ph)
+        if not csv_path or not os.path.isfile(csv_path):
+            return
+        
+        try:
+            max_cap = int(getattr(self.cfg, "phase_memory_cap", 3000))
+            
+            # Читаем все строки
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                rows = list(reader)
+            
+            # Если меньше лимита - ничего не делаем
+            if len(rows) <= max_cap:
+                return
+            
+            # Оставляем последние max_cap записей
+            rows = rows[-max_cap:]
+            
+            # Перезаписываем файл
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if header:
+                    writer.writerow(header)
+                writer.writerows(rows)
+        except Exception:
+            from error_logger import log_exception
+            log_exception("Unhandled exception")
 
     def _save_throttled(self):
         """
