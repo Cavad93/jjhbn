@@ -740,24 +740,19 @@ class MetaCEMMC:
             "oof_samples": oof_valid
         }
 
-    def _bootstrap_ci(
-        self,
-        preds: np.ndarray,
-        labels: np.ndarray,
-        n_bootstrap: int,
-        confidence: float
-    ) -> Tuple[float, float]:
-        """
-        Вычисляет bootstrap доверительные интервалы для accuracy
-        """
+    def _bootstrap_ci(self, preds: np.ndarray, labels: np.ndarray, n_bootstrap: int, confidence: float) -> Tuple[float, float]:
+        """Вычисляет bootstrap доверительные интервалы для accuracy"""
+        # FIX: проверка пустых данных
+        if len(preds) == 0 or len(labels) == 0:
+            return 0.0, 0.0
+        
         accuracies = []
         n = len(preds)
         for _ in range(n_bootstrap):
             idx = np.random.choice(n, size=n, replace=True)
-            boot_preds  = preds[idx]
-            boot_labels = labels[idx]
-            boot_acc = 100.0 * np.mean((boot_preds >= 0.5) == boot_labels)
+            boot_acc = 100.0 * np.mean((preds[idx] >= 0.5) == labels[idx])
             accuracies.append(boot_acc)
+        
         accuracies = np.array(accuracies)
         alpha = 1.0 - confidence
         ci_lower = np.percentile(accuracies, 100 * alpha / 2)
@@ -816,27 +811,24 @@ class MetaCEMMC:
         return True
 
     def _train_phase(self, ph: int) -> None:
-        """
-        Обучает модель для конкретной фазы через CEM или CMA-ES
-        """
+        """Обучает модель для конкретной фазы через CEM или CMA-ES"""
         X_list, y_list, sample_weights = self._load_phase_buffer_from_disk(ph)
         if len(X_list) < int(getattr(self.cfg, "meta_min_train", 100)):
             return
-
+        
         X = np.array(X_list, dtype=float)
         y = np.array(y_list, dtype=float)
         sample_weights = np.array(sample_weights, dtype=float)
-
-        # нормировка весов
-        sample_weights = sample_weights * len(sample_weights) / (sample_weights.sum() + 1e-12)
-
-        use_cma = getattr(self.cfg, "meta_use_cma_es", False) and HAVE_CMA
-        if use_cma:
-            w_best = self._train_cma_es(X, y, ph, sample_weights=sample_weights)
+        
+        # FIX: защита от деления на ноль
+        weights_sum = sample_weights.sum()
+        if weights_sum > 1e-12:
+            sample_weights = sample_weights * len(sample_weights) / weights_sum
         else:
-            # фикс сигнатуры: поддерживаем sample_weights и здесь
-            w_best = self._train_cem(X, y, sample_weights=sample_weights)
-
+            sample_weights = np.ones_like(sample_weights)
+        
+        use_cma = getattr(self.cfg, "meta_use_cma_es", False) and HAVE_CMA
+        w_best = self._train_cma_es(X, y, ph, sample_weights=sample_weights) if use_cma else self._train_cem(X, y, sample_weights=sample_weights)
         self.w_meta_ph[ph] = w_best
 
     def _train_cem(
@@ -988,102 +980,87 @@ class MetaCEMMC:
 
         return w_best
 
-    def _mc_eval(
-        self,
-        w: np.ndarray,
-        X: np.ndarray,
-        y: np.ndarray,
-        n_bootstrap: int = 20,
-        sample_weights: Optional[np.ndarray] = None
-    ) -> float:
-        """
-        Монте-Карло оценка качества весов через взвешенный bootstrap
-        """
+    def _mc_eval(self, w: np.ndarray, X: np.ndarray, y: np.ndarray, n_bootstrap: int = 20, sample_weights: Optional[np.ndarray] = None) -> float:
+        """Монте-Карло оценка качества весов через взвешенный bootstrap"""
         n = len(X)
-        losses = []
-        l2_reg = float(getattr(self.cfg, "meta_l2", 0.001))
+        if n == 0:  # FIX: ранний выход
+            return float('inf')
+        
         if sample_weights is None:
             sample_weights = np.ones(n)
-        probs = sample_weights / (sample_weights.sum() + 1e-12)
-
+        
+        # FIX: защита от нулевой суммы
+        weights_sum = sample_weights.sum()
+        probs = (sample_weights / weights_sum) if weights_sum > 1e-12 else (np.ones(n) / n)
+        
+        losses = []
+        l2_reg = float(getattr(self.cfg, "meta_l2", 0.001))
+        
         for _ in range(n_bootstrap):
             idx = np.random.choice(n, size=n, replace=True, p=probs)
-            Xb = X[idx]
-            yb = y[idx]
-            weights_b = sample_weights[idx]
+            Xb, yb, weights_b = X[idx], y[idx], sample_weights[idx]
             
-            z = Xb @ w
-            z = np.clip(z, -60, 60)
-            p = 1.0 / (1.0 + np.exp(-z))
-            p = np.clip(p, 1e-6, 1 - 1e-6)
+            z = np.clip(Xb @ w, -60, 60)
+            p = np.clip(1.0 / (1.0 + np.exp(-z)), 1e-6, 1 - 1e-6)
             
             sample_losses = -(yb * np.log(p) + (1 - yb) * np.log(1 - p))
-            weighted_loss = np.sum(sample_losses * weights_b) / (weights_b.sum() + 1e-12)
-            reg = l2_reg * np.sum(w**2)
-            losses.append(weighted_loss + reg)
-
+            
+            # FIX: безопасное взвешивание
+            wb_sum = weights_b.sum()
+            weighted_loss = (np.sum(sample_losses * weights_b) / wb_sum) if wb_sum > 1e-12 else np.mean(sample_losses)
+            
+            losses.append(weighted_loss + l2_reg * np.sum(w**2))
+        
         return float(np.mean(losses))
 
     # ========== ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ С УЧЕТОМ CV ==========
     def _maybe_flip_modes(self):
-        """
-        Переключение режимов SHADOW ↔ ACTIVE с учетом CV метрик
-        """
+        """Переключение режимов SHADOW ↔ ACTIVE с учетом CV метрик"""
         def wr(arr: List[int], n: int) -> Optional[float]:
             if len(arr) < n:
                 return None
-            window = arr[-n:]
-            return 100.0 * (sum(window) / float(len(window)))
-
+            return 100.0 * sum(arr[-n:]) / n
+        
         try:
             enter_wr = float(getattr(self.cfg, "meta_enter_wr", 58.0))
-            exit_wr  = float(getattr(self.cfg, "meta_exit_wr", 52.0))
+            exit_wr = float(getattr(self.cfg, "meta_exit_wr", 52.0))
             min_ready = int(getattr(self.cfg, "meta_min_ready", 100))
             cv_enabled = bool(getattr(self.cfg, "cv_enabled", True))
         except Exception:
-            enter_wr, exit_wr, min_ready = 58.0, 52.0, 100
-            cv_enabled = True
-
+            enter_wr, exit_wr, min_ready, cv_enabled = 58.0, 52.0, 100, True
+        
         wr_shadow = wr(self.shadow_hits, min_ready)
         wr_active = wr(self.active_hits, max(30, min_ready // 2))
         
-        # Получаем текущую фазу с валидацией диапазона
-        ph = getattr(self, "_last_phase", 0)
-        ph = max(0, min(ph, self.P - 1))
-
+        # FIX: валидация границ фазы
+        ph = max(0, min(getattr(self, "_last_phase", 0), self.P - 1))
+        
         # SHADOW → ACTIVE
-        if self.mode == "SHADOW" and wr_shadow is not None:
-            basic_threshold_met = wr_shadow >= enter_wr
+        if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= enter_wr:
             if cv_enabled:
                 cv_metrics = self.cv_metrics.get(ph, {})
                 cv_passed = self.validation_passed.get(ph, False)
-                if basic_threshold_met and cv_passed:
+                if cv_passed:
                     cv_wr = cv_metrics.get("oof_accuracy", 0.0)
                     ci_lower = cv_metrics.get("ci_lower", 0.0)
                     min_improvement = float(getattr(self.cfg, "cv_min_improvement", 2.0))
                     if cv_wr >= enter_wr and ci_lower >= (enter_wr - min_improvement):
                         self.mode = "ACTIVE"
-                        print(f"[MetaCEMMC] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}%, "
-                            f"CV_WR={cv_wr:.2f}% (CI: [{ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
+                        print(f"[MetaCEMMC] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}%, CV_WR={cv_wr:.2f}% (CI: [{ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
             else:
-                if basic_threshold_met:
-                    self.mode = "ACTIVE"
-                    print(f"[MetaCEMMC] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}% (CV disabled)")
-
+                self.mode = "ACTIVE"
+                print(f"[MetaCEMMC] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}% (CV disabled)")
+        
         # ACTIVE → SHADOW
         if self.mode == "ACTIVE" and wr_active is not None:
-            basic_threshold_failed = wr_active < exit_wr
-            cv_degraded = False
-            if cv_enabled:
-                cv_metrics = self.cv_metrics.get(ph, {})
-                cv_wr = cv_metrics.get("oof_accuracy", 100.0)
-                cv_degraded = cv_wr < exit_wr
-
-            if basic_threshold_failed or cv_degraded:
+            basic_failed = wr_active < exit_wr
+            cv_degraded = cv_enabled and self.cv_metrics.get(ph, {}).get("oof_accuracy", 100.0) < exit_wr
+            
+            if basic_failed or cv_degraded:
                 self.mode = "SHADOW"
                 if cv_enabled:
                     self.validation_passed[ph] = False
-                reason = "WR dropped" if basic_threshold_failed else "CV degraded"
+                reason = "WR dropped" if basic_failed else "CV degraded"
                 print(f"[MetaCEMMC] ACTIVE→SHADOW ph={ph}: {reason} (WR={wr_active:.2f}%)")
 
     # ========== СТАТУС И ДИАГНОСТИКА ==========
@@ -1258,8 +1235,9 @@ class MetaCEMMC:
     def _save(self):
         """Сохранение состояния META в JSON"""
         try:
+            # FIX: w_meta_ph это numpy array, используем enumerate
             st = {
-                "w_meta_ph": {int(k): v.tolist() for k, v in self.w_meta_ph.items()},
+                "w_meta_ph": [w.tolist() for w in self.w_meta_ph],
                 "mode": self.mode,
                 "shadow_hits": list(self.shadow_hits)[-2000:],
                 "active_hits": list(self.active_hits)[-2000:],
@@ -1283,23 +1261,34 @@ class MetaCEMMC:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 state = json.load(f)
+            
             self.mode = state.get("mode", "SHADOW")
-            w_list = state.get("w_meta_ph")
-            if w_list:
-                loaded_w = np.array(w_list, dtype=float)
-                if loaded_w.shape[1] != self.D:
-                    old_D = loaded_w.shape[1]
-                    new_w = np.zeros((self.P, self.D), dtype=float)
-                    new_w[:, :old_D] = loaded_w
-                    self.w_meta_ph = new_w
-                    print(f"[MetaCEMMC] Expanded weights from {old_D}D to {self.D}D")
+            
+            # FIX: правильная обработка list/dict
+            w_data = state.get("w_meta_ph")
+            if w_data:
+                if isinstance(w_data, list):
+                    loaded_w = np.array(w_data, dtype=float)
+                elif isinstance(w_data, dict):
+                    loaded_w = np.array([w_data.get(str(i), np.zeros(self.D)) for i in range(self.P)], dtype=float)
                 else:
-                    self.w_meta_ph = loaded_w
+                    loaded_w = None
+                
+                if loaded_w is not None and loaded_w.shape[0] == self.P:
+                    if loaded_w.shape[1] != self.D:
+                        old_D = loaded_w.shape[1]
+                        new_w = np.zeros((self.P, self.D), dtype=float)
+                        min_D = min(old_D, self.D)
+                        new_w[:, :min_D] = loaded_w[:, :min_D]
+                        self.w_meta_ph = new_w
+                        print(f"[MetaCEMMC] Expanded weights {old_D}D → {self.D}D")
+                    else:
+                        self.w_meta_ph = loaded_w
             
             self.shadow_hits = state.get("shadow_hits", [])
             self.active_hits = state.get("active_hits", [])
-
-            # НОРМАЛИЗАЦИЯ seen_ph
+            
+            # Нормализация словарей (как было)
             sp = state.get("seen_ph", {p: 0 for p in range(self.P)})
             if isinstance(sp, list):
                 sp = {i: int(v) for i, v in enumerate(sp)}
@@ -1308,8 +1297,7 @@ class MetaCEMMC:
             for p in range(self.P):
                 sp.setdefault(p, 0)
             self.seen_ph = sp
-
-            # НОРМАЛИЗАЦИЯ cv_metrics
+            
             cm = state.get("cv_metrics", {p: {} for p in range(self.P)})
             if isinstance(cm, list):
                 cm = {i: v for i, v in enumerate(cm)}
@@ -1318,8 +1306,7 @@ class MetaCEMMC:
             for p in range(self.P):
                 cm.setdefault(p, {})
             self.cv_metrics = cm
-
-            # НОРМАЛИЗАЦИЯ validation_passed
+            
             vp = state.get("validation_passed", {p: False for p in range(self.P)})
             if isinstance(vp, list):
                 vp = {i: bool(v) for i, v in enumerate(vp)}
@@ -1328,8 +1315,7 @@ class MetaCEMMC:
             for p in range(self.P):
                 vp.setdefault(p, False)
             self.validation_passed = vp
-
-            # НОРМАЛИЗАЦИЯ cv_last_check
+            
             clc = state.get("cv_last_check", {p: 0 for p in range(self.P)})
             if isinstance(clc, list):
                 clc = {i: int(v) for i, v in enumerate(clc)}
@@ -1339,10 +1325,9 @@ class MetaCEMMC:
                 clc.setdefault(p, 0)
             self.cv_last_check = clc
             
-            # ВОССТАНОВЛЕНИЕ _last_phase
-            self._last_phase = int(state.get("_last_phase", 0))
+            # FIX: валидация границ
+            self._last_phase = max(0, min(int(state.get("_last_phase", 0)), self.P - 1))
             
-            # ВОССТАНОВЛЕНИЕ phase_csv_paths
             saved_paths = state.get("phase_csv_paths", {})
             if saved_paths:
                 self._phase_csv_paths = {int(k): str(v) for k, v in saved_paths.items()}
@@ -1351,40 +1336,29 @@ class MetaCEMMC:
             from error_logger import log_exception
             log_exception("Unhandled exception")
 
-
-    def _emit_report(
-        self,
-        ph: Optional[int],
-        algo: Optional[str] = None,
-        iters=None,
-        best=None,
-        median=None,
-        sigma=None
-    ):
-        """
-        Генерирует и отправляет отчет об обучении
-        """
-        if not HAVE_PLOTTING:
+    def _emit_report(self, ph: Optional[int], algo: Optional[str] = None, iters=None, best=None, median=None, sigma=None):
+        """Генерирует и отправляет отчет об обучении"""
+        if not HAVE_PLOTTING or plot_cma_like is None:
             return
         try:
-            fig = plot_cma_like(
+            # FIX: используем phase/algo вместо title
+            fig_path = plot_cma_like(
                 iters=iters,
                 best=best,
                 median=median,
                 sigma=sigma,
-                title=f"META {algo} Training - Phase {ph}"
+                phase=ph,
+                algo=algo or "CMA-ES"
             )
-            tmp_path = f"/tmp/meta_train_ph{ph}.png"
-            fig.savefig(tmp_path, dpi=100, bbox_inches='tight')
-            plt.close(fig)
-            if send_telegram_photo:
-                send_telegram_photo(tmp_path, caption=f"META training completed for phase {ph}")
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                log_exception(f"MetaCEMMC: failed to remove {tmp_path}")
+            
+            if send_telegram_photo and os.path.isfile(fig_path):
+                send_telegram_photo(fig_path, caption=f"META {algo} phase {ph}")
+                try:
+                    os.remove(fig_path)
+                except Exception:
+                    pass
         except Exception as e:
-            print(f"[MetaCEMMC] Report generation failed: {e.__class__.__name__}: {e}")
+            print(f"[MetaCEMMC] Report failed: {e.__class__.__name__}: {e}")
 
 # ========== ЭКСПОРТ ==========
 
