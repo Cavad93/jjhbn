@@ -4,8 +4,8 @@ import csv, math, time, statistics as st
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 
-from calib.selector import brier as _brier_ext, nll as _nll_ext, ece as _ece_ext
-from metrics.reliability import reliability_curve
+# ← ИСПРАВЛЕНИЕ 1: Добавлен импорт nll + brier
+from metrics.calibration import ece as _ece_ext, nll as _nll_ext, brier as _brier_ext, reliability_curve
 
 
 B = 1e9  # gwei scale
@@ -58,9 +58,9 @@ def _pct(x: float) -> str:
 def _fmt(x: float, nd: int = 6) -> str:
     return f"{x:.{nd}f}"
 
-def _brier(p: List[float], y: List[int]) -> Optional[float]:
-    if not p or not y or len(p) != len(y): return None
-    return sum((pi - yi)**2 for pi, yi in zip(p, y)) / len(p)
+# ← ИСПРАВЛЕНИЕ 2: Удалена локальная _brier (используем импортированную)
+# def _brier(p: List[float], y: List[int]) -> Optional[float]:
+#     ...
 
 def _roi_from_capitals(cap_before: float, cap_after: float) -> Optional[float]:
     if cap_before and cap_after and cap_before > 0:
@@ -71,7 +71,7 @@ def _roi_from_capitals(cap_before: float, cap_after: float) -> Optional[float]:
 def read_trades(csv_path: str) -> List[Dict[str, Any]]:
     rows = []
     try:
-        # utf-8-sig удаляет BOM у первого заголовка (в твоём файле это \ufeffsettled_ts)
+        # utf-8-sig удаляет BOM у первого заголовка
         with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
             r = csv.DictReader(f)
             for row in r:
@@ -177,15 +177,31 @@ def compute_24h_metrics(csv_path: str, now_utc: Optional[int] = None) -> Dict[st
             worst = (pnl_n, r)
 
     wr = wins / n if n else 0.0
-    ev_brier = _brier(probs_used, labels)
+    
+    # ← ИСПРАВЛЕНИЕ 3: Используем импортированную _brier_ext + конвертация в numpy
+    ev_brier = None
+    if probs_used and labels and len(probs_used) == len(labels):
+        try:
+            import numpy as np
+            ev_brier = float(_brier_ext(np.array(labels), np.array(probs_used)))
+        except Exception:
+            # Fallback на старую реализацию
+            ev_brier = sum((pi - yi)**2 for pi, yi in zip(probs_used, labels)) / len(probs_used)
 
-    # --- новые метрики калибровки ---
-    try:
-        ev_nll  = _nll_ext(labels, probs_used) if probs_used else None
-        ev_ece  = _ece_ext(labels, probs_used, n_bins=15) if probs_used else None
-        conf, acc = reliability_curve(labels, probs_used, n_bins=15)
-    except Exception:
-        ev_nll, ev_ece, conf, acc = None, None, None, None
+    # ← ИСПРАВЛЕНИЕ 4: Полная проверка массивов + конвертация в numpy
+    ev_nll, ev_ece, conf, acc = None, None, None, None
+    if probs_used and labels and len(probs_used) == len(labels) and len(labels) >= 2:
+        try:
+            import numpy as np
+            labels_arr = np.array(labels)
+            probs_arr = np.array(probs_used)
+            
+            ev_nll = float(_nll_ext(labels_arr, probs_arr))
+            ev_ece = float(_ece_ext(labels_arr, probs_arr, n_bins=15))
+            conf, acc = reliability_curve(labels_arr, probs_arr, n_bins=15)
+        except Exception as e:
+            # Если что-то пошло не так - просто пропускаем метрики
+            ev_nll, ev_ece, conf, acc = None, None, None, None
 
     # ROI по капиталу если есть
     roi_cap = None
@@ -288,8 +304,8 @@ def compute_24h_metrics(csv_path: str, now_utc: Optional[int] = None) -> Dict[st
         "stake_med": stake_med,
         "p_thr_med": p_thr_med,
         "ev_brier": ev_brier,
-        "ev_nll": float(ev_nll) if ev_nll is not None else None,
-        "ev_ece": float(ev_ece) if ev_ece is not None else None,
+        "ev_nll": ev_nll,
+        "ev_ece": ev_ece,
         "reliability_bins": (
             {"confidence": list(map(float, conf)), "accuracy": list(map(float, acc))}
             if (conf is not None and acc is not None) else None
