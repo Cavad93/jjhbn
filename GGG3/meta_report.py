@@ -6,7 +6,7 @@ from typing import Optional, Sequence
 import numpy as np
 
 import matplotlib
-matplotlib.use("Agg")  # headless
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 def plot_cma_like(
@@ -20,25 +20,37 @@ def plot_cma_like(
 ) -> str:
     iters = np.asarray(iters)
     best = np.asarray(best, dtype=float)
+    
     title = f"{algo}: фаза {phase} — сходимость"
     fig, ax1 = plt.subplots(figsize=(9, 5))
     l1, = ax1.semilogy(iters, np.clip(best, 1e-12, None), linewidth=2, label="Лучшая пригодность (log)")
     lines, labels = [l1], [l1.get_label()]
+    
     if median is not None:
         med = np.asarray(median, dtype=float)
-        l2, = ax1.semilogy(iters, np.clip(med, 1e-12, None), linewidth=1.6, linestyle="--", label="Медианная пригодность (log)")
-        lines.append(l2); labels.append(l2.get_label())
+        if len(med) != len(iters):
+            print(f"[warning] median length {len(med)} != iters length {len(iters)}, skipping")
+        else:
+            l2, = ax1.semilogy(iters, np.clip(med, 1e-12, None), linewidth=1.6, linestyle="--", label="Медианная пригодность (log)")
+            lines.append(l2)
+            labels.append(l2.get_label())
+    
     ax1.set_xlabel("Итерация")
     ax1.set_ylabel("Loss (лог. шкала)")
     ax1.grid(True, which="both", alpha=0.3)
 
     if sigma is not None:
-        ax2 = ax1.twinx()
-        l3, = ax2.plot(iters, sigma, linewidth=1.6, label="Шаг σ")
-        ax2.set_ylabel("Шаг σ")
-        lines.append(l3); labels.append(l3.get_label())
+        sig = np.asarray(sigma, dtype=float)
+        if len(sig) != len(iters):
+            print(f"[warning] sigma length {len(sig)} != iters length {len(iters)}, skipping")
+        else:
+            ax2 = ax1.twinx()
+            l3, = ax2.plot(iters, sig, linewidth=1.6, label="Шаг σ")
+            ax2.set_ylabel("Шаг σ")
+            lines.append(l3)
+            labels.append(l3.get_label())
 
-    ax1.legend(lines, labels, loc="upper right")
+    ax1.legend(lines, labels, loc="upper right", framealpha=0.9)
     plt.title(title)
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{algo.lower()}_phase{phase}_{int(time.time())}.png")
@@ -53,6 +65,11 @@ def send_telegram_photo(token: str, chat_id: str, photo_path: str, caption: str)
     except Exception:
         print("[meta-report] requests не установлен — пропущена отправка в Telegram")
         return False
+    
+    if not os.path.exists(photo_path):
+        print(f"[meta-report] photo not found: {photo_path}")
+        return False
+    
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
     with open(photo_path, "rb") as f:
         files = {"photo": f}
