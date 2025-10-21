@@ -64,14 +64,6 @@ except Exception:
     send_telegram_photo = None
     send_telegram_text = None
 
-# LambdaMART эксперт (если доступен)
-try:
-    from models.lambdamart_expert import LambdaMARTExpert as _LMCore
-    _HAVE_LAMBDAMART = True
-except Exception:
-    _LMCore = None
-    _HAVE_LAMBDAMART = False
-
 # Безопасное сохранение JSON с атомарной заменой
 try:
     from state_safety import atomic_save_json
@@ -124,177 +116,6 @@ def _entropy4(p_list):
     hist, _ = np.histogram(vals, bins=10, range=(0.0, 1.0), density=True)
     hist = hist / (hist.sum() + 1e-12)
     return float(-(hist * np.log(hist + 1e-12)).sum())
-
-# === NEW: LambdaMART в роли второй МЕТА + блендер вероятностей ===
-class LambdaMARTMetaLite:
-    """
-    Обучает LGBMRanker на φ-признаках мета-уровня и отдаёт «сырую» вероятность через сигмоиду.
-    Буферизует данные и периодически переобучается.
-    """
-    def __init__(self, retrain_every: int = 80, min_ready: int = 160, max_buf: int = 10000):
-        self.enabled = bool(_HAVE_LAMBDAMART)
-        self.retrain_every = int(retrain_every)
-        self.min_ready = int(min_ready)
-        self.max_buf = int(max_buf)
-        self.params = dict(
-            n_estimators=400,
-            learning_rate=0.05,
-            max_depth=-1,
-            num_leaves=31,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            objective="lambdarank",
-            metric="ndcg"
-        )
-        self.model = None
-        self._X, self._y, self._g = [], [], []
-        self._last_fit_n = 0
-
-    def _phi(self, p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx=None):
-        """Расширенный вектор фичей с контекстом (18 элементов)"""
-        lzs = [_safe_logit(p) for p in [p_xgb, p_rf, p_arf, p_nn]]
-        lz_base = _safe_logit(p_base)
-        plist = [p for p in [p_xgb, p_rf, p_arf, p_nn] if p is not None]
-        disagree = float(np.std(plist)) if len(plist) > 1 else 0.0
-        ent = _entropy4([p_xgb, p_rf, p_arf, p_nn])
-
-        # Контекстные фичи
-        if reg_ctx is not None and isinstance(reg_ctx, dict):
-            trend_sign = float(reg_ctx.get("trend_sign", 0.0))
-            trend_abs = float(reg_ctx.get("trend_abs", 0.0))
-            vol_ratio = float(reg_ctx.get("vol_ratio", 1.0))
-            jump_flag = float(reg_ctx.get("jump_flag", 0.0))
-            ofi_sign = float(reg_ctx.get("ofi_sign", 0.0))
-            book_imb = float(reg_ctx.get("book_imb", 0.0))
-            basis_sign = float(reg_ctx.get("basis_sign", 0.0))
-            funding_sign = float(reg_ctx.get("funding_sign", 0.0))
-        else:
-            trend_sign = trend_abs = vol_ratio = jump_flag = 0.0
-            ofi_sign = book_imb = basis_sign = funding_sign = 0.0
-
-        # Взаимодействия
-        disagree_vol = disagree * vol_ratio
-        entropy_trend = ent * abs(trend_abs)
-
-        return np.array([
-            lzs[0], lzs[1], lzs[2], lzs[3], lz_base,  # 0-4: логиты
-            disagree, ent,                             # 5-6: агрегаты
-            trend_sign, trend_abs, vol_ratio, jump_flag,  # 7-10: контекст
-            ofi_sign, book_imb, basis_sign, funding_sign,  # 11-14: микроструктура
-            disagree_vol, entropy_trend,               # 15-16: взаимодействия
-            1.0                                        # 17: bias
-        ], dtype=float)
-
-    def _phase_group(self, reg_ctx):
-        try:
-            return int(phase_from_ctx(reg_ctx or {}))
-        except Exception:
-            return 0
-
-    def predict(self, p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx=None):
-        if not self.enabled or self.model is None:
-            return None
-        x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx).reshape(1, -1)
-        try:
-            s = float(self.model.predict(x)[0])
-            p = 1.0 / (1.0 + math.exp(-s))
-            return float(np.clip(p, 0.0, 1.0))
-        except Exception:
-            return None
-
-    def record_result(
-        self,
-        p_xgb,
-        p_rf,
-        p_arf,
-        p_nn,
-        p_base,
-        y_up,
-        reg_ctx=None,
-        used_in_live=False,
-        p_final_used=None,  # ← добавлено, может приходить из вызова, внутри не обязателен
-    ):
-        if not self.enabled:
-            return
-        try:
-            x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
-            g = self._phase_group(reg_ctx)
-
-            self._X.append(x)
-            self._y.append(int(y_up))
-            self._g.append(g)
-
-            if len(self._X) > self.max_buf:
-                drop = len(self._X) - self.max_buf
-                self._X = self._X[drop:]
-                self._y = self._y[drop:]
-                self._g = self._g[drop:]
-
-            if len(self._X) >= self.min_ready and (len(self._X) - self._last_fit_n) >= self.retrain_every:
-                X = np.vstack(self._X)
-                y = np.asarray(self._y, dtype=int)
-                g = np.asarray(self._g, dtype=int)
-
-                order = np.argsort(g)
-                X = X[order]
-                y = y[order]
-                g = g[order]
-
-                _, counts = np.unique(g, return_counts=True)
-                mdl = _LMCore(self.params) if _LMCore else None
-                if mdl is not None:
-                    mdl.fit(X, y, groups=counts.tolist())
-                    self.model = mdl.model
-                    self._last_fit_n = len(self._X)
-        except Exception as e:
-            print(f"[ens ] lmeta.record_result error: {e.__class__.__name__}: {e}\n{traceback.format_exc()}")
-
-    def status(self) -> str:
-        if not self.enabled:
-            return "LMETA[off]"
-        n = len(self._X)
-        ready = n >= self.min_ready
-        return f"LMETA[{'ON' if self.model is not None else 'boot'} n={n}, ready={ready}]"
-
-class ProbBlender:
-    """
-    Линейно смешивает две калиброванные вероятности p1 и p2.
-    Вес подбирается по NLL или Brier на скользящем окне.
-    """
-    def __init__(self, metric: str = "nll", window: int = 1200, step: float = 0.02):
-        self.metric = str(metric).lower()
-        self.win = int(window)
-        self.step = float(step)
-        self.hist = deque(maxlen=self.win)
-        self.w = 0.5
-
-    def mix(self, p1: float, p2: float) -> float:
-        w = float(self.w)
-        p = w * float(p1) + (1.0 - w) * float(p2)
-        return float(min(max(p, 0.0), 1.0))
-
-    def record(self, y: int, p1: float | None, p2: float | None) -> None:
-        if p1 is None or p2 is None:
-            return
-        self.hist.append((float(p1), float(p2), int(y)))
-        self._retune()
-
-    def _retune(self) -> None:
-        if len(self.hist) < 50:
-            return
-        arr = list(self.hist)
-        p1 = np.array([a for a,_,_ in arr], dtype=float)
-        p2 = np.array([b for _,b,_ in arr], dtype=float)
-        y  = np.array([c for _,_,c in arr], dtype=float)
-        best, best_w = 1e18, self.w
-        grid = np.arange(0.0, 1.0 + self.step/2, self.step)
-        for w in grid:
-            p = np.clip(w*p1 + (1.0 - w)*p2, 1e-6, 1.0 - 1e-6)
-            cur = (np.mean((p - y)**2) if self.metric == "brier"
-                   else -np.mean(y*np.log(p) + (1.0 - y)*np.log(1.0 - p)))
-            if cur < best:
-                best, best_w = cur, float(w)
-        self.w = best_w
 
 # ---- helpers ----
 _EPS = 1e-8
@@ -1336,12 +1157,19 @@ class MetaCEMMC:
             from error_logger import log_exception
             log_exception("Unhandled exception")
 
-    def _emit_report(self, ph: Optional[int], algo: Optional[str] = None, iters=None, best=None, median=None, sigma=None):
+    def _emit_report(
+        self,
+        ph: Optional[int],
+        algo: Optional[str] = None,
+        iters=None,
+        best=None,
+        median=None,
+        sigma=None
+    ):
         """Генерирует и отправляет отчет об обучении"""
         if not HAVE_PLOTTING or plot_cma_like is None:
             return
         try:
-            # FIX: используем phase/algo вместо title
             fig_path = plot_cma_like(
                 iters=iters,
                 best=best,
@@ -1352,7 +1180,10 @@ class MetaCEMMC:
             )
             
             if send_telegram_photo and os.path.isfile(fig_path):
-                send_telegram_photo(fig_path, caption=f"META {algo} phase {ph}")
+                token = getattr(self.cfg, 'tg_bot_token', '')
+                chat_id = getattr(self.cfg, 'tg_chat_id', '')
+                if token and chat_id:
+                    send_telegram_photo(token, chat_id, fig_path, caption=f"META {algo} phase {ph}")
                 try:
                     os.remove(fig_path)
                 except Exception:
@@ -1362,4 +1193,4 @@ class MetaCEMMC:
 
 # ========== ЭКСПОРТ ==========
 
-__all__ = ["MetaCEMMC", "LambdaMARTMetaLite", "ProbBlender"]
+__all__ = ["MetaCEMMC"]
