@@ -6,6 +6,12 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+try:
+    from error_logger import log_exception
+except ImportError:
+    def log_exception(msg: str):
+        pass
+
 BINANCE_FUT = "https://fapi.binance.com"
 
 class FuturesContext:
