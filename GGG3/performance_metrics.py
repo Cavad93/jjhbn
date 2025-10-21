@@ -15,9 +15,10 @@ performance_metrics.py — монитор реального брейк-ивен
 
 from __future__ import annotations
 import os, json, math, time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Optional, Deque, Dict, Any
 from collections import deque
+from error_logger import log_exception
 
 
 # t-критические значения для 97.5% (двусторонний 95% ДИ)
@@ -44,8 +45,7 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         if math.isfinite(v):
             return v
     except Exception:
-        from error_logger import log_exception
-        log_exception("Error in _tcrit_975")
+        log_exception("Error in _safe_float")
     return float(default)
 
 def _clip01(p: float) -> float:
@@ -202,9 +202,14 @@ class PerfMonitor:
         # средняя комиссия/газ (если fees_net=False учтём её в p_BE)
         c_avg = (sum(self.gas) / n) if (not self.fees_net and n > 0) else 0.0
 
-        # p_BE (защита от деления на 0)
+        # p_BE (защита от деления на 0 и отсутствия проигрышей)
         denom = Wbar + Lbar
-        p_be = (Lbar + c_avg) / denom if denom > 1e-12 else 1.0
+        if l_cnt == 0:
+            p_be = 0.0  # нет проигрышей → брейк-ивен равен 0
+        elif denom > 1e-12:
+            p_be = (Lbar + c_avg) / denom
+        else:
+            p_be = 1.0
 
         # rolling log-growth
         # лучший способ — через capital_before/after, но если нет, используем pnl/ capital_before
@@ -289,9 +294,9 @@ class PerfMonitor:
             lines.append(f"Fees(avg)={_fmt(m['c_avg'], 6)} (в ед. PnL)")
         # E[log(1+Δ)] и 95% ДИ
         if ("g_ci_low" in m) and ("g_ci_high" in m):
-            lines.append(f"ḡ={_fmt(m['g_rolling'], 6)} | CI95=[{_fmt(m['g_ci_low'], 6)}, {_fmt(m['g_ci_high'], 6)}]")
+            lines.append(f"ḡ={_fmt(m['g_rolling'], 6)} | CI95=[{_fmt(m['g_ci_low'], 6)}, {_fmt(m['g_ci_high'], 6)}]")
         else:
-            lines.append(f"ḡ={_fmt(m['g_rolling'], 6)}")
+            lines.append(f"ḡ={_fmt(m['g_rolling'], 6)}")
 
         # дельты (если есть прошлый отчёт)
         dparts = []
