@@ -16,10 +16,11 @@ from error_logger import log_exception
 
 def estimate_late_money_direction(pool, rd, our_side_up: bool) -> float:
     """
-    Оценивает долю поздних денег, которая пойдет на нашу сторону.
+    Анализирует последние N эпох из pool.obs для определения паттерна поздних денег.
+    Определяет идут ли поздние деньги за толпой или против неё.
     
     Args:
-        pool: PoolFeaturesCtx с историей снапшотов пулов
+        pool: PoolFeaturesCtx с историей снимков в pool.obs
         rd: RoundInfo текущего раунда
         our_side_up: True если ставим на UP
     
@@ -27,82 +28,91 @@ def estimate_late_money_direction(pool, rd, our_side_up: bool) -> float:
         0.0 = все против нас, 0.5 = нейтрально, 1.0 = все за нас
     """
     try:
-        # Проверка наличия атрибута
-        if not hasattr(pool, 'history') or not pool.history:
+        if not hasattr(pool, 'obs') or not pool.obs:
             return 0.5
         
-        # Получаем историю последних 30 раундов с "поздними деньгами"
-        history = []
-        for epoch_data in list(pool.history.values())[-30:]:
-            # Защита от разных структур
-            if not isinstance(epoch_data, dict):
-                continue
-            
-            snapshots = epoch_data.get("snapshots", [])
+        # Получаем последние 30 завершённых эпох (исключая текущую)
+        all_epochs = sorted(pool.obs.keys())
+        current_epoch = int(getattr(rd, 'epoch', 0))
+        recent_epochs = [e for e in all_epochs if e < current_epoch][-30:]
+        
+        if len(recent_epochs) < 10:
+            return 0.5
+        
+        patterns = []
+        
+        for epoch in recent_epochs:
+            snapshots = pool.obs[epoch]
             if len(snapshots) < 2:
                 continue
             
-            # Начальное и финальное состояние пула
+            # Первый и последний снимок: (ts, bull, bear)
             initial = snapshots[0]
             final = snapshots[-1]
             
-            bull_init = initial.get("bull", 0.0)
-            bear_init = initial.get("bear", 0.0)
-            bull_final = final.get("bull", 0.0)
-            bear_final = final.get("bear", 0.0)
+            ts_init, bull_init, bear_init = initial
+            ts_final, bull_final, bear_final = final
             
-            if (bull_init + bear_init) < 1e-6 or (bull_final + bear_final) < 1e-6:
+            total_init = bull_init + bear_init
+            total_final = bull_final + bear_final
+            
+            if total_init < 1e-6 or total_final < 1e-6:
                 continue
             
-            # Bias начальный и приток
-            pool_bias_init = bull_init / (bull_init + bear_init)
-            late_bull = max(0, bull_final - bull_init)
-            late_bear = max(0, bear_final - bear_init)
+            # Начальный bias (кто доминирует в начале)
+            bias_init = bull_init / total_init
             
-            if (late_bull + late_bear) < 1e-6:
+            # Приток денег за весь период
+            bull_flow = max(0, bull_final - bull_init)
+            bear_flow = max(0, bear_final - bear_init)
+            total_flow = bull_flow + bear_flow
+            
+            if total_flow < 1e-6:
                 continue
             
-            late_bias = late_bull / (late_bull + late_bear)
+            # Bias притока (куда идут новые деньги)
+            flow_bias = bull_flow / total_flow
             
-            history.append({
-                "pool_bias_init": pool_bias_init,
-                "late_bias": late_bias
+            patterns.append({
+                'bias_init': bias_init,
+                'flow_bias': flow_bias
             })
         
-        if len(history) < 10:  # недостаточно данных
+        if len(patterns) < 10:
             return 0.5
         
-        # Анализируем паттерн
-        follow_crowd_count = 0
+        # Анализ: поздние деньги идут за толпой или против?
+        follow_count = 0
         contrarian_count = 0
         
-        for h in history:
-            pb = h["pool_bias_init"]
-            lb = h["late_bias"]
+        for p in patterns:
+            bi = p['bias_init']
+            fb = p['flow_bias']
             
             # "Толпа за толпой" (оба смещены в одну сторону)
-            if (pb > 0.55 and lb > 0.55) or (pb < 0.45 and lb < 0.45):
-                follow_crowd_count += 1
-            # "Умные деньги" (поздние против толпы)
-            elif (pb > 0.55 and lb < 0.45) or (pb < 0.45 and lb > 0.55):
+            if (bi > 0.55 and fb > 0.55) or (bi < 0.45 and fb < 0.45):
+                follow_count += 1
+            # "Умные деньги против толпы" (поздние против начального смещения)
+            elif (bi > 0.55 and fb < 0.45) or (bi < 0.45 and fb > 0.55):
                 contrarian_count += 1
         
         # Текущий bias пула
         current_bull_bias = float(rd.bull_amount) / max(1e-9, float(rd.bull_amount + rd.bear_amount))
         
-        # Если доминирует "толпа за толпой"
-        if follow_crowd_count > contrarian_count * 1.5:
+        # Если доминирует "толпа за толпой" → поздние деньги пойдут туда же куда pool
+        if follow_count > contrarian_count * 1.5:
             return current_bull_bias if our_side_up else (1.0 - current_bull_bias)
         
-        # Если доминирует "умные деньги против толпы"
-        elif contrarian_count > follow_crowd_count * 1.5:
+        # Если доминирует "умные деньги" → поздние деньги пойдут против pool
+        elif contrarian_count > follow_count * 1.5:
             return (1.0 - current_bull_bias) if our_side_up else current_bull_bias
         
-        # Нейтрально
+        # Нейтрально (нет явного паттерна)
         return 0.5
         
     except Exception:
-        return 0.5  # fallback
+        log_exception("estimate_late_money_direction failed")
+        return 0.5
 
 
 def adaptive_quantile(csv_path: str, n: int = 100, max_epoch_exclusive: Optional[int] = None) -> float:
@@ -118,7 +128,6 @@ def adaptive_quantile(csv_path: str, n: int = 100, max_epoch_exclusive: Optional
         0.30 (консервативно) .. 0.50 (медиана)
     """
     try:
-        # Используем импорты из основного модуля
         from bnbusdrt6 import rolling_winrate_laplace, rolling_calib_error
         
         wr = rolling_winrate_laplace(csv_path, n=n, max_epoch_exclusive=max_epoch_exclusive)
@@ -170,7 +179,7 @@ def estimate_r_hat_improved(
     kl_df: pd.DataFrame,
     treasury_fee: float = 0.03,
     use_stress_r15: bool = True,
-    r2d = None  # ← ДОБАВЛЕНО: опциональный параметр для 2D-таблицы
+    r2d = None
 ) -> Tuple[float, str]:
     """
     Улучшенная оценка r̂ с приоритетом на IMPLIED из текущего пула.
@@ -189,7 +198,6 @@ def estimate_r_hat_improved(
     Returns:
         (r_hat, source_description)
     """
-    # Импорты из основного модуля
     from bnbusdrt6 import (
         implied_payout_ratio, r_ewma_by_side, r_tod_percentile,
         last3_ev_estimates
@@ -205,12 +213,12 @@ def estimate_r_hat_improved(
         r_base = r_implied
         source_parts.append(f"implied={r_implied:.3f}")
         
-        # ШАГ 2: Корректировка на "поздние деньги" (умнее!)
-        if use_stress_r15 and hasattr(pool, 'late_delta_quantile'):  # ← ДОБАВЛЕНА ПРОВЕРКА
+        # ШАГ 2: Корректировка на "поздние деньги"
+        if use_stress_r15 and hasattr(pool, 'late_delta_quantile'):
             try:
                 delta15 = float(pool.late_delta_quantile(q=0.5) or 0.0)
                 
-                # Оцениваем направление поздних денег
+                # Оцениваем направление поздних денег на основе истории
                 late_fraction = estimate_late_money_direction(pool, rd, bet_up)
                 
                 side_now = float(rd.bull_amount if bet_up else rd.bear_amount)
@@ -254,14 +262,14 @@ def estimate_r_hat_improved(
                     r_base *= vol_mult
                     source_parts.append(f"vol_penalty={vol_mult:.3f}")
         except Exception:
-            from error_logger import log_exception
-            log_exception("Unhandled exception")
+            log_exception("r_hat: volatility penalty calc failed")
         
-        r_final = float(max(1.01, r_base))  # минимум 1.01
+        # ВАЛИДАЦИЯ: ограничиваем разумным диапазоном
+        r_final = float(np.clip(r_base, 1.1, 5.0))
         source = " | ".join(source_parts)
         return r_final, f"improved({source})"
     
-    # FALLBACK: исторические методы (как раньше, но с адаптивным q)
+    # FALLBACK: исторические методы
     try:
         q = adaptive_quantile(csv_path, n=100, max_epoch_exclusive=epoch)
         
@@ -281,7 +289,8 @@ def estimate_r_hat_improved(
         )
         
         if r_hat and math.isfinite(r_hat) and r_hat > 1.0:
-            return float(r_hat), f"tod_q{int(q*100)}={r_hat:.3f}"
+            r_hat = float(np.clip(r_hat, 1.1, 5.0))
+            return r_hat, f"tod_q{int(q*100)}={r_hat:.3f}"
         
         # 2) EWMA
         r_hat = r_ewma_by_side(
@@ -292,9 +301,10 @@ def estimate_r_hat_improved(
         )
         
         if r_hat and math.isfinite(r_hat) and r_hat > 1.0:
-            return float(r_hat), f"ewma={r_hat:.3f}"
+            r_hat = float(np.clip(r_hat, 1.1, 5.0))
+            return r_hat, f"ewma={r_hat:.3f}"
         
-        # 3) 2D-таблица (если передана как параметр) ← ИСПРАВЛЕНО
+        # 3) 2D-таблица
         if r2d is not None:
             try:
                 r_hat = r2d.estimate(
@@ -303,25 +313,26 @@ def estimate_r_hat_improved(
                     csv_path=csv_path
                 )
                 if r_hat and math.isfinite(r_hat) and r_hat > 1.0:
-                    return float(r_hat), f"r2d={r_hat:.3f}"
+                    r_hat = float(np.clip(r_hat, 1.1, 5.0))
+                    return r_hat, f"r2d={r_hat:.3f}"
             except Exception:
-                from error_logger import log_exception
-                log_exception("Unhandled exception")
+                log_exception("r_hat: r2d estimation failed")
         
         # 4) Медиана последних 3
         r_med, _, _ = last3_ev_estimates(csv_path)
         if r_med and math.isfinite(r_med) and r_med > 1.0:
-            return float(r_med), f"last3_med={r_med:.3f}"
+            r_med = float(np.clip(r_med, 1.1, 5.0))
+            return r_med, f"last3_med={r_med:.3f}"
         
         # 5) IMPLIED как последний fallback
         r_imp = implied_payout_ratio(bet_up, rd, treasury_fee)
         if r_imp and math.isfinite(r_imp) and r_imp > 1.0:
-            return float(r_imp), f"implied_fallback={r_imp:.3f}"
+            r_imp = float(np.clip(r_imp, 1.1, 5.0))
+            return r_imp, f"implied_fallback={r_imp:.3f}"
         
     except Exception:
         log_exception("r_hat: all methods failed; using hardcoded fallback 1.90")
     
-    # Финальный fallback
     return 1.90, "hardcoded_fallback=1.90"
 
 
@@ -338,7 +349,6 @@ def analyze_r_hat_accuracy(csv_path: str, n: int = 200) -> Optional[Dict[str, fl
         або None если данных недостаточно
     """
     try:
-        # Импорт из основного модуля
         from bnbusdrt6 import _read_csv_df
         
         df = _read_csv_df(csv_path)
