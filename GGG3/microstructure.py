@@ -1,7 +1,6 @@
 # microstructure.py
 # -*- coding: utf-8 -*-
 import time
-import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -28,7 +27,7 @@ class MicrostructureClient:
         self.symbol = symbol.upper()
         self.prev_microprice: Optional[float] = None
 
-    def fetch_depth(self, limit: int = 5) -> Optional[DepthSnapshot]:
+    def fetch_depth(self, limit: int = 5, ts_ms: Optional[int] = None) -> Optional[DepthSnapshot]:
         try:
             r = self.s.get(f"{BINANCE_SPOT}/api/v3/depth",
                            params={"symbol": self.symbol, "limit": int(limit)},
@@ -41,7 +40,7 @@ class MicrostructureClient:
                 return None
             bid1, ask1 = bids[0][0], asks[0][0]
             return DepthSnapshot(
-                ts_ms=int(time.time()*1000),
+                ts_ms=ts_ms if ts_ms is not None else int(time.time()*1000),
                 bid1=bid1, ask1=ask1,
                 bids=bids, asks=asks
             )
@@ -109,6 +108,8 @@ class MicrostructureClient:
             s = 0.0
             vol = 0.0
             for t in trades:
+                if "q" not in t or "m" not in t:
+                    continue
                 qty = float(t["q"])
                 is_buyer_maker = bool(t["m"])
                 # m=True => buyer is maker => агрессивный продавец => знак -1
@@ -128,14 +129,15 @@ class MicrostructureClient:
         """
         out = dict(rel_spread=0.0, book_imb=0.0, microprice_delta=0.0,
                    ofi_5s=0.0, ofi_15s=0.0, ofi_30s=0.0, ob_slope=0.0, mid=0.0)
-        dp = self.fetch_depth(limit=5)
+        dp = self.fetch_depth(limit=5, ts_ms=end_ts_ms)
         if dp is None:
             return out
         mid = 0.5*(dp.bid1 + dp.ask1)
         out["mid"] = float(mid)
         out["rel_spread"] = self._rel_spread(dp.bid1, dp.ask1)
-        out["book_imbalance"] = self._book_imbalance(dp.bids, dp.asks)  # запасной ключ
-        out["book_imb"] = out["book_imbalance"]
+        book_imb_val = self._book_imbalance(dp.bids, dp.asks)
+        out["book_imbalance"] = book_imb_val
+        out["book_imb"] = book_imb_val
         bidv1 = dp.bids[0][1] if dp.bids else 0.0
         askv1 = dp.asks[0][1] if dp.asks else 0.0
         mp = self._microprice(dp.bid1, dp.ask1, bidv1, askv1)
