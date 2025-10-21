@@ -76,7 +76,6 @@ def _as_float(x, default=float("nan")):
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 from gating_no_r import compute_p_thr_no_r
-from no_r_auto import pick_no_r_mode
 from delta_daily import DeltaDaily
 
 from proj_scenarios import try_send_projection
