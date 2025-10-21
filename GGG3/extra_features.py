@@ -59,10 +59,12 @@ def kyle_lambda(df: pd.DataFrame, win: int = 20) -> float:
     if len(df) < win+1:
         return 0.0
     sub = df.iloc[-(win+1):].copy()
-    dp = (sub["close"] - sub["close"].shift(1)).abs().dropna()
-    v = sub["volume"].iloc[1:len(sub)].values
-    x = v.astype(float)
-    y = dp.values.astype(float)
+    sub["dp"] = (sub["close"] - sub["close"].shift(1)).abs()
+    sub = sub[["dp", "volume"]].dropna()
+    if len(sub) < 2:
+        return 0.0
+    x = sub["volume"].values.astype(float)
+    y = sub["dp"].values.astype(float)
     vx = np.var(x)
     if vx <= 0:
         return 0.0
@@ -93,7 +95,9 @@ def idio_features(bnb_df: pd.DataFrame, btc_df: Optional[pd.DataFrame], eth_df: 
     Возвращаем resid_ret_1m, beta_sum и Δbeta_sum за 60 мин.
     """
     out = dict(resid_ret_1m=0.0, beta_sum=0.0, beta_sum_d60=0.0)
-    if bnb_df is None or bnb_df.empty or btc_df is None or btc_df.empty or eth_df is None or eth_df.empty:
+    if (bnb_df is None or bnb_df.empty or "close" not in bnb_df.columns or
+        btc_df is None or btc_df.empty or "close" not in btc_df.columns or
+        eth_df is None or eth_df.empty or "close" not in eth_df.columns):
         return out
     # синхронизация индексов
     df = pd.DataFrame({
@@ -155,6 +159,6 @@ class GasHistory:
         return out
 
 def pack_vector(feat_dicts: Dict[str, float], names: Optional[list] = None) -> Tuple[np.ndarray, list]:
-    keys = names if names is not None else list(feat_dicts.keys())
+    keys = names if names is not None else sorted(feat_dicts.keys())
     vals = [float(feat_dicts.get(k, 0.0)) for k in keys]
     return np.array(vals, dtype=float), keys
