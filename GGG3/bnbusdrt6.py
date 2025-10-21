@@ -422,7 +422,7 @@ from meta_ctx import build_regime_ctx, pack_ctx
 from collections import deque
 from calib.selector import CalibratorSelector  # <— наш селектор калибратора
 
-from meta_cem_mc import MetaCEMMC, LambdaMARTMetaLite, ProbBlender  # ← NEW
+from meta_cem_mc import MetaCEMMC
 
 # УБИРАЕМ ДУБЛИРУЮЩИЕ ИМПОРТЫ - они уже есть в начале!
 # import numpy as np        # ← УБРАТЬ
@@ -6057,16 +6057,6 @@ def main_loop():
         except Exception:
             log_exception("Unhandled exception")
 
-    # Оставляем только первый калибратор для упрощения
-    _CALIB_MGR2 = None
-    _LM_META = None
-    _BLENDER = None
-    
-    # Сохраняем в globals для совместимости
-    globals()["_CALIB_MGR2"] = None
-    globals()["_LM_META"] = None
-    globals()["_BLENDER"] = None
-
 
     import atexit, signal, sys
 
@@ -8179,3 +8169,5 @@ if __name__ == "__main__":
         except Exception:
             log_exception("Failed to send Telegram notification")
         raise
+
+
