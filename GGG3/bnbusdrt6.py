@@ -7363,6 +7363,7 @@ def main_loop():
                                     log_exception("Unhandled exception")
                             
                             # Конвертируем feats в dict (если это pandas Series)
+                            # Конвертируем feats в dict (если это pandas Series)
                             feats_dict = {}
                             try:
                                 if hasattr(feats, 'to_dict'):
@@ -7373,7 +7374,73 @@ def main_loop():
                                     feats_dict = dict(feats)
                             except Exception:
                                 feats_dict = {}
-                            
+
+                            # Вычисляем все недостающие индикаторы для объяснений
+                            try:
+                                if kl_df is not None and len(kl_df) > 0:
+                                    # 1. RSI (реальное значение, не нормализованное)
+                                    from ta_utils import rsi
+                                    rsi_series = rsi(kl_df["close"], 14).fillna(50.0)
+                                    feats_dict["rsi"] = float(rsi_series.iloc[-1])
+                                    
+                                    # 2. Momentum 1h (процентное изменение за последний час)
+                                    if len(kl_df) >= 60:
+                                        close_now = float(kl_df["close"].iloc[-1])
+                                        close_1h_ago = float(kl_df["close"].iloc[-60])
+                                        feats_dict["momentum_1h"] = (close_now - close_1h_ago) / close_1h_ago
+                                    else:
+                                        feats_dict["momentum_1h"] = 0.0
+                                    
+                                    # 3. ATR normalized (уже есть в feats как atr и atr_sma)
+                                    if "atr" in feats_dict and "atr_sma" in feats_dict:
+                                        atr_val = feats_dict.get("atr", 0)
+                                        atr_sma_val = feats_dict.get("atr_sma", 1)
+                                        if isinstance(atr_val, pd.Series):
+                                            atr_val = float(atr_val.iloc[-1]) if len(atr_val) > 0 else 0.0
+                                        if isinstance(atr_sma_val, pd.Series):
+                                            atr_sma_val = float(atr_sma_val.iloc[-1]) if len(atr_sma_val) > 0 else 1.0
+                                        feats_dict["atr_norm"] = float(atr_val / (atr_sma_val + 1e-12))
+                                    else:
+                                        feats_dict["atr_norm"] = 0.0
+                                    
+                                    # 4. BB Position (позиция цены в Bollinger Bands)
+                                    from ta_utils import sma, stdev
+                                    bb_basis = sma(kl_df["close"], BB_LEN)
+                                    bb_dev = stdev(kl_df["close"], BB_LEN)
+                                    bb_upper = bb_basis + 2.0 * bb_dev
+                                    bb_lower = bb_basis - 2.0 * bb_dev
+                                    close_now = float(kl_df["close"].iloc[-1])
+                                    bb_u = float(bb_upper.iloc[-1])
+                                    bb_l = float(bb_lower.iloc[-1])
+                                    if bb_u > bb_l:
+                                        feats_dict["bb_position"] = (close_now - bb_l) / (bb_u - bb_l)
+                                    else:
+                                        feats_dict["bb_position"] = 0.5
+                                    
+                                    # 5. Volume Ratio (текущий объем относительно среднего)
+                                    vol_usd = kl_df["volume"] * kl_df["close"]
+                                    vol_mean = sma(vol_usd, VOL_LEN)
+                                    vol_now = float(vol_usd.iloc[-1])
+                                    vol_avg = float(vol_mean.iloc[-1])
+                                    if vol_avg > 0:
+                                        feats_dict["volume_ratio"] = vol_now / vol_avg
+                                    else:
+                                        feats_dict["volume_ratio"] = 1.0
+                                else:
+                                    # Fallback к дефолтным значениям, если нет данных
+                                    feats_dict["rsi"] = 50.0
+                                    feats_dict["momentum_1h"] = 0.0
+                                    feats_dict["atr_norm"] = 0.0
+                                    feats_dict["bb_position"] = 0.5
+                                    feats_dict["volume_ratio"] = 1.0
+                            except Exception as e:
+                                print(f"[explainer] Feature calculation failed: {e}")
+                                feats_dict.setdefault("rsi", 50.0)
+                                feats_dict.setdefault("momentum_1h", 0.0)
+                                feats_dict.setdefault("atr_norm", 0.0)
+                                feats_dict.setdefault("bb_position", 0.5)
+                                feats_dict.setdefault("volume_ratio", 1.0)
+
                             explanation = create_explanation_for_bet(
                                 p_final=float(p_final) if p_final is not None else float(p_side),
                                 p_xgb=float(p_xgb) if p_xgb is not None else None,
