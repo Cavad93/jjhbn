@@ -3474,25 +3474,6 @@ class XGBExpert(_BaseExpert):
         cv_wr = cv_metrics.get("oof_accuracy", 0.0)
         cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
         
-        # НОВОЕ: Отправляем метрики в визуализатор
-        try:
-            from training_visualizer import get_visualizer
-            viz = get_visualizer()
-            
-            expert_name = "XGB"
-            
-            viz.record_expert_metrics(
-                expert_name=expert_name,
-                accuracy=wr_all if wr_all is not None else 0.0,
-                n_samples=len(all_hits),
-                cv_accuracy=cv_wr / 100.0 if cv_wr > 0 else None,
-                cv_ci_lower=cv_metrics.get('ci_lower') if cv_status == "ok" else None,
-                cv_ci_upper=cv_metrics.get('ci_upper') if cv_status == "ok" else None,
-                mode=self.mode
-            )
-        except Exception:
-            log_exception("Unhandled exception")
-        
         return {
             "mode": self.mode,
             "enabled": self.enabled,
@@ -3506,6 +3487,39 @@ class XGBExpert(_BaseExpert):
             "cv_ci": cv_ci,
             "cv_validated": str(self.validation_passed.get(ph, False))
         }
+
+            # ===== ВИЗУАЛИЗАЦИЯ: Записываем метрики после обучения =====
+            try:
+                from training_visualizer import get_visualizer
+                viz = get_visualizer()
+        
+                def _wr(xs):
+                    if not xs: return None
+                    return sum(xs) / float(len(xs))
+        
+                wr_a = _wr(self.active_hits)
+                wr_s = _wr(self.shadow_hits)
+                all_hits = (self.active_hits or []) + (self.shadow_hits or [])
+                wr_all = _wr(all_hits)
+        
+                cv_metrics = self.cv_metrics.get(ph, {})
+                cv_status = cv_metrics.get("status", "N/A")
+                cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+        
+                viz.record_expert_metrics(
+                    expert_name="XGB",
+                    accuracy=wr_all if wr_all is not None else 0.0,
+                    n_samples=len(all_hits),
+                    cv_accuracy=cv_wr / 100.0 if cv_wr > 0 else None,
+                    cv_ci_lower=cv_metrics.get('ci_lower') if cv_status == "ok" else None,
+                    cv_ci_upper=cv_metrics.get('ci_upper') if cv_status == "ok" else None,
+                    mode=self.mode
+                )
+                print(f"[XGB] Phase {ph} metrics recorded to visualizer")
+            except Exception as e:
+                print(f"[XGB] Visualizer recording failed: {e}")
+                import traceback
+                traceback.print_exc()
 
 
 
@@ -4309,25 +4323,6 @@ class RFCalibratedExpert(_BaseExpert):
         cv_wr = cv_metrics.get("oof_accuracy", 0.0)
         cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
         
-        # НОВОЕ: Отправляем метрики в визуализатор
-        try:
-            from training_visualizer import get_visualizer
-            viz = get_visualizer()
-            
-            expert_name = "RF"
-            
-            viz.record_expert_metrics(
-                expert_name=expert_name,
-                accuracy=wr_all if wr_all is not None else 0.0,
-                n_samples=len(all_hits),
-                cv_accuracy=cv_wr / 100.0 if cv_wr > 0 else None,
-                cv_ci_lower=cv_metrics.get('ci_lower') if cv_status == "ok" else None,
-                cv_ci_upper=cv_metrics.get('ci_upper') if cv_status == "ok" else None,
-                mode=self.mode
-            )
-        except Exception:
-            log_exception("Unhandled exception")
-        
         return {
             "mode": self.mode,
             "enabled": self.enabled,
@@ -4825,25 +4820,6 @@ class RiverARFExpert(_BaseExpert):
         cv_status = cv_metrics.get("status", "N/A")
         cv_wr = cv_metrics.get("oof_accuracy", 0.0)
         cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
-        
-        # НОВОЕ: Отправляем метрики в визуализатор
-        try:
-            from training_visualizer import get_visualizer
-            viz = get_visualizer()
-            
-            expert_name = "ARF"
-            
-            viz.record_expert_metrics(
-                expert_name=expert_name,
-                accuracy=wr_all if wr_all is not None else 0.0,
-                n_samples=len(all_hits),
-                cv_accuracy=cv_wr / 100.0 if cv_wr > 0 else None,
-                cv_ci_lower=cv_metrics.get('ci_lower') if cv_status == "ok" else None,
-                cv_ci_upper=cv_metrics.get('ci_upper') if cv_status == "ok" else None,
-                mode=self.mode
-            )
-        except Exception:
-            log_exception("Unhandled exception")
         
         return {
             "mode": self.mode,
@@ -5776,25 +5752,6 @@ class NNExpert(_BaseExpert):
         cv_wr = cv_metrics.get("oof_accuracy", 0.0)
         cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
         
-        # НОВОЕ: Отправляем метрики в визуализатор
-        try:
-            from training_visualizer import get_visualizer
-            viz = get_visualizer()
-            
-            expert_name = "NN"
-            
-            viz.record_expert_metrics(
-                expert_name=expert_name,
-                accuracy=wr_all if wr_all is not None else 0.0,
-                n_samples=len(all_hits),
-                cv_accuracy=cv_wr / 100.0 if cv_wr > 0 else None,
-                cv_ci_lower=cv_metrics.get('ci_lower') if cv_status == "ok" else None,
-                cv_ci_upper=cv_metrics.get('ci_upper') if cv_status == "ok" else None,
-                mode=self.mode
-            )
-        except Exception:
-            log_exception("Unhandled exception")
-        
         return {
             "mode": self.mode,
             "enabled": self.enabled,
@@ -5808,6 +5765,39 @@ class NNExpert(_BaseExpert):
             "cv_ci": cv_ci,
             "cv_validated": str(self.validation_passed.get(ph, False))
         }
+
+            # ===== ВИЗУАЛИЗАЦИЯ: Записываем метрики после обучения =====
+            try:
+                from training_visualizer import get_visualizer
+                viz = get_visualizer()
+        
+                def _wr(xs):
+                    if not xs: return None
+                    return sum(xs) / float(len(xs))
+        
+                wr_a = _wr(self.active_hits)
+                wr_s = _wr(self.shadow_hits)
+                all_hits = (self.active_hits or []) + (self.shadow_hits or [])
+                wr_all = _wr(all_hits)
+        
+                cv_metrics = self.cv_metrics.get(ph, {})
+                cv_status = cv_metrics.get("status", "N/A")
+                cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+        
+                viz.record_expert_metrics(
+                    expert_name="ARF",
+                    accuracy=wr_all if wr_all is not None else 0.0,
+                    n_samples=len(all_hits),
+                    cv_accuracy=cv_wr / 100.0 if cv_wr > 0 else None,
+                    cv_ci_lower=cv_metrics.get('ci_lower') if cv_status == "ok" else None,
+                    cv_ci_upper=cv_metrics.get('ci_upper') if cv_status == "ok" else None,
+                    mode=self.mode
+                )
+                print(f"[ARF] Phase {ph} metrics recorded to visualizer")
+            except Exception as e:
+                print(f"[ARF] Visualizer recording failed: {e}")
+                import traceback
+                traceback.print_exc()
 
 # =============================
 # REST MODE
