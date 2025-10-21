@@ -19,8 +19,10 @@ import pandas as pd
 from typing import Dict, Tuple, Optional
 from collections import defaultdict
 
+# ========== КОНСТАНТЫ ==========
+VOL_THRESHOLD = 1.3  # Порог высокой волатильности
+
 # ========== ГЛОБАЛЬНЫЕ СЧЕТЧИКИ ОШИБОК ==========
-# Для мониторинга качества формирования контекста
 _ERROR_COUNTS = defaultdict(int)
 _FEATURE_STATS = defaultdict(list)
 
@@ -61,7 +63,7 @@ def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
         "volume": "sum"
     }
     out = df[["open", "high", "low", "close", "volume"]].resample(
-        rule, label="right", closed="right"
+        rule, label="left", closed="left"
     ).agg(agg)
     return out.dropna(how="any")
 
@@ -104,93 +106,30 @@ def build_regime_ctx(
         enable_logging: Включить логирование ошибок (для отладки)
     
     Returns:
-        Словарь с 8 контекстными признаками:
-        {
-            'trend_sign': float,      # Знак тренда (±1, 0)
-            'trend_abs': float,       # Сила тренда [0, 3] (z-score)
-            'vol_ratio': float,       # Отношение текущей волы к средней [0, 5]
-            'jump_flag': float,       # Флаг скачка цены (0/1)
-            'ofi_sign': float,        # Знак order flow imbalance (±1, 0)
-            'book_imb': float,        # Дисбаланс стакана [-1, 1]
-            'basis_sign': float,      # Знак базиса фьючерсов (±1, 0)
-            'funding_sign': float,    # Знак ставки финансирования (±1, 0)
-        }
-    
-    Детали вычислений:
-    
-    1. TREND (тренд):
-       - Вычисляется MACD histogram на HTF свечах (15min по умолчанию)
-       - Нормализуется к стандартному отклонению последних 100 HTF баров
-       - trend_sign: направление (-1 = down, 0 = flat, +1 = up)
-       - trend_abs: сила тренда в единицах сигма, клиппед [0, 3]
-    
-    2. VOL_RATIO (волатильность):
-       - Отношение текущего ATR к скользящему среднему ATR
-       - vol_ratio = ATR_now / SMA(ATR)
-       - Клиппед в [0, 5] (до 5x средней волатильности)
-       - >1.0 = повышенная вола, <1.0 = пониженная
-    
-    3. JUMP_FLAG (скачки):
-       - Передается извне (вычисляется через BN-S test)
-       - 1.0 = обнаружен значимый скачок цены
-       - 0.0 = нормальное непрерывное движение
-    
-    4. OFI (order flow imbalance):
-       - Знак OFI за последние 15 секунд
-       - Положительный = давление покупок
-       - Отрицательный = давление продаж
-    
-    5. BOOK_IMB (дисбаланс стакана):
-       - (bid_volume - ask_volume) / total_volume в топ-5 уровнях
-       - Клиппед [-1, 1]
-       - +1 = все в bid, -1 = все в ask
-    
-    6. BASIS (базис фьючерсов):
-       - Знак (mark_price - spot) / spot
-       - Положительный = contango (фьючерс дороже)
-       - Отрицательный = backwardation
-    
-    7. FUNDING (ставка финансирования):
-       - Знак последней funding rate
-       - Положительный = длинные платят коротким (перегрет)
-       - Отрицательный = короткие платят длинным (перепродан)
-    
-    Обработка ошибок:
-        При ошибке вычисления любой фичи возвращается 0.0 (нейтральное значение).
-        Счетчики ошибок доступны через get_error_stats().
+        Словарь с 8 контекстными признаками
     """
     global _ERROR_COUNTS
     
     # --- 1) ТРЕНД (HTF MACD-hist с z-нормализацией) ---
     try:
-        # Ресемплируем в higher timeframe
         htf = resample_ohlc(df_1m, htf_rule)
+        i = htf.index.get_indexer([tstamp], method="ffill")[0]
         
-        # Находим индекс последней свечи ДО tstamp
-        i = htf.index.get_indexer([tstamp], method="pad")[0]
+        # Защита от текущей незакрытой свечи
+        if i >= 0 and htf.index[i] >= tstamp:
+            i -= 1
         
-        if i <= 0:
-            # Недостаточно данных
+        if i < 1:
             trend_sign = 0.0
             trend_abs = 0.0
         else:
-            # Вычисляем MACD histogram
             h = macd_hist(htf["close"])
-            
-            # Окно для z-нормализации (только прошлые данные)
-            h_win = h.iloc[max(0, i - 100):i]
-            
-            # Стандартное отклонение окна
+            h_win = h.iloc[max(0, i - 100):i + 1]
             std = float(h_win.std(ddof=0)) if len(h_win) > 1 else 0.0
-            
-            # Значение MACD hist на предыдущей свече (не текущей!)
-            h_val = float(h.iloc[i - 1])
-            
-            # Знак и нормализованная величина
+            h_val = float(h.iloc[i])
             trend_sign = _sign(h_val)
             trend_abs = 0.0 if std == 0.0 else _clip(abs(h_val) / std, 0.0, 3.0)
             
-        # Опциональная статистика
         if enable_logging:
             _FEATURE_STATS['trend_sign'].append(trend_sign)
             _FEATURE_STATS['trend_abs'].append(trend_abs)
@@ -203,18 +142,17 @@ def build_regime_ctx(
 
     # --- 2) ВОЛАТИЛЬНОСТЬ (ATR ratio) ---
     try:
-        # Находим индекс последней записи ДО tstamp
-        j = feats["atr"].index.get_indexer([tstamp], method="pad")[0]
+        j = feats["atr"].index.get_indexer([tstamp], method="ffill")[0]
         
-        atr_now = float(feats["atr"].iloc[j])
-        atr_sma = float(feats["atr_sma"].iloc[j])
+        if j >= 0 and feats["atr"].index[j] >= tstamp:
+            j -= 1
         
-        # Защита от деления на ноль
-        if atr_sma <= 0:
+        if j < 0:
             vol_ratio = 0.0
         else:
-            # Отношение текущего ATR к среднему, клиппед до 5x
-            vol_ratio = _clip(atr_now / atr_sma, 0.0, 5.0)
+            atr_now = float(feats["atr"].iloc[j])
+            atr_sma = float(feats["atr_sma"].iloc[j])
+            vol_ratio = _clip(atr_now / atr_sma, 0.0, 5.0) if atr_sma > 0 else 0.0
         
         if enable_logging:
             _FEATURE_STATS['vol_ratio'].append(vol_ratio)
@@ -225,14 +163,11 @@ def build_regime_ctx(
             print(f"[regime_ctx] vol_ratio computation failed: {e}")
         vol_ratio = 0.0
 
-    # --- 3) МИКРОСТРУКТУРА (с защитой от None) ---
+    # --- 3) МИКРОСТРУКТУРА ---
     if micro_feats is not None and isinstance(micro_feats, dict):
         try:
-            # Order Flow Imbalance за последние 15 секунд
             ofi15 = float(micro_feats.get("ofi_15s", 0.0))
             ofi_sign = _sign(ofi15)
-            
-            # Дисбаланс стакана (bid vs ask volume)
             book_imb_raw = float(micro_feats.get("book_imb", 0.0))
             book_imb = _clip(book_imb_raw, -1.0, 1.0)
             
@@ -247,20 +182,16 @@ def build_regime_ctx(
             ofi_sign = 0.0
             book_imb = 0.0
     else:
-        # micro_feats не предоставлены или None
         if enable_logging and micro_feats is None:
             _ERROR_COUNTS['microstructure_missing'] += 1
         ofi_sign = 0.0
         book_imb = 0.0
 
-    # --- 4) ФЬЮЧЕРСЫ (с защитой от None) ---
+    # --- 4) ФЬЮЧЕРСЫ ---
     if fut_feats is not None and isinstance(fut_feats, dict):
         try:
-            # Базис: (mark_price - spot) / spot
             basis_raw = float(fut_feats.get("basis_now", 0.0))
             basis_sign = _sign(basis_raw)
-            
-            # Ставка финансирования (уже sign из futures_ctx)
             funding_raw = float(fut_feats.get("funding_sign", 0.0))
             funding_sign = _sign(funding_raw)
             
@@ -275,20 +206,17 @@ def build_regime_ctx(
             basis_sign = 0.0
             funding_sign = 0.0
     else:
-        # fut_feats не предоставлены или None
         if enable_logging and fut_feats is None:
             _ERROR_COUNTS['futures_missing'] += 1
         basis_sign = 0.0
         funding_sign = 0.0
 
-    # --- 5) СКАЧКИ ЦЕНЫ (передается извне) ---
-    # Вычисляется через Barndorff-Nielsen-Shephard test в основном боте
+    # --- 5) СКАЧКИ ЦЕНЫ ---
     jf = 1.0 if bool(jump_flag) else 0.0
     
     if enable_logging:
         _FEATURE_STATS['jump_flag'].append(jf)
 
-    # Собираем итоговый словарь
     return dict(
         trend_sign=trend_sign,
         trend_abs=trend_abs,
@@ -306,27 +234,6 @@ def build_regime_ctx(
 def pack_ctx(ctx: dict) -> Tuple[np.ndarray, list]:
     """
     Упаковывает контекстный словарь в numpy вектор с фиксированным порядком
-    
-    Используется для гейтинга экспертов в META-модели.
-    
-    Args:
-        ctx: Словарь с контекстными признаками
-    
-    Returns:
-        (vec, names): 
-            - vec: numpy array размера 9 (8 фичей + bias)
-            - names: список имен фичей в том же порядке
-    
-    Порядок фичей в векторе:
-        [0] trend_sign
-        [1] trend_abs
-        [2] vol_ratio
-        [3] jump_flag
-        [4] ofi_sign
-        [5] book_imb
-        [6] basis_sign
-        [7] funding_sign
-        [8] bias (всегда 1.0)
     """
     names = [
         "trend_sign", "trend_abs", "vol_ratio", "jump_flag",
@@ -342,7 +249,7 @@ def pack_ctx(ctx: dict) -> Tuple[np.ndarray, list]:
         float(ctx.get("book_imb", 0.0)),
         float(ctx.get("basis_sign", 0.0)),
         float(ctx.get("funding_sign", 0.0)),
-        1.0  # bias term
+        1.0
     ], dtype=float)
     
     return vec, names
@@ -354,12 +261,6 @@ def phase_from_ctx(ctx: dict) -> int:
     """
     Определяет фазу рынка из контекста (6 фаз)
     
-    Фазы используются META для раздельного обучения моделей под
-    различные рыночные режимы.
-    
-    Args:
-        ctx: Контекстный словарь
-    
     Returns:
         Номер фазы [0-5]:
             0: bull_low   (бычий тренд, низкая вола)
@@ -368,75 +269,34 @@ def phase_from_ctx(ctx: dict) -> int:
             3: bear_high  (медвежий тренд, высокая вола)
             4: flat_low   (флэт, низкая вола)
             5: flat_high  (флэт, высокая вола)
-    
-    Логика разметки:
-        - Тренд: определяется по trend_sign
-        - Волатильность: высокая если vol_ratio >= 1.3
     """
     trend_sign = float(ctx.get("trend_sign", 0.0))
     vol_ratio = float(ctx.get("vol_ratio", 0.0))
     
-    # Порог высокой волатильности
-    high_vol = (vol_ratio >= 1.3)
+    high_vol = (vol_ratio >= VOL_THRESHOLD)
     
-    # Бычий тренд
     if trend_sign > 0:
         return 1 if high_vol else 0
-    
-    # Медвежий тренд
     if trend_sign < 0:
         return 3 if high_vol else 2
-    
-    # Флэт (нет явного тренда)
     return 5 if high_vol else 4
 
 
 # ========== ДИАГНОСТИКА И МОНИТОРИНГ ==========
 
 def get_error_stats() -> dict:
-    """
-    Возвращает статистику ошибок при формировании контекста
-    
-    Returns:
-        Словарь с количеством ошибок по типам фичей:
-        {
-            'trend': int,
-            'vol_ratio': int,
-            'microstructure': int,
-            'microstructure_missing': int,
-            'futures': int,
-            'futures_missing': int,
-        }
-    
-    Используется для мониторинга качества источников данных.
-    Если какой-то счетчик растет быстро - проблема с источником данных.
-    """
+    """Возвращает статистику ошибок при формировании контекста"""
     return dict(_ERROR_COUNTS)
 
 
 def reset_error_stats() -> None:
-    """Сбрасывает счетчики ошибок (полезно для периодического мониторинга)"""
+    """Сбрасывает счетчики ошибок"""
     global _ERROR_COUNTS
     _ERROR_COUNTS.clear()
 
 
 def get_feature_distributions() -> dict:
-    """
-    Возвращает статистику распределений контекстных фичей
-    
-    Returns:
-        Словарь с базовой статистикой по каждой фиче:
-        {
-            'trend_sign': {'mean': float, 'std': float, 'min': float, 'max': float, 'n': int},
-            'trend_abs': {...},
-            ...
-        }
-    
-    Используется для диагностики:
-    - Если все значения = 0, значит фича не вычисляется
-    - Если std = 0, значит фича не информативна
-    - Если min = max, значит фича застряла на одном значении
-    """
+    """Возвращает статистику распределений контекстных фичей"""
     stats = {}
     
     for name, values in _FEATURE_STATS.items():
@@ -465,33 +325,19 @@ def validate_context(ctx: dict, strict: bool = False) -> Tuple[bool, list]:
     """
     Проверяет корректность сформированного контекста
     
-    Args:
-        ctx: Контекстный словарь для проверки
-        strict: Если True, требует наличия ВСЕХ полей (не только ключевых)
-    
     Returns:
-        (is_valid, warnings):
-            - is_valid: True если контекст валиден
-            - warnings: список строк с предупреждениями
-    
-    Проверки:
-        - Наличие обязательных полей
-        - Диапазоны значений (например, vol_ratio не должен быть отрицательным)
-        - Признаки проблем с данными (все фичи = 0)
+        (is_valid, warnings)
     """
     warnings = []
     
-    # Обязательные поля
     required = ['trend_sign', 'trend_abs', 'vol_ratio', 'jump_flag',
                 'ofi_sign', 'book_imb', 'basis_sign', 'funding_sign']
     
-    # Проверка наличия полей
     missing = [f for f in required if f not in ctx]
     if missing:
         warnings.append(f"Missing required fields: {missing}")
         return False, warnings
     
-    # Проверка диапазонов
     if not (0.0 <= ctx['vol_ratio'] <= 5.0):
         warnings.append(f"vol_ratio out of range: {ctx['vol_ratio']}")
     
@@ -504,14 +350,11 @@ def validate_context(ctx: dict, strict: bool = False) -> Tuple[bool, list]:
     if ctx['jump_flag'] not in [0.0, 1.0]:
         warnings.append(f"jump_flag should be 0 or 1, got: {ctx['jump_flag']}")
     
-    # Проверка на подозрительные паттерны
     if strict:
-        # Если все фичи = 0, возможно проблема с источником данных
         non_zero = sum(1 for k, v in ctx.items() if k != 'jump_flag' and abs(v) > 1e-6)
         if non_zero == 0:
             warnings.append("All features are zero - possible data source issue")
         
-        # Если vol_ratio всегда = 0, ATR не вычисляется
         if ctx['vol_ratio'] == 0.0:
             warnings.append("vol_ratio is zero - check ATR computation")
     
@@ -521,20 +364,13 @@ def validate_context(ctx: dict, strict: bool = False) -> Tuple[bool, list]:
 
 def format_context_summary(ctx: dict) -> str:
     """
-    Форматирует контекст в человекочитаемую строку для логирования
-    
-    Args:
-        ctx: Контекстный словарь
-    
-    Returns:
-        Строка с компактным представлением контекста
+    Форматирует контекст в человекочитаемую строку
     
     Пример:
         "Phase=2 Trend=↓(1.2σ) Vol=1.5x Jump=0 OFI=↓ Book=0.3 Basis=↑ Fund=↑"
     """
     phase = phase_from_ctx(ctx)
     
-    # Символы для направления
     trend_arrow = "↑" if ctx['trend_sign'] > 0 else ("↓" if ctx['trend_sign'] < 0 else "→")
     ofi_arrow = "↑" if ctx['ofi_sign'] > 0 else ("↓" if ctx['ofi_sign'] < 0 else "→")
     basis_arrow = "↑" if ctx['basis_sign'] > 0 else ("↓" if ctx['basis_sign'] < 0 else "→")
@@ -555,20 +391,15 @@ def format_context_summary(ctx: dict) -> str:
 # ========== ЭКСПОРТ ==========
 
 __all__ = [
-    # Основные функции
     'build_regime_ctx',
     'pack_ctx',
     'phase_from_ctx',
-    
-    # Диагностика
     'get_error_stats',
     'reset_error_stats',
     'get_feature_distributions',
     'reset_feature_stats',
     'validate_context',
     'format_context_summary',
-    
-    # Утилиты (если нужны снаружи)
     'ema',
     'macd_hist',
     'resample_ohlc',
