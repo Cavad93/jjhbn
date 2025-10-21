@@ -201,12 +201,31 @@ def fmt_pct(x, nd=2, dash="—"):
     s = fmtf(x, nd=nd, dash=dash)
     return s if s == dash else f"{s}%"
 
-def update_capital_atomic(capital_state, new_capital: float, ts: int, csv_row: dict) -> float:
+def update_capital_atomic(
+    capital_state, 
+    new_capital: float, 
+    ts: int, 
+    csv_row: dict, 
+    csv_path: str = None
+) -> float:
     """
     Атомарно обновляет капитал и сохраняет строку в CSV.
     Гарантирует согласованность: сначала капитал, потом CSV.
     Если что-то пойдет не так, возвращает последний сохраненный капитал.
+    
+    Args:
+        capital_state: Объект для управления состоянием капитала
+        new_capital: Новое значение капитала
+        ts: Timestamp операции
+        csv_row: Словарь с данными строки для CSV
+        csv_path: Путь к CSV файлу (если None, использует CSV_PATH)
+    
+    Returns:
+        Обновленное значение капитала
     """
+    # Если csv_path не указан, используем глобальный CSV_PATH
+    target_csv = csv_path if csv_path is not None else CSV_PATH
+    
     try:
         # Сначала сохраняем капитал атомарно через временный файл
         temp_path = capital_state.path + ".tmp"
@@ -218,9 +237,9 @@ def update_capital_atomic(capital_state, new_capital: float, ts: int, csv_row: d
         
         # Только после успешного сохранения капитала пишем в CSV
         try:
-            append_trade_row(CSV_PATH, csv_row)  # ← ИСПРАВЛЕНО
+            append_trade_row(target_csv, csv_row)
         except Exception as e:
-            print(f"[csv ] write failed but capital saved: {e}")
+            print(f"[csv ] write failed but capital saved (target={target_csv}): {e}")
         
         return new_capital
     except Exception as e:
@@ -617,9 +636,6 @@ CROSS_W_MOM = 0.18
 CROSS_W_VWAP = 0.12
 STABLE_W_MOM = 0.06
 STABLE_W_VWAP = 0.04
-
-# СТАВКА: жёсткий кэп на раунд
-MAX_STAKE_FRACTION = 0.01  # ≤3% капитала
 
 TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID   = os.getenv("TG_CHAT_ID", "").strip()
@@ -1533,24 +1549,6 @@ CSV_DTYPES = {
 # --- Порог для включения δ от тюнера ---
 MIN_TRADES_FOR_DELTA = 500  # до этого числа завершённых сделок δ принудительно 0.000
 
-def _settled_trades_count(path: str) -> int:
-    """
-    Считает КОЛИЧЕСТВО завершённых сделок (win/loss/draw) в trades CSV.
-    Этого достаточно, чтобы решить: включать ли δ из тюнера или держать 0.000.
-    """
-    try:
-        df = _read_csv_df(path)
-        if df is None or df.empty:
-            return 0
-        out = df.get("outcome")
-        if out is None:
-            return 0
-        # outcome хранится как строка; считаем только win/loss/draw
-        out = out.astype("string").str.lower()
-        return int(out.isin(["win", "loss", "draw"]).sum())
-    except Exception:
-        return 0
-
 
 
 def _coerce_csv_dtypes(df: pd.DataFrame) -> pd.DataFrame:
@@ -1709,8 +1707,7 @@ def try_settle_shadow_rows(path: str, w3: Web3, c, cur_epoch: int) -> None:
             # --- пополняем окно калибратора мета-вероятностей ---
             try:
                 if outcome in ("win", "loss"):
-                    # сырое p_meta_raw, которое положили в bets[epoch] при решении
-                    p_logged_raw = float(b.get("p_meta_raw", b.get("p_up", float('nan'))))
+                    p_logged_raw = float(row.get("p_meta_raw", row.get("p_up", float('nan'))))
                     _CALIB_P_META.append(p_logged_raw)
                     _CALIB_Y_META.append(1 if outcome == "win" else 0)
                     # обновим онлайн-менеджер (если включен)
@@ -2186,7 +2183,13 @@ def implied_payout_ratio(side_up: bool, rd: RoundInfo, fee: float = TREASURY_FEE
     side_amt = float(rd.bull_amount if side_up else rd.bear_amount)
     if side_amt <= 0.0 or total <= 0.0:
         return None
-    return (total / side_amt) * (1.0 - fee)
+    
+    ratio = (total / side_amt) * (1.0 - fee)
+    
+    # Валидация: разумный диапазон для payout ratio
+    # Нижний предел: 1.1 (минимальная выгода)
+    # Верхний предел: 5.0 (защита от аномалий при малых пулах)
+    return float(np.clip(ratio, 1.1, 5.0))
 
 
 # === KPI: число закрытых и «тишина» 1ч ===
@@ -2990,15 +2993,15 @@ class XGBExpert(_BaseExpert):
         return Xg, yg
 
     def _get_past_phases_tail(self, ph: int, n: int) -> Tuple[np.ndarray, np.ndarray]:
-        # Берет последние n записей только из фаз 0..ph (включительно)
+        # Берет последние n записей только из фаз 0..ph-1 (исключая текущую)
         # Исключает данные из будущих фаз → нет утечки
         if n <= 0:
             return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
         
-        # Собираем все данные из фаз 0..ph
+        # Собираем все данные из прошлых фаз (0..ph-1)
         X_past = []
         y_past = []
-        for p in range(min(ph + 1, self.P)):
+        for p in range(ph):  # ✅ ИСПРАВЛЕНО: было range(min(ph + 1, self.P))
             if self.X_ph.get(p):
                 X_past.extend(self.X_ph[p])
                 y_past.extend(self.y_ph[p])
@@ -3028,7 +3031,7 @@ class XGBExpert(_BaseExpert):
         need_g = max(need_g, int(self.cfg.phase_min_ready) - len(Xp))   # не менее, чтобы достичь порога
         
         # Считаем сколько доступно в фазах 0..ph
-        available_past = sum(len(self.X_ph.get(p, [])) for p in range(min(ph + 1, self.P)))
+        available_past = sum(len(self.X_ph.get(p, [])) for p in range(ph))  # ✅ ИСПРАВЛЕНО
         need_g = min(need_g, available_past)  # не больше, чем доступно в прошлых фазах
         
         Xg, yg = self._get_past_phases_tail(ph, need_g)
@@ -3422,7 +3425,7 @@ class XGBExpert(_BaseExpert):
             return 100.0 * (sum(window)/len(window))
         
         # Текущие метрики
-        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
+        wr_shadow = wr(self.shadow_hits, getattr(self.cfg, 'min_ready', 80))
         wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
         
         # Получаем CV метрики текущей фазы
@@ -3465,7 +3468,7 @@ class XGBExpert(_BaseExpert):
             if len(arr) < n: return None
             window = arr[-n:]
             return 100.0 * (sum(window)/len(window))
-        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
+        wr_shadow = wr(self.shadow_hits, getattr(self.cfg, 'min_ready', 80))
         if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= self.cfg.enter_wr:
             self.mode = "ACTIVE"
             if HAVE_RIVER:
@@ -3603,15 +3606,15 @@ class RFCalibratedExpert(_BaseExpert):
         return Xg, yg
 
     def _get_past_phases_tail(self, ph: int, n: int) -> Tuple[np.ndarray, np.ndarray]:
-        # Берет последние n записей только из фаз 0..ph (включительно)
+        # Берет последние n записей только из фаз 0..ph-1 (исключая текущую)
         # Исключает данные из будущих фаз → нет утечки
         if n <= 0:
             return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
         
-        # Собираем все данные из фаз 0..ph
+        # Собираем все данные из прошлых фаз (0..ph-1)
         X_past = []
         y_past = []
-        for p in range(min(ph + 1, self.P)):
+        for p in range(ph):  # ✅ ИСПРАВЛЕНО: было range(min(ph + 1, self.P))
             if self.X_ph.get(p):
                 X_past.extend(self.X_ph[p])
                 y_past.extend(self.y_ph[p])
@@ -3640,7 +3643,7 @@ class RFCalibratedExpert(_BaseExpert):
         need_g = max(need_g, int(self.cfg.phase_min_ready) - len(Xp))   # не менее, чтобы достичь порога
         
         # Считаем сколько доступно в фазах 0..ph
-        available_past = sum(len(self.X_ph.get(p, [])) for p in range(min(ph + 1, self.P)))
+        available_past = sum(len(self.X_ph.get(p, [])) for p in range(ph))  # ✅ ИСПРАВЛЕНО
         need_g = min(need_g, available_past)  # не больше, чем доступно в прошлых фазах
         
         Xg, yg = self._get_past_phases_tail(ph, need_g)
@@ -4261,7 +4264,7 @@ class RFCalibratedExpert(_BaseExpert):
             return 100.0 * (sum(window)/len(window))
         
         # Текущие метрики
-        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
+        wr_shadow = wr(self.shadow_hits, getattr(self.cfg, 'min_ready', 80))
         wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
         
         # Получаем CV метрики текущей фазы
@@ -4304,7 +4307,7 @@ class RFCalibratedExpert(_BaseExpert):
             if len(arr) < n: return None
             window = arr[-n:]
             return 100.0 * (sum(window)/len(window))
-        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
+        wr_shadow = wr(self.shadow_hits, getattr(self.cfg, 'min_ready', 80))
         if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= self.cfg.enter_wr:
             self.mode = "ACTIVE"
             if HAVE_RIVER:
@@ -5092,15 +5095,15 @@ class NNExpert(_BaseExpert):
         return Xg, yg
 
     def _get_past_phases_tail(self, ph: int, n: int) -> Tuple[np.ndarray, np.ndarray]:
-        # Берет последние n записей только из фаз 0..ph (включительно)
+        # Берет последние n записей только из фаз 0..ph-1 (исключая текущую)
         # Исключает данные из будущих фаз → нет утечки
         if n <= 0:
             return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
         
-        # Собираем все данные из фаз 0..ph
+        # Собираем все данные из прошлых фаз (0..ph-1)
         X_past = []
         y_past = []
-        for p in range(min(ph + 1, self.P)):
+        for p in range(ph):  # ✅ ИСПРАВЛЕНО: было range(min(ph + 1, self.P))
             if self.X_ph.get(p):
                 X_past.extend(self.X_ph[p])
                 y_past.extend(self.y_ph[p])
@@ -5129,7 +5132,7 @@ class NNExpert(_BaseExpert):
         need_g = max(need_g, int(self.cfg.phase_min_ready) - len(Xp))   # не менее, чтобы достичь порога
         
         # Считаем сколько доступно в фазах 0..ph
-        available_past = sum(len(self.X_ph.get(p, [])) for p in range(min(ph + 1, self.P)))
+        available_past = sum(len(self.X_ph.get(p, [])) for p in range(ph))  # ✅ ИСПРАВЛЕНО
         need_g = min(need_g, available_past)  # не больше, чем доступно в прошлых фазах
         
         Xg, yg = self._get_past_phases_tail(ph, need_g)
@@ -5373,7 +5376,7 @@ class NNExpert(_BaseExpert):
             return 100.0 * (sum(window)/len(window))
         
         # Текущие метрики
-        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
+        wr_shadow = wr(self.shadow_hits, getattr(self.cfg, 'min_ready', 80))
         wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
         
         # Получаем CV метрики текущей фазы
@@ -5416,7 +5419,7 @@ class NNExpert(_BaseExpert):
             if len(arr) < n: return None
             window = arr[-n:]
             return 100.0 * (sum(window)/len(window))
-        wr_shadow = wr(self.shadow_hits, self.cfg.min_ready)
+        wr_shadow = wr(self.shadow_hits, getattr(self.cfg, 'min_ready', 80))
         if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= self.cfg.enter_wr:
             self.mode = "ACTIVE"
             if HAVE_RIVER:
@@ -6586,10 +6589,12 @@ def main_loop():
     nn_exp  = NNExpert(ml_cfg)
 
     # Если в этом файле уже есть переменные с токеном/чатом — подставляем их в cfg:
-    ml_cfg.meta_report_dir = "meta_reports"    # опционально, куда сохранять PNG
-    ml_cfg.phase_min_ready = 50                # ← старт обучения с 50 примеров/фазу
-    ml_cfg.meta_retrain_every = 50             # ← тренироваться каждые 50 новых примеров
-    meta    = MetaCEMMC(ml_cfg)
+    ml_cfg.meta_report_dir = "meta_reports"
+    ml_cfg.phase_min_ready = 50
+    ml_cfg.meta_retrain_every = 50
+    ml_cfg.tg_bot_token = TG_TOKEN
+    ml_cfg.tg_chat_id = str(TG_CHAT_ID)
+    meta = MetaCEMMC(ml_cfg)
 
     meta.bind_experts(xgb_exp, rf_exp, arf_exp, nn_exp)
 
@@ -6899,9 +6904,10 @@ def main_loop():
                                     cooling_needed = (losses >= 3) and (avg_loss_edge >= 0.03)
                                     
                                     if cooling_needed:
-                                        last_loss_ts = int(recent_trades[recent_trades["outcome"] == "loss"].iloc[-1]["settled_ts"])
-                                        hours_since = (now - last_loss_ts) / 3600.0
-                                        COOLDOWN_HOURS = 1.0  # было 2.0
+                                        # ИСПРАВЛЕНО: проверяем timestamp ПЕРВОГО проигрыша в серии, а не последнего
+                                        first_loss_ts = int(recent_trades[recent_trades["outcome"] == "loss"].iloc[0]["settled_ts"])
+                                        hours_since = (now - first_loss_ts) / 3600.0
+                                        COOLDOWN_HOURS = 1.0
                                         
                                         if hours_since < COOLDOWN_HOURS:
                                             bets[epoch] = dict(
@@ -6914,12 +6920,14 @@ def main_loop():
                                             # Детальное сообщение
                                             print(f"[cool] epoch={epoch} COOLING: {losses}/5 losses "
                                                 f"(avg_edge={avg_loss_edge:.3f}) | "
+                                                f"series started {hours_since:.1f}h ago | "
                                                 f"wait {COOLDOWN_HOURS-hours_since:.1f}h more")
                                             
                                             send_round_snapshot(
                                                 prefix=f"🧊 <b>Cooling</b> epoch={epoch}",
                                                 extra_lines=[
-                                                    f"Пауза после {losses}/5 проигрышей (последний час).",
+                                                    f"Пауза после {losses}/5 проигрышей.",
+                                                    f"Серия началась {hours_since:.1f}ч назад",
                                                     f"Средний edge проигрышей: {avg_loss_edge:.3f}",
                                                     f"Осталось: {COOLDOWN_HOURS-hours_since:.1f}ч"
                                                 ]
@@ -7313,13 +7321,13 @@ def main_loop():
                         has_recent = had_trade_in_last_hours(CSV_PATH, 1.0)
                         bootstrap_phase = (total_settled < MIN_TRADES_FOR_DELTA)
 
-                        cap3 = MAX_STAKE_FRACTION * capital
-                        if cap3 < min_bet_bnb:
-                            bets[epoch] = dict(skipped=True, reason="cap3_lt_minbet", wait_polls=0, settled=False)
-                            print(f"[skip] epoch={epoch} (cap 3% < minBet) cap3={cap3:.6f} minBet={min_bet_bnb:.6f}")
+                        # Проверка минимальной ставки (используем адаптивный Kelly, без жёсткого cap3)
+                        if capital < min_bet_bnb * 1.5:
+                            bets[epoch] = dict(skipped=True, reason="capital_too_small", wait_polls=0, settled=False)
+                            print(f"[skip] epoch={epoch} (capital too small) cap={capital:.6f} minBet={min_bet_bnb:.6f}")
                             send_round_snapshot(
-                                prefix=f"⛔ <b>Skip</b> epoch={epoch} (cap 3% ≤ minBet)",
-                                extra_lines=[f"cap3={cap3:.6f} BNB ≤ minBet={min_bet_bnb:.6f} BNB"]
+                                prefix=f"⛔ <b>Skip</b> epoch={epoch} (малый капитал)",
+                                extra_lines=[f"capital={capital:.6f} BNB, minBet={min_bet_bnb:.6f} BNB"]
                             )
                             notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
                             continue
@@ -7337,7 +7345,7 @@ def main_loop():
                                 stake_pct = 0.01   # 1% в начале
                             
                             stake = max(min_bet_bnb, stake_pct * capital)
-                            stake = min(stake, cap3)
+                            # cap3 удалён — используем только stake_pct
                             kelly_half = None
                         else:
                             # --- Kelly по рынку (риск/выплата r̂): f* = (p*r̂ - 1) / (r̂ - 1) ---
@@ -7410,7 +7418,6 @@ def main_loop():
                             kelly_half = f_eff_scaled  # для логов
                             
                             stake = max(min_bet_bnb, frac * capital)
-                            stake = min(stake, cap3)
 
 
                         if stake <= 0 or capital < min_bet_bnb * 1.0:
@@ -7583,7 +7590,13 @@ def main_loop():
                                 q50_loss = _as_float(q50_loss, 0.0)
                             except Exception:
                                 q50_loss = 0.0
-                            
+
+                            try:
+                                q90_loss = loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.90)
+                                q90_loss = _as_float(q90_loss, 0.0)
+                            except Exception:
+                                q90_loss = 0.0
+
                             try:
                                 margin_vs_market = _as_float(p_side, 0.5) - (1.0 / max(1e-9, _as_float(r_hat, 1.9)))
                             except Exception:
@@ -7608,7 +7621,7 @@ def main_loop():
                             # Три пути прохождения фильтра (OR-логика):
                             pass_ev_strong = (p_side >= (p_thr + delta_eff))
                             pass_margin_q70 = (margin_vs_market >= q70_loss) and (p_side >= (p_thr + 0.5 * delta_eff))
-                            pass_margin_q50 = (margin_vs_market >= q50_loss) and (p_side >= (p_thr + delta_eff))
+                            pass_margin_q50 = (margin_vs_market >= q50_loss) and (p_side >= (p_thr + 0.25 * delta_eff))
                             
                             # Определяем источник для логирования
                             if pass_ev_strong:
@@ -7756,7 +7769,7 @@ def main_loop():
                         
                         # --- считаем запас на входе
                         # --- считаем запас на входе
-                        edge_at_entry = float(p_side - (p_thr + delta_eff))
+                        edge_at_entry = _as_float(p_side, 0.5) - (_as_float(p_thr, 0.5) + _as_float(delta_eff, 0.0))
 
                         _safe_margin = float(margin_vs_market) if isinstance(margin_vs_market, (int, float)) and math.isfinite(float(margin_vs_market)) else 0.0
                         print(f"[bet ] epoch={epoch} side={side} "
@@ -7785,7 +7798,7 @@ def main_loop():
 
                         # --- считаем запас на входе
                         # при ENTER:
-                        edge_at_entry = float(p_side - (p_thr + delta_eff))   # здесь p_thr+δ == p_thr_ev
+                        edge_at_entry = _as_float(p_side, 0.5) - (_as_float(p_thr, 0.5) + _as_float(delta_eff, 0.0))
                         # безопасные значения для логирования
                         _safe_margin = float(margin_vs_market) if isinstance(margin_vs_market, (int, float)) and math.isfinite(margin_vs_market) else 0.0
                         _safe_q90 = float(q90_loss) if (('q90_loss' in locals()) or ('q90_loss' in globals())) and isinstance(q90_loss, (int, float)) and math.isfinite(q90_loss) else 0.0
@@ -7862,7 +7875,7 @@ def main_loop():
                         extra = [
                             f"side=<b>{side}</b>, p={_as_float(p_side,0.0):.4f} ≥ p_thr+δ={(_as_float(p_thr)+_as_float(delta_eff,0.0)):.4f} [{p_thr_src}]",
                             f"edge@entry={edge_at_entry:+.4f}",
-                            f"S={stake:.6f} BNB (кэп {MAX_STAKE_FRACTION*100:.0f}% от капитала), gas_bet≈{gas_bet_bnb_cur:.8f} BNB",
+                            f"S={stake:.6f} BNB (адаптивный Kelly, макс 2.5%), gas_bet≈{gas_bet_bnb_cur:.8f} BNB",
                             (_delta15_str if USE_STRESS_R15 else None),
                         ]
                         if override_reasons:
@@ -8149,19 +8162,19 @@ def main_loop():
 
                             # Сначала — МЕТА (не зависит от x_ml, чтобы опыт рос всегда)
                             try:
-                                meta.settle(
+                                meta.record_result(
                                     p_xgb=p_xgb,
                                     p_rf=p_rf,
                                     p_arf=p_arf,
                                     p_nn=p_nn,
                                     p_base=p_base,
                                     y_up=y_up_int,
-                                    reg_ctx=reg_ctx,
                                     used_in_live=used_flag,
                                     p_final_used=p_fin,
+                                    reg_ctx=reg_ctx
                                 )
                             except Exception as e:
-                                print(f"[ens ] meta.settle error: {e}")
+                                print(f"[ens ] meta.record_result error: {e}")
 
                             # Затем — эксперты (по-прежнему только если x_ml валиден)
                             try:
@@ -8268,7 +8281,7 @@ def main_loop():
                         "outcome": outcome,
                         "pnl": pnl,
                         "capital_before": capital_before,
-                        "capital_after": capital,
+                        "capital_after": new_capital,
                         "lock_ts": rd.lock_ts,
                         "close_ts": rd.close_ts,
                         "lock_price": rd.lock_price,
@@ -8292,7 +8305,7 @@ def main_loop():
                         from error_logger import log_exception
                         log_exception("Unhandled exception")
 
-                    capital = update_capital_atomic(capital_state, new_capital, now, row)
+                    capital = update_capital_atomic(capital_state, new_capital, now, row, csv_path=CSV_PATH)
 
                     # --- Performance monitor: прокинем сделку
                     try:
@@ -8497,19 +8510,19 @@ def main_loop():
 
                                 # 1) СНАЧАЛА — МЕТА. Всегда пытаемся заселить, даже если x_ml пустой или эксперты упадут.
                                 try:
-                                    meta.settle(
+                                    meta.record_result(
                                         p_xgb=p_xgb,
                                         p_rf=p_rf,
                                         p_arf=p_arf,
                                         p_nn=p_nn,
                                         p_base=p_base,
                                         y_up=y_up_int,
-                                        reg_ctx=reg_ctx,
                                         used_in_live=used_flag,
                                         p_final_used=p_fin,
+                                        reg_ctx=reg_ctx
                                     )
                                 except Exception as e:
-                                    print(f"[ens ] meta.settle error: {e}")
+                                    print(f"[ens ] meta.record_result error: {e}")
 
                                 # 2) ПОТОМ — эксперты. Ошибки не блокируют МЕТУ.
                                 try:
@@ -8585,7 +8598,7 @@ def main_loop():
                             "outcome": outcome,
                             "pnl": pnl,
                             "capital_before": capital_before,
-                            "capital_after": capital,
+                            "capital_after": new_capital,
                             "lock_ts": rd.lock_ts,
                             "close_ts": rd.close_ts,
                             "lock_price": lock_price_est if rd.lock_price == 0 else rd.lock_price,
