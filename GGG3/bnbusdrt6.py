@@ -6868,13 +6868,15 @@ def main_loop():
                             continue
 
 
+                        
                         override_reasons = []
                         if bootstrap_phase:
                             override_reasons.append("bootstrap меньше чем 500")
                         if not has_recent:
                             override_reasons.append("idle≥1h")
-                        if meta.mode != "ACTIVE":
-                            override_reasons.append("meta≠ACTIVE")
+                        # ОТКЛЮЧЕНО: meta≠ACTIVE (можно вернуть при необходимости)
+                        # if meta.mode != "ACTIVE":
+                        #     override_reasons.append("meta≠ACTIVE")
 
                         # === АДАПТИВНАЯ δ: многофакторная стратегия ===
                         if not bootstrap_phase and has_recent and meta.mode == "ACTIVE":
