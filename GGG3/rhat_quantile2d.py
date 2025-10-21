@@ -18,6 +18,8 @@ def _safe_float(x, default=np.nan):
         return default
 
 def _log_bin(x: float, edges: List[float]) -> int:
+    if not edges or len(edges) < 2:
+        return 0
     if not math.isfinite(x) or x <= 0:
         return 0
     lx = math.log10(max(1e-12, x))
@@ -25,6 +27,8 @@ def _log_bin(x: float, edges: List[float]) -> int:
     return max(0, min(i, len(edges)-2))
 
 def _lin_bin(x: float, edges: List[float]) -> int:
+    if not edges or len(edges) < 2:
+        return 0
     i = int(np.searchsorted(edges, x, side="right") - 1)
     return max(0, min(i, len(edges)-2))
 
@@ -32,8 +36,8 @@ def _lin_bin(x: float, edges: List[float]) -> int:
 class RHat2D:
     state_path: str = "rhat2d_state.json"
     pending_path: str = "rhat2d_pending.json"
-    t_edges: List[float] = field(default_factory=lambda: [0, 7, 15, 30, 60, 9999])  # сек до lock
-    pool_log_edges: List[float] = field(default_factory=lambda: [-3, -2, -1, 0, 1, 3])  # лог10(BNB)
+    t_edges: List[float] = field(default_factory=lambda: [0, 7, 15, 30, 60, 9999])
+    pool_log_edges: List[float] = field(default_factory=lambda: [-3, -2, -1, 0, 1, 3])
     max_per_bucket: int = 500
 
     def _load_state(self) -> Dict[str, List[float]]:
@@ -67,8 +71,7 @@ class RHat2D:
                 json.dump(pend, f, ensure_ascii=False)
             os.replace(tmp, self.pending_path)
         except Exception:
-            from error_logger import log_exception
-            log_exception("Failed to load JSON")
+            log_exception(f"RHat2D: failed to save pending to {self.pending_path}")
 
     def _key(self, i: int, j: int) -> str:
         return f"{i}:{j}"
@@ -93,6 +96,7 @@ class RHat2D:
         df = df.dropna(subset=["epoch","payout_ratio","outcome"])
         df = df[df["outcome"].isin(["win","loss","draw"])]
         buckets = self._load_state()
+        
         for _, row in df.iterrows():
             ep = str(int(_safe_float(row.get("epoch"))))
             if ep not in pend:
@@ -110,6 +114,7 @@ class RHat2D:
                 arr = arr[-self.max_per_bucket:]
             buckets[key] = arr
             pend.pop(ep, None)
+        
         self._save_state(buckets)
         self._save_pending(pend)
 
@@ -117,7 +122,6 @@ class RHat2D:
                  side: str,
                  lock_ts: Optional[int] = None,
                  ewma_lambda: float = 0.25,
-                 fallback_hours: int = 24,
                  csv_path: str = "trades_prediction.csv",
                  i_hint: Optional[int] = None,
                  j_hint: Optional[int] = None) -> Optional[float]:
@@ -137,13 +141,18 @@ class RHat2D:
             return None
         if df is None or df.empty:
             return None
+        
         df = df.dropna(subset=["outcome","payout_ratio"])
         df = df[df["outcome"].isin(["win","loss","draw"])]
+        
+        # Фильтрация по side (консистентная во всех fallback)
         side = (side or "").upper()
         if "side" in df.columns:
             df_side = df[df["side"].astype(str).str.upper() == side]
         else:
             df_side = df
+        
+        # 1) EWMA
         rr = pd.to_numeric(df_side.get("payout_ratio", pd.Series(dtype=float)), errors="coerce").dropna().to_numpy()
         if rr.size >= 3:
             lam = float(max(0.01, min(0.99, ewma_lambda)))
@@ -152,21 +161,25 @@ class RHat2D:
             r_ewma = float(np.sum(w * rr))
         else:
             r_ewma = float(np.nan)
+        
         if math.isfinite(r_ewma) and r_ewma > 1.0:
             return r_ewma
 
-        if lock_ts is not None and "lock_ts" in df.columns:
-            df = df.assign(h=((pd.to_numeric(df["lock_ts"], errors="coerce") // 3600) % 24))
+        # 2) Hour-of-day (используем df_side, не df!)
+        if lock_ts is not None and "lock_ts" in df_side.columns:
+            df_side = df_side.assign(h=((pd.to_numeric(df_side["lock_ts"], errors="coerce") // 3600) % 24))
             try:
                 h = int((int(lock_ts) // 3600) % 24)
             except Exception:
                 h = None
             if h is not None:
-                arr = pd.to_numeric(df[df["h"] == h]["payout_ratio"], errors="coerce").dropna().to_numpy()
+                arr = pd.to_numeric(df_side[df_side["h"] == h]["payout_ratio"], errors="coerce").dropna().to_numpy()
                 if arr.size >= 5:
                     return float(np.quantile(arr, 0.25))
 
-        arr = pd.to_numeric(df["payout_ratio"], errors="coerce").dropna().to_numpy()
+        # 3) Финальный fallback (используем df_side!)
+        arr = pd.to_numeric(df_side["payout_ratio"], errors="coerce").dropna().to_numpy()
         if arr.size >= 1:
             return float(np.quantile(arr, 0.25))
+        
         return None
