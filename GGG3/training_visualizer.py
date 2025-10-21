@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import json
 import time
+import traceback
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict
 from collections import deque
@@ -71,6 +72,12 @@ class TrainingVisualizer:
         
         # Генерируем HTML при инициализации
         self._generate_html_dashboard()
+        
+        # Создаем пустой JSON файл
+        if not os.path.exists(self.data_file):
+            self._save_data()
+        
+        print(f"[TrainingVisualizer] Initialized: {output_dir}")
     
     def record_expert_metrics(
         self,
@@ -102,18 +109,19 @@ class TrainingVisualizer:
                 if len(self.expert_metrics[expert_name]) > 1000:
                     self.expert_metrics[expert_name] = self.expert_metrics[expert_name][-1000:]
             
-            # НОВОЕ: Обновляем эволюцию
+            # Обновляем эволюцию (опционально)
             try:
                 from evolution_tracker import get_evolution_tracker
                 evo = get_evolution_tracker(self.output_dir)
                 stage = evo.update_expert(expert_name, accuracy)
                 
                 # Если был значительный прогресс - отправляем в Telegram
-                if stage is not None and evo.should_notify(expert_name):
+                if stage is not None:
                     self._send_evolution_notification(expert_name, stage, accuracy)
+            except ImportError:
+                pass  # evolution_tracker не установлен
             except Exception as e:
-                from error_logger import log_exception
-                log_exception("Failed to import get_evolution_tracker")
+                print(f"[TrainingVisualizer] Evolution tracking error: {e}")
             
             self._save_data()
     
@@ -202,8 +210,15 @@ class TrainingVisualizer:
             with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp_file, self.data_file)
+            
+            # Подсчитываем статистику
+            total_expert_points = sum(len(m) for m in self.expert_metrics.values())
+            total_meta_points = sum(len(s) for s in self.meta_training_history.values())
+            print(f"[TrainingVisualizer] Data saved: {total_expert_points} expert points, {total_meta_points} META points")
+            
         except Exception as e:
-            print(f"[TrainingVisualizer] Failed to save data: {e}")
+            print(f"[TrainingVisualizer] Failed to save data: {e.__class__.__name__}: {e}")
+            traceback.print_exc()
     
     def _generate_html_dashboard(self):
         """Генерирует HTML dashboard с живыми графиками"""
@@ -214,6 +229,16 @@ class TrainingVisualizer:
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🤖 Training Dashboard - Experts & META</title>
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <!--
+    ⚠️ ВАЖНО: Для корректной работы откройте дашборд через HTTP сервер!
+    
+    Выполните в терминале:
+    cd training_viz && python -m http.server 8000
+    
+    Затем откройте в браузере: http://localhost:8000/dashboard.html
+    
+    (Файл не будет работать через file:// из-за CORS ограничений)
+    -->
     <style>
         * {
             margin: 0;
@@ -382,7 +407,6 @@ class TrainingVisualizer:
             to { opacity: 1; transform: translateY(0); }
         }
         
-        /* НОВОЕ: Стили для эволюции */
         #evolutionContainer {
             display: flex;
             justify-content: space-around;
@@ -518,7 +542,6 @@ class TrainingVisualizer:
             </div>
         </div>
         
-        <!-- НОВОЕ: Блок эволюции -->
         <div class="card" style="margin-bottom: 20px;">
             <h2>🧬 Evolution Progress - From Cell to Human</h2>
             <div id="evolutionContainer">
@@ -628,7 +651,6 @@ class TrainingVisualizer:
     <script>
         let lastDataTimestamp = 0;
         
-        // Эволюционные стадии (упрощенная версия для JS)
         const EVOLUTION_STAGES = [
             {level: 0, emoji: "🧪", name: "Химический суп", min: 0.0, max: 0.35},
             {level: 1, emoji: "🧬", name: "РНК молекула", min: 0.35, max: 0.38},
@@ -830,13 +852,11 @@ class TrainingVisualizer:
                     
                     const stage = getStageFromAccuracy(latest.accuracy);
                     
-                    // Обновляем UI
                     elem.querySelector('.evo-level').textContent = `Lvl ${stage.level}`;
                     elem.querySelector('.evo-organism').textContent = stage.emoji;
                     elem.querySelector('.evo-description').textContent = stage.name;
                     elem.querySelector('.evo-progress-fill').style.width = `${stage.level}%`;
                     
-                    // Анимация эволюции при изменении
                     if (elem.dataset.lastLevel && parseInt(elem.dataset.lastLevel) < stage.level) {
                         elem.classList.add('evolving');
                         setTimeout(() => elem.classList.remove('evolving'), 1000);
@@ -951,9 +971,8 @@ class TrainingVisualizer:
             }
         }
         
-        // Автообновление каждые 2 секунды
         setInterval(loadData, 2000);
-        loadData();  // Загрузка при старте
+        loadData();
     </script>
 </body>
 </html>"""
@@ -965,12 +984,19 @@ class TrainingVisualizer:
         except Exception as e:
             print(f"[TrainingVisualizer] Failed to create HTML: {e}")
 
-# Глобальный экземпляр визуализатора
-_visualizer: Optional[TrainingVisualizer] = None
+# Глобальное хранилище визуализаторов (по одному на директорию)
+_visualizers: Dict[str, TrainingVisualizer] = {}
 
 def get_visualizer(output_dir: str = "training_viz") -> TrainingVisualizer:
-    """Получить глобальный экземпляр визуализатора"""
-    global _visualizer
-    if _visualizer is None:
-        _visualizer = TrainingVisualizer(output_dir)
-    return _visualizer
+    """Получить визуализатор для конкретной директории"""
+    global _visualizers
+    if output_dir not in _visualizers:
+        _visualizers[output_dir] = TrainingVisualizer(output_dir)
+        abs_path = os.path.abspath(_visualizers[output_dir].html_file)
+        print("=" * 60)
+        print(f"📊 Training Dashboard initialized!")
+        print(f"📁 HTML: file://{abs_path}")
+        print(f"📁 JSON: {_visualizers[output_dir].data_file}")
+        print(f"💡 For best results, run: cd {output_dir} && python -m http.server 8000")
+        print("=" * 60)
+    return _visualizers[output_dir]
