@@ -89,7 +89,6 @@ from prob_calibrators import make_calibrator, _BaseCal
 from performance_metrics import PerfMonitor
 
 # === НОВОЕ: контекстная калибровка p и r̂-таблица, EV-гейт по «марже к рынку» ===
-from ctx_calibration import p_ctx_calibrated
 from rhat_quantile2d import RHat2D
 from ev_margin_gate import loss_margin_q, p_thr_from_ev
 
