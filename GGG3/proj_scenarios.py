@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Optional, Tuple
 try:
     import numpy as np
 except Exception:
-    np = None  # деградация без numpy (будет грубее и медленнее)
+    np = None
 
 WEI = 10**18
 
@@ -57,7 +57,6 @@ def daily_log_returns(csv_path: str, lookback_days: int = 30) -> List[Tuple[str,
     since = now - lookback_days*86400
 
     rows = read_trades(csv_path)
-    # группируем по дате UTC
     per_day: Dict[str, List[float]] = {}
     for r in rows:
         ts = _safe_int(r.get("settled_ts") or r.get("ts") or r.get("time"))
@@ -66,9 +65,9 @@ def daily_log_returns(csv_path: str, lookback_days: int = 30) -> List[Tuple[str,
         cb = _safe_float(r.get("capital_before"), float("nan"))
         ca = _safe_float(r.get("capital_after"),  float("nan"))
         if not (math.isfinite(cb) and math.isfinite(ca) and cb > 0 and ca > 0):
-            # запасной вариант: если нет capital_* берем pnl_net ~ относительный к before
-            pnl_net = _safe_float(r.get("pnl_net"), float("nan"))
-            if math.isfinite(pnl_net) and cb and cb > 0:
+            # запасной вариант: если нет capital_* берем pnl ~ относительный к before
+            pnl_net = _safe_float(r.get("pnl") or r.get("pnl_net"), float("nan"))
+            if math.isfinite(pnl_net) and math.isfinite(cb) and cb > 0:
                 ca = cb + pnl_net
             else:
                 continue
@@ -79,8 +78,7 @@ def daily_log_returns(csv_path: str, lookback_days: int = 30) -> List[Tuple[str,
     days = []
     for d, arr in per_day.items():
         if arr:
-            days.append((d, sum(arr)))  # лог-ретёрны аддитивны
-    # сортировка по дате
+            days.append((d, sum(arr)))
     days.sort(key=lambda x: x[0])
     return days
 
@@ -99,7 +97,6 @@ def shrink_mu(mu: float, sigma: float, n: int, prior_var: float = 0.0001) -> flo
     """
     Мягкая усадка μ к 0 (байесовская логика): mu_post = mu * (n*sigma^2)/(n*sigma^2 + tau^2),
     где tau^2 = prior_var — дисперсия «приора» относительно среднего 0.
-    Для тяжёлых хвостов повышай prior_var.
     """
     if n <= 1:
         return 0.0
@@ -117,14 +114,15 @@ def block_bootstrap_paths(day_logs: List[Tuple[str, float]],
     """
     Возвращает:
       cum_logs  — список суммарных лог-ростов за горизонт;
-      mdds      — список max drawdown (в логах; перевод в % см. ниже).
+      mdds      — список max drawdown (в логах).
     """
     xs = [v for _, v in day_logs]
     n = len(xs)
     if n == 0:
         return [], []
+    
     if np is None:
-        # деградация без numpy: простой нерепликационный бутстрап
+        # деградация без numpy
         import random
         rnd = random.Random(rng_seed)
         cum_logs = []
@@ -134,7 +132,6 @@ def block_bootstrap_paths(day_logs: List[Tuple[str, float]],
             remain = horizon_days
             while remain > 0:
                 j = rnd.randrange(0, n)
-                # берём блок [j, j+block_len)
                 for k in range(block_len):
                     if remain <= 0: break
                     seq.append(xs[(j+k) % n])
@@ -147,7 +144,7 @@ def block_bootstrap_paths(day_logs: List[Tuple[str, float]],
             for r in seq[:horizon_days]:
                 level += r
                 peak = max(peak, level)
-                dd = level - peak  # в лог-терминах (<=0)
+                dd = level - peak
                 if dd < max_dd:
                     max_dd = dd
             cum_logs.append(total)
@@ -163,11 +160,9 @@ def block_bootstrap_paths(day_logs: List[Tuple[str, float]],
             remain = horizon_days
             while remain > 0:
                 j = rng.integers(0, n)
-                blk = xs_np[(j):(j+block_len)]
-                if blk.size < block_len:
-                    # циклически дополним
-                    need = block_len - blk.size
-                    blk = np.concatenate([blk, xs_np[:need]])
+                # Циклическое взятие блока
+                blk_indices = np.arange(j, j + block_len) % n
+                blk = xs_np[blk_indices]
                 take = min(remain, block_len)
                 seq.extend(blk[:take])
                 remain -= take
@@ -176,7 +171,7 @@ def block_bootstrap_paths(day_logs: List[Tuple[str, float]],
             # max DD
             level = np.cumsum(seq)
             peak = np.maximum.accumulate(level)
-            dd_series = level - peak  # <=0
+            dd_series = level - peak
             cum_logs[i] = total
             mdds[i] = float(dd_series.min())
         return list(cum_logs), list(mdds)
@@ -186,28 +181,30 @@ def logs_to_mult(logx: float) -> float:
     return math.exp(logx)
 
 def logdd_to_pct(logdd: float) -> float:
-    # logdd <= 0; перевод в «-DD%»
-    return math.exp(logdd) - 1.0  # будет ≤ 0
+    return math.exp(logdd) - 1.0
 
 def summarize_scenarios(cum_logs: List[float], mdds: List[float]) -> Dict[str, Any]:
     if not cum_logs:
         return {"ok": False, "msg": "недостаточно данных"}
-    def q(p, arr):
-        k = int(round((len(arr)-1)*p))
-        return sorted(arr)[k]
-    mults = [logs_to_mult(x) for x in cum_logs]
-    dd_pct = [logdd_to_pct(d) for d in mdds]  # отрицательные
+    
+    def q(p, arr_sorted):
+        k = int(round((len(arr_sorted)-1)*p))
+        return arr_sorted[k]
+    
+    mults_sorted = sorted([logs_to_mult(x) for x in cum_logs])
+    dd_pct_sorted = sorted([logdd_to_pct(d) for d in mdds])
+    
     res = {
         "ok": True,
         "mult": {
-            "p10": q(0.10, mults),
-            "p50": q(0.50, mults),
-            "p90": q(0.90, mults),
+            "p10": q(0.10, mults_sorted),
+            "p50": q(0.50, mults_sorted),
+            "p90": q(0.90, mults_sorted),
         },
         "dd": {
-            "p10": q(0.10, dd_pct),  # более «жёсткие» DD (меньше по значению)
-            "p50": q(0.50, dd_pct),
-            "p90": q(0.90, dd_pct),
+            "p10": q(0.10, dd_pct_sorted),
+            "p50": q(0.50, dd_pct_sorted),
+            "p90": q(0.90, dd_pct_sorted),
         }
     }
     return res
@@ -218,21 +215,25 @@ def apply_threshold_payout(start_cap: float, mult: float, daily_rate_guess: floa
     """
     Грубая аппроксимация политики «реинвест до 35, далее — вывод ежедневно».
     mult — итоговый мультипликатор за горизонт (из симуляции)
-    daily_rate_guess — оценка средней дневной доходности (геометрической) из выборки
+    daily_rate_guess — оценка средней дневной доходности (геометрической)
     Возвращает: итоговый капитал (min(35, ...)) и суммарные выводы за горизонт.
     """
     cap_end_nothold = start_cap * mult
     if cap_end_nothold <= threshold:
         return {"final_cap": cap_end_nothold, "withdraw": 0.0}
-    # дошли до порога на дне d*, дальше выводим threshold * daily_rate_guess
-    # найдём d* по формуле S*(1+r)^d >= threshold
+    
+    # Если стартовый капитал уже >= порога
+    if start_cap >= threshold:
+        total_withdraw = cap_end_nothold - threshold
+        return {"final_cap": threshold, "withdraw": max(0.0, total_withdraw)}
+    
     if daily_rate_guess <= -1.0:
         return {"final_cap": start_cap, "withdraw": 0.0}
     if daily_rate_guess <= 0:
         return {"final_cap": min(threshold, cap_end_nothold), "withdraw": 0.0}
+    
     d_star = math.ceil(math.log(threshold/start_cap) / math.log(1.0 + daily_rate_guess))
     d_star = max(0, min(horizon_days, d_star))
-    # перелив в день достижения:
     cap_at_d = start_cap * ((1.0 + daily_rate_guess) ** d_star)
     overshoot = max(0.0, cap_at_d - threshold)
     remain = max(0, horizon_days - d_star)
@@ -257,7 +258,6 @@ def build_projection_text(csv_path: str,
     mu, sigma = estimate_mu_sigma(days)
     n = len(days)
     mu_shr = shrink_mu(mu, sigma, n, prior_var=prior_var)
-    # оценка «среднего» дневного геометрического роста (нетто): g ≈ mu_shr
     daily_g = mu_shr
 
     lines = []
@@ -274,7 +274,6 @@ def build_projection_text(csv_path: str,
             lines.append(f"⏳ Горизонт {H}д: данных мало")
             continue
         mults = summ["mult"]; dds = summ["dd"]
-        # применим правило «до 35 — реинвест»
         scen_text = []
         for tag, mult in (("Пессимистичный (10%)", mults["p10"]),
                           ("Реалистичный (50%)", mults["p50"]),
