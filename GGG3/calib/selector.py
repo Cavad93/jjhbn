@@ -1,3 +1,4 @@
+# calib/selector.py
 import numpy as np
 from dataclasses import dataclass
 from typing import Dict, Any, Tuple
@@ -6,31 +7,9 @@ from .beta import BetaCalibrator
 from .isotonic import IsotonicCalibrator
 from .bbq import BBQCalibrator
 
-def brier(y, p, w=None):
-    y = np.asarray(y).ravel().astype(float)
-    p = np.asarray(p).ravel().astype(float)
-    if w is None: w = np.ones_like(y)
-    return np.average((p - y)**2, weights=w)
+# ← ИСПРАВЛЕНИЕ: Импортируем ВСЕ метрики из одного места
+from metrics.calibration import ece, nll, brier
 
-def nll(y, p, w=None):
-    y = np.asarray(y).ravel().astype(float)
-    p = np.clip(np.asarray(p).ravel(), 1e-12, 1-1e-12)
-    if w is None: w = np.ones_like(y)
-    return -np.average(y*np.log(p) + (1-y)*np.log(1-p), weights=w)
-
-def ece(y, p, n_bins=15):
-    y = np.asarray(y).ravel().astype(float)
-    p = np.asarray(p).ravel().astype(float)
-    bins = np.linspace(0,1,n_bins+1)
-    idx = np.digitize(p, bins) - 1
-    e = 0.0
-    for b in range(n_bins):
-        m = idx==b
-        if not np.any(m): continue
-        conf = p[m].mean()
-        acc = y[m].mean()
-        e += (m.sum() / len(y)) * abs(acc - conf)
-    return e
 
 @dataclass
 class CalibratorSelector:
@@ -64,7 +43,7 @@ class CalibratorSelector:
                 else:
                     p = obj.predict_proba(raw_scores)
                 
-                cur = nll(y, p) if self.pick_by == "nll" else brier(y, p)
+                cur = nll(y, p, w=weights) if self.pick_by == "nll" else brier(y, p, w=weights)
                 metrics[name] = float(cur)
                 
                 if cur < best_val:
@@ -82,6 +61,7 @@ class CalibratorSelector:
             p_best = best_obj.predict_proba(raw_scores)
         
         metrics["ece"] = float(ece(y, p_best))
-        metrics["nll"] = float(nll(y, p_best))
+        metrics["nll"] = float(nll(y, p_best, w=weights))
+        metrics["brier"] = float(brier(y, p_best, w=weights))  # ← ДОБАВЛЕНО для полноты
         
         return best_name, best_obj, metrics
