@@ -59,7 +59,12 @@ class PlattCalibrator(_BaseCal):
         self.A: float = 1.0
         self.B: float = 0.0
         self._since = 0
-        self._clf = None  # sklearn LR (если доступен)
+
+    def __setstate__(self, state):
+        """Обратная совместимость при загрузке старых pickle."""
+        self.__dict__.update(state)
+        if not hasattr(self, '_since'):
+            self._since = 0
 
     def transform(self, p_raw: float) -> float:
         z = self.A * _logit(p_raw) + self.B
@@ -77,7 +82,6 @@ class PlattCalibrator(_BaseCal):
             if HAVE_SK and LogisticRegression is not None:
                 clf = LogisticRegression(solver="lbfgs")
                 clf.fit(X, y)
-                self._clf = clf
                 self.A = float(clf.coef_[0,0])
                 self.B = float(clf.intercept_[0])
             else:
@@ -101,17 +105,25 @@ class PlattCalibrator(_BaseCal):
 class IsotonicCalibrator(_BaseCal):
     def __init__(self, window: int = 4000):
         super().__init__(window=window)
-        self.iso = IsotonicRegression(out_of_bounds="clip") if HAVE_SK and IsotonicRegression else None
+        if not HAVE_SK or IsotonicRegression is None:
+            raise RuntimeError("IsotonicCalibrator requires sklearn. Install with: pip install scikit-learn")
+        self.iso = IsotonicRegression(out_of_bounds="clip")
         self._since = 0
 
+    def __setstate__(self, state):
+        """Обратная совместимость при загрузке старых pickle."""
+        self.__dict__.update(state)
+        if not hasattr(self, '_since'):
+            self._since = 0
+
     def transform(self, p_raw: float) -> float:
-        if self.iso is None or not self.ready:
+        if not self.ready:
             return float(min(max(p_raw, 1e-6), 1.0 - 1e-6))
         return float(self.iso.predict([p_raw])[0])
 
     def maybe_fit(self, min_samples: int = 400, every: int = 200) -> bool:
         self._since += 1
-        if self.iso is None or len(self.P) < min_samples or self._since < every:
+        if len(self.P) < min_samples or self._since < every:
             return False
         self._since = 0
         try:
@@ -127,6 +139,12 @@ class TemperatureCalibrator(_BaseCal):
         super().__init__(window=window)
         self.T: float = 1.0
         self._since = 0
+
+    def __setstate__(self, state):
+        """Обратная совместимость при загрузке старых pickle."""
+        self.__dict__.update(state)
+        if not hasattr(self, '_since'):
+            self._since = 0
 
     def transform(self, p_raw: float) -> float:
         z = _logit(p_raw) / max(1e-6, self.T)
@@ -156,6 +174,24 @@ class TemperatureCalibrator(_BaseCal):
             return False
 
 def make_calibrator(method: str = "platt") -> _BaseCal:
-    # УПРОЩЕНО: всегда используем Platt (логистическая регрессия)
-    # Без множественного выбора между методами
-    return PlattCalibrator()
+    """
+    Создаёт калибратор по имени метода.
+    
+    Args:
+        method: "platt", "isotonic" или "temperature"
+    
+    Returns:
+        Инстанс калибратора
+    
+    Raises:
+        ValueError: Если метод неизвестен
+        RuntimeError: Если метод требует sklearn, но он не установлен
+    """
+    if method == "isotonic":
+        return IsotonicCalibrator()
+    elif method == "temperature":
+        return TemperatureCalibrator()
+    elif method == "platt":
+        return PlattCalibrator()
+    else:
+        raise ValueError(f"Unknown calibrator method: {method}. Use 'platt', 'isotonic' or 'temperature'")
