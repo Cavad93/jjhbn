@@ -16,7 +16,7 @@ class PoolFeaturesCtx:
     Копит снимки пулов bull/bear для активного epoch:
       - pool_logit = logit(bull/(bull+bear))
       - Δpool_logit за 30/60с
-      - late_money_share за последние 12с до lock
+      - late_money_share за последние late_sec секунд до lock (по умолчанию 30с)
       - last_k_outcomes_mean: среднее по последним k исходам (UP=1, DOWN=0)
       - last_k_payout_median: медианный payout по последним k
     """
@@ -58,9 +58,11 @@ class PoolFeaturesCtx:
         arr = self.obs.get(epoch, [])
         if not arr:
             return None
-        # ищем последнюю запись со временем <= ts_cut
-        cand = [x for x in arr if x[0] <= ts_cut]
-        return cand[-1] if cand else None
+        # ищем последнюю запись со временем <= ts_cut (обратный перебор для оптимизации)
+        for i in range(len(arr) - 1, -1, -1):
+            if arr[i][0] <= ts_cut:
+                return arr[i]
+        return None
 
     def features(self, epoch: int, lock_ts: int) -> Dict[str, float]:
         out = dict(pool_logit=0.0, pool_logit_d30=0.0, pool_logit_d60=0.0,
@@ -105,9 +107,11 @@ class PoolFeaturesCtx:
             last = self._last_obs_before(epoch, lock_ts) or (self.obs.get(epoch, [])[-1] if self.obs.get(epoch) else None)
             prev = self._last_obs_before(epoch, lock_ts - 1 - self.late)
 
-            # мягкий фолбэк: если prev не нашли (редкие лаги/редкие тики), берём ближайший ≤ lock_ts-1
+            # мягкий фолбэк: если prev не нашли, берём самую раннюю доступную запись
             if (prev is None) and self.obs.get(epoch):
-                prev = self._last_obs_before(epoch, lock_ts - 1)
+                arr = self.obs.get(epoch, [])
+                if arr:
+                    prev = arr[0]
 
             if not last or not prev:
                 return
@@ -129,4 +133,3 @@ class PoolFeaturesCtx:
             return 0.0
         q = min(max(q, 0.0), 1.0)
         return float(np.quantile(np.array(self.late_deltas, dtype=float), q))
-
