@@ -8681,5 +8681,3 @@ if __name__ == "__main__":
         except Exception:
             log_exception("Failed to send Telegram notification")
         raise
-
-
