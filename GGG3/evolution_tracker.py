@@ -174,16 +174,23 @@ class EvolutionTracker:
     
     def accuracy_to_level(self, accuracy: float) -> int:
         """Конвертирует accuracy в уровень эволюции (0-100)"""
-        # Находим подходящую стадию
+        # Валидация и клиппинг
+        try:
+            accuracy = float(accuracy)
+            if not (0 <= accuracy <= 1):
+                accuracy = max(0.0, min(1.0, accuracy))
+        except (TypeError, ValueError):
+            return 0
+        
+        # Находим подходящую стадию (используем <= для включения верхней границы)
         for stage in EVOLUTION_STAGES:
-            if stage.min_accuracy <= accuracy < stage.max_accuracy:
+            if stage.min_accuracy <= accuracy <= stage.max_accuracy:
                 return stage.level
         
-        # Для accuracy >= 1.0 возвращаем максимальный уровень
+        # Fallback для accuracy >= 1.0
         if accuracy >= 1.0:
             return 100
         
-        # Для очень низких accuracy
         return 0
     
     def get_stage(self, level: int) -> EvolutionStage:
@@ -198,35 +205,38 @@ class EvolutionTracker:
         Обновляет уровень эксперта
         
         Returns:
-            EvolutionStage если был переход на новый уровень, иначе None
+            EvolutionStage если был переход на новый порог уведомления, иначе None
         """
         new_level = self.accuracy_to_level(accuracy)
         old_level = self.levels.get(expert_name, 0)
         
         self.levels[expert_name] = new_level
+        
+        # Проверяем, нужно ли уведомление (каждые 10 уровней)
+        last_notified = self.last_notified.get(expert_name, -1)
+        should_notify = (new_level >= last_notified + 10)
+        
+        if should_notify:
+            self.last_notified[expert_name] = new_level
+        
         self._save_state()
         
-        # Проверяем, нужно ли уведомление (переход через порог 10 уровней)
-        if new_level >= old_level + 10:
-            return self.get_stage(new_level)
-        
-        return None
+        return self.get_stage(new_level) if should_notify else None
     
     def should_notify(self, expert_name: str) -> bool:
-        """Проверяет, нужно ли отправить уведомление"""
+        """
+        Проверяет, нужно ли отправить уведомление (БЕЗ модификации состояния)
+        
+        DEPRECATED: Используйте update_expert() напрямую для получения уведомлений
+        """
         current_level = self.levels.get(expert_name, 0)
         last_level = self.last_notified.get(expert_name, -1)
-        
-        # Уведомляем каждые 10 уровней
-        if current_level >= last_level + 10:
-            self.last_notified[expert_name] = current_level
-            return True
-        
-        return False
+        return current_level >= last_level + 10
     
     def _save_state(self):
         """Сохраняет состояние"""
         try:
+            os.makedirs(self.output_dir, exist_ok=True)
             data = {
                 "levels": self.levels,
                 "last_notified": self.last_notified
@@ -234,8 +244,11 @@ class EvolutionTracker:
             with open(self.evolution_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception:
-            from error_logger import log_exception
-            log_exception("Failed to save JSON")
+            try:
+                from error_logger import log_exception
+                log_exception("Failed to save evolution state")
+            except (ImportError, Exception):
+                pass
     
     def _load_state(self):
         """Загружает состояние"""
@@ -246,8 +259,11 @@ class EvolutionTracker:
                 self.levels = data.get("levels", self.levels)
                 self.last_notified = data.get("last_notified", self.last_notified)
         except Exception:
-            from error_logger import log_exception
-            log_exception("Failed to load JSON")
+            try:
+                from error_logger import log_exception
+                log_exception("Failed to load evolution state")
+            except (ImportError, Exception):
+                pass
 
 # Глобальный экземпляр
 _evolution_tracker: Optional[EvolutionTracker] = None
