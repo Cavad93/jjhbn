@@ -2,14 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 META Decision Explainer - объясняет решения META и экспертов человеческим языком.
-
-Анализирует:
-- Почему META выбрала именно такую вероятность
-- Какому эксперту META доверяет больше и почему
-- Что повлияло на решение конкретного эксперта
-- Рыночный контекст и паттерны
-
-~1000 шаблонов фраз для покрытия всех ситуаций.
 """
 
 import math
@@ -22,28 +14,24 @@ import random
 @dataclass
 class ExpertPrediction:
     """Прогноз одного эксперта"""
-    name: str  # XGB, RF, ARF, NN
+    name: str
     p_up: float
-    confidence: float  # условная уверенность
-    weight: float  # вес от META
+    confidence: float
+    weight: float
     
 
 @dataclass
 class MarketContext:
     """Контекст рынка в момент решения"""
-    volatility: str  # "low", "medium", "high"
-    trend: str  # "strong_up", "weak_up", "sideways", "weak_down", "strong_down"
-    volume: str  # "low", "normal", "high"
-    time_of_day: str  # "asian", "european", "us", "quiet"
-    recent_streak: str  # "3W", "2L", etc
+    volatility: str
+    trend: str
+    volume: str
+    time_of_day: str
+    recent_streak: str
     
 
 class MetaExplainer:
-    """
-    Генератор объяснений для решений META и экспертов.
-    
-    Использует ~1000 шаблонов фраз для естественного языка.
-    """
+    """Генератор объяснений для решений META и экспертов."""
     
     def __init__(self, language: str = "ru"):
         self.language = language
@@ -56,36 +44,21 @@ class MetaExplainer:
         features: Dict[str, float],
         context: Optional[MarketContext] = None
     ) -> str:
-        """
-        Главный метод: генерирует полное объяснение решения.
-        
-        Args:
-            meta_p_up: Финальная вероятность UP от META
-            experts: Список прогнозов экспертов
-            features: Словарь фич (RSI, ATR, momentum, etc)
-            context: Рыночный контекст
-            
-        Returns:
-            Многострочное текстовое объяснение
-        """
+        """Генерирует полное объяснение решения."""
         parts = []
         
-        # 1. Общий вердикт META
         parts.append(self._explain_meta_decision(meta_p_up))
         
-        # 2. Анализ экспертов
-        parts.append(self._explain_experts_consensus(experts, meta_p_up))
+        if experts:
+            parts.append(self._explain_experts_consensus(experts, meta_p_up))
+            
+            dominant = self._find_dominant_expert(experts)
+            if dominant:
+                parts.append(self._explain_dominant_expert(dominant, features))
         
-        # 3. Доминирующий эксперт
-        dominant = self._find_dominant_expert(experts)
-        if dominant:
-            parts.append(self._explain_dominant_expert(dominant, features))
-        
-        # 4. Рыночный контекст
         if context:
             parts.append(self._explain_market_context(context, meta_p_up))
         
-        # 5. Факторы риска и уверенность
         parts.append(self._explain_confidence(meta_p_up, experts))
         
         return "\n\n".join(parts)
@@ -98,7 +71,6 @@ class MetaExplainer:
         templates = self.templates["meta_decision"][strength][direction.lower()]
         base = random.choice(templates)
         
-        # Добавляем точное значение
         return base.format(prob=p_up*100, direction=direction)
     
     def _explain_experts_consensus(
@@ -107,7 +79,9 @@ class MetaExplainer:
         meta_p: float
     ) -> str:
         """Объясняет консенсус экспертов"""
-        # Классифицируем согласованность
+        if not experts:
+            return "Эксперты не предоставили прогнозы."
+        
         predictions = [e.p_up for e in experts]
         std = np.std(predictions)
         
@@ -118,7 +92,6 @@ class MetaExplainer:
         else:
             consensus_type = "disagreement"
         
-        # Считаем сколько экспертов за UP/DOWN
         up_count = sum(1 for p in predictions if p > 0.5)
         down_count = len(predictions) - up_count
         
@@ -139,13 +112,11 @@ class MetaExplainer:
         """Объясняет почему доминирует конкретный эксперт"""
         parts = []
         
-        # Почему META доверяет этому эксперту
         weight_pct = expert.weight * 100
         templates_trust = self.templates["expert_trust"][self._classify_weight(expert.weight)]
         trust_text = random.choice(templates_trust)
         parts.append(trust_text.format(expert=expert.name, weight=weight_pct))
         
-        # Что повлияло на решение эксперта
         expert_analysis = self._analyze_expert_reasoning(expert.name, expert.p_up, features)
         parts.append(expert_analysis)
         
@@ -171,14 +142,12 @@ class MetaExplainer:
             return ""
     
     def _explain_xgb_reasoning(self, p_up: float, features: Dict[str, float]) -> str:
-        """Объясняет решение XGBoost (анализирует key features)"""
+        """Объясняет решение XGBoost"""
         parts = []
         direction = "бычье" if p_up > 0.5 else "медвежье"
         
-        # Анализируем ключевые фичи для XGB
         key_signals = []
         
-        # RSI
         rsi = features.get("rsi", 50)
         if rsi > 70:
             key_signals.append(random.choice(self.templates["features"]["rsi"]["overbought"]))
@@ -187,14 +156,12 @@ class MetaExplainer:
         elif 45 < rsi < 55:
             key_signals.append(random.choice(self.templates["features"]["rsi"]["neutral"]))
         
-        # Momentum
         mom = features.get("momentum_1h", 0)
         if abs(mom) > 0.02:
             mom_direction = "восходящий" if mom > 0 else "нисходящий"
             templates_mom = self.templates["features"]["momentum"]["strong"]
             key_signals.append(random.choice(templates_mom).format(direction=mom_direction))
         
-        # Volatility
         atr = features.get("atr_norm", 0)
         if atr > 0.015:
             key_signals.append(random.choice(self.templates["features"]["volatility"]["high"]))
@@ -213,17 +180,14 @@ class MetaExplainer:
         """Объясняет решение Random Forest"""
         direction = "роста" if p_up > 0.5 else "падения"
         
-        # RF хорош в паттернах
         patterns = []
         
-        # Bollinger Bands
         bb_pos = features.get("bb_position", 0.5)
         if bb_pos > 0.8:
             patterns.append("перекупленность по BB")
         elif bb_pos < 0.2:
             patterns.append("перепроданность по BB")
         
-        # Volume
         vol_ratio = features.get("volume_ratio", 1.0)
         if vol_ratio > 1.5:
             patterns.append("аномально высокий объем")
@@ -239,16 +203,12 @@ class MetaExplainer:
     def _explain_arf_reasoning(self, p_up: float, features: Dict[str, float]) -> str:
         """Объясняет решение Adaptive Random Forest"""
         direction = "вверх" if p_up > 0.5 else "вниз"
-        
-        # ARF адаптируется к новым условиям
         base = random.choice(self.templates["expert_reasoning"]["arf"])
         return base.format(direction=direction)
     
     def _explain_nn_reasoning(self, p_up: float, features: Dict[str, float]) -> str:
         """Объясняет решение Neural Network"""
-        direction = "бычий" if p_up > 0.5 else "медвежий"
-        
-        # NN находит сложные нелинейные паттерны
+        direction = "бычьим" if p_up > 0.5 else "медвежьим"
         base = random.choice(self.templates["expert_reasoning"]["nn"])
         return base.format(direction=direction)
     
@@ -256,15 +216,12 @@ class MetaExplainer:
         """Объясняет влияние рыночного контекста"""
         parts = []
         
-        # Volatility
         vol_templates = self.templates["context"]["volatility"][context.volatility]
         parts.append(random.choice(vol_templates))
         
-        # Trend
         trend_templates = self.templates["context"]["trend"][context.trend]
         parts.append(random.choice(trend_templates))
         
-        # Time of day
         time_templates = self.templates["context"]["time"][context.time_of_day]
         parts.append(random.choice(time_templates))
         
@@ -272,12 +229,14 @@ class MetaExplainer:
     
     def _explain_confidence(self, p_up: float, experts: List[ExpertPrediction]) -> str:
         """Объясняет уровень уверенности в прогнозе"""
-        # Уверенность = расстояние от 0.5 + согласованность экспертов
         distance = abs(p_up - 0.5)
-        predictions = [e.p_up for e in experts]
-        agreement = 1.0 - np.std(predictions) / 0.25  # нормализованная согласованность
         
-        confidence_score = (distance * 2 + agreement) / 2
+        if not experts:
+            confidence_score = distance * 2
+        else:
+            predictions = [e.p_up for e in experts]
+            agreement = max(0.0, 1.0 - np.std(predictions) / 0.25)
+            confidence_score = (distance * 2 + agreement) / 2
         
         if confidence_score > 0.7:
             level = "high"
@@ -318,18 +277,7 @@ class MetaExplainer:
             return "weak"
     
     def _load_templates(self) -> Dict[str, Any]:
-        """
-        Загружает ~1000 шаблонов объяснений.
-        
-        Структура:
-        - meta_decision: решения META
-        - consensus: консенсус экспертов
-        - expert_trust: доверие к эксперту
-        - expert_reasoning: объяснения экспертов
-        - features: влияние фич
-        - context: рыночный контекст
-        - confidence: уверенность
-        """
+        """Загружает шаблоны объяснений"""
         return {
             "meta_decision": {
                 "very_strong": {
@@ -580,8 +528,6 @@ class MetaExplainer:
         }
 
 
-# ============= ИНТЕГРАЦИЯ С ОСНОВНЫМ КОДОМ =============
-
 def create_explanation_for_bet(
     p_final: float,
     p_xgb: Optional[float],
@@ -592,24 +538,9 @@ def create_explanation_for_bet(
     features: Dict[str, float],
     context: Optional[Dict[str, Any]] = None
 ) -> str:
-    """
-    Вспомогательная функция для интеграции в main_loop.
-    
-    Вызывайте перед размещением ставки, чтобы получить объяснение.
-    
-    Args:
-        p_final: Итоговая вероятность от META
-        p_xgb, p_rf, p_arf, p_nn: Прогнозы экспертов (может быть None)
-        meta_weights: Веса экспертов от META (dict: {"xgb": 0.3, "rf": 0.2, ...})
-        features: Словарь фич
-        context: Рыночный контекст (опционально)
-    
-    Returns:
-        Текстовое объяснение решения
-    """
+    """Создает объяснение для интеграции в main loop"""
     explainer = MetaExplainer(language="ru")
     
-    # Формируем список экспертов
     experts = []
     if p_xgb is not None:
         experts.append(ExpertPrediction(
@@ -640,7 +571,6 @@ def create_explanation_for_bet(
             weight=meta_weights.get("nn", 0.25) if meta_weights else 0.25
         ))
     
-    # Создаем MarketContext если передан
     market_ctx = None
     if context:
         market_ctx = MarketContext(
@@ -659,10 +589,7 @@ def create_explanation_for_bet(
     )
 
 
-# ============= ПРИМЕР ИСПОЛЬЗОВАНИЯ =============
-
 if __name__ == "__main__":
-    # Тестовый пример
     explanation = create_explanation_for_bet(
         p_final=0.62,
         p_xgb=0.65,
