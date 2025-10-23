@@ -258,19 +258,22 @@ class MetaCEMMC:
         p_base: Optional[float],
         reg_ctx: Optional[dict] = None
     ) -> Optional[float]:
-        """
-        Создает финальное предсказание из предсказаний экспертов
-        """
         ph = phase_from_ctx(reg_ctx)
+        
+        x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
+        if x is None:
+            return None
         
         # Проверяем, обучена ли модель для этой фазы
         w = self.w_meta_ph[ph]
         if np.allclose(w, 0.0):
-            return None  # Модель еще не обучена
-
-        x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
-        if x is None:
-            return None
+            # ИСПРАВЛЕНО: в shadow режиме используем простое среднее экспертов
+            # вместо возврата None (что приводило к использованию p_base)
+            preds = [p for p in [p_xgb, p_rf, p_arf, p_nn] if p is not None]
+            if len(preds) == 0:
+                return None
+            p_mean = float(np.mean(preds))
+            return float(np.clip(p_mean, 0.0, 1.0))
 
         return self._safe_p_from_x(ph, x)
 
@@ -845,7 +848,7 @@ class MetaCEMMC:
         try:
             enter_wr = float(getattr(self.cfg, "meta_enter_wr", 58.0))
             exit_wr = float(getattr(self.cfg, "meta_exit_wr", 52.0))
-            min_ready = int(getattr(self.cfg, "meta_min_ready", 100))
+            min_ready = int(getattr(self.cfg, "meta_min_ready", 80))  # ✅ БЫЛО 100, стало 80
             cv_enabled = bool(getattr(self.cfg, "cv_enabled", True))
         except Exception:
             enter_wr, exit_wr, min_ready, cv_enabled = 58.0, 52.0, 100, True
