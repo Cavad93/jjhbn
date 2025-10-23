@@ -2689,6 +2689,48 @@ def send_round_snapshot(prefix: str, extra_lines: List[str]):
     text = f"{prefix}\n" + "\n".join(extra_lines) + "\n\n" + stats_msg + f"<i>{explain}</i>"
     tg_send(text)
 
+
+def validate_and_clean_features(x_raw: np.ndarray, feature_name: str = "unknown") -> Optional[np.ndarray]:
+    """
+    Валидирует и очищает фичи от NaN/Inf значений.
+    
+    Args:
+        x_raw: массив фичей
+        feature_name: имя эксперта для логирования
+        
+    Returns:
+        Очищенный массив или None если данные невалидны
+    """
+    if x_raw is None:
+        return None
+    
+    try:
+        x = np.asarray(x_raw, dtype=np.float32)
+        
+        # Проверка на NaN
+        if np.any(np.isnan(x)):
+            nan_count = np.sum(np.isnan(x))
+            print(f"⚠️  [{feature_name}] Found {nan_count} NaN values, replacing with 0")
+            x = np.nan_to_num(x, nan=0.0)
+        
+        # Проверка на Inf
+        if np.any(np.isinf(x)):
+            inf_count = np.sum(np.isinf(x))
+            print(f"⚠️  [{feature_name}] Found {inf_count} Inf values, clipping to ±1e10")
+            x = np.clip(x, -1e10, 1e10)
+        
+        # Проверка на экстремальные значения
+        if np.any(np.abs(x) > 1e15):
+            print(f"⚠️  [{feature_name}] Found extreme values (>1e15), clipping")
+            x = np.clip(x, -1e15, 1e15)
+        
+        return x
+    
+    except Exception as e:
+        print(f"❌ [{feature_name}] Feature validation failed: {e}")
+        return None
+
+
 # =============================
 # ML: КОНФИГИ
 # =============================
@@ -2696,8 +2738,8 @@ def send_round_snapshot(prefix: str, extra_lines: List[str]):
 class MLConfig:
     # общие пороги гейтинга (как было)
     min_ready: int = 80
-    enter_wr: float = 3.0
-    exit_wr: float = 1.0
+    enter_wr: float = 0.58      # ✅ БЫЛО 3.0 (300%!) - теперь 58%
+    exit_wr: float = 0.52       # ✅ БЫЛО 1.0 (100%) - теперь 52%
     retrain_every: int = 40
     adwin_delta: float = 0.002
     max_memory: int = 3000          # ИЗМЕНЕНО: было 5000
@@ -2737,12 +2779,15 @@ class MLConfig:
     nn_state_path: str = "nn_state.json"
     nn_model_path: str = "nn_model.pkl"
     nn_scaler_path: str = "nn_scaler.pkl"
-    nn_hidden: int = 16
+    nn_hidden: int = 32
     nn_eta: float = 0.01
     nn_l2: float = 0.0005
-    nn_epochs: int = 30
-    nn_retrain_every: int = 40
+    nn_epochs: int = 1
+    nn_batch_size: int = 128 
+    nn_retrain_every: int = 100
     nn_calib_every: int = 200
+    nn_cal_path: str = "nn_cal.pkl"  # Путь для калибратора
+    nn_calibration_method: str = "temperature"  # Метод калибровки (temperature хорош для NN)
 
     # META
     meta_state_path: str = "meta_state.json"
@@ -2772,7 +2817,11 @@ class MLConfig:
     phase_min_ready: int = 150
     phase_mix_global_share: float = 0.30   # если < phase_min_ready: доля глобального хвоста
     phase_hysteresis_s: int = 300     
-    meta_use_cma_es: bool = True  # ← включаем CMA-ES     # залипание фазы (анти-дрожь)
+    # META CEM+MC
+    meta_use_cma_es: bool = True
+    meta_enter_wr: float = 0.58    # ✅ НОВОЕ: порог активации META (58%)
+    meta_exit_wr: float = 0.52     # ✅ НОВОЕ: порог деактивации META (52%)
+    meta_min_ready: int = 80       # ✅ НОВОЕ: минимум примеров для активации
     meta_weight_decay_days: float = 30.0  # период полураспада для экспоненциального забывания (в днях)
     phase_state_path: str = "phase_state.json"
 
@@ -3101,55 +3150,147 @@ class XGBExpert(_BaseExpert):
         return X, y
 
     def _maybe_train_phase(self, ph: int):
+        """
+        Обучает XGBoost модель для конкретной фазы.
+        
+        Включает:
+        - Проверку накопленных данных
+        - Валидацию фичей
+        - Периодический анализ корреляции
+        - Обучение с warm start
+        - Интеграцию с TrainingVisualizer
+        """
+        
+        # ========== БЛОК 1: БАЗОВЫЕ ПРОВЕРКИ ==========
         if not self.enabled or self.n_feats is None:
             return
+        
         if self.new_since_train_ph.get(ph, 0) < int(self.cfg.retrain_every):
             return
+        
+        # ========== БЛОК 2: ПОЛУЧЕНИЕ ДАННЫХ ==========
         X_all, y_all = self._get_phase_train(ph)
+        
         if len(X_all) < int(self.cfg.phase_min_ready):
             return
+        
+        # Ограничиваем окно обучения
         if len(X_all) > int(self.cfg.train_window):
             X_all = X_all[-int(self.cfg.train_window):]
             y_all = y_all[-int(self.cfg.train_window):]
-
+        
+        # ========== БЛОК 3: ВАЛИДАЦИЯ ДАННЫХ ==========
+        # Проверяем на NaN/Inf перед обучением
+        if np.any(np.isnan(X_all)) or np.any(np.isinf(X_all)):
+            print(f"[XGB] ⚠️  Warning: NaN/Inf detected in training data for phase {ph}, cleaning...")
+            X_all = np.nan_to_num(X_all, nan=0.0, posinf=1e10, neginf=-1e10)
+        
+        # ========== БЛОК 4: ПЕРИОДИЧЕСКИЙ АНАЛИЗ ФИЧЕЙ ==========
+        # Каждые 500 примеров проверяем корреляцию фичей с целью
+        if len(X_all) % 500 == 0 and len(X_all) >= 500:
+            try:
+                from feature_validator import analyze_feature_correlation, check_data_leakage
+                
+                print(f"\n[XGB] 📊 Запуск валидации фичей для фазы {ph}...")
+                
+                # Анализ корреляции
+                correlations = analyze_feature_correlation(
+                    X_all, 
+                    y_all,
+                    feature_names=[f"f{i}" for i in range(X_all.shape[1])],
+                    top_n=20
+                )
+                
+                # Проверка на утечку
+                suspicious = check_data_leakage(
+                    X_all,
+                    feature_names=[f"f{i}" for i in range(X_all.shape[1])]
+                )
+                
+            except ImportError:
+                pass  # feature_validator не установлен
+            except Exception as e:
+                print(f"[XGB] Ошибка валидации фичей: {e}")
+        
+        # ========== БЛОК 5: ОБУЧЕНИЕ МОДЕЛИ ==========
         try:
-            # масштабирование как раньше (global scaler ок, но лучше по батчу фазы)
+            # Масштабирование данных
             self.scaler = StandardScaler().fit(X_all)
             Xt = self.scaler.transform(X_all)
+            
+            # Создание DMatrix
             dtrain = xgb.DMatrix(Xt, label=y_all)
-
+            
+            # Параметры модели
             params = dict(
                 objective="binary:logistic",
                 eval_metric="logloss",
-                eta=getattr(self.cfg, "xgb_eta", 0.1),
+                eta=getattr(self.cfg, "xgb_eta", 0.08),
                 max_depth=getattr(self.cfg, "xgb_max_depth", 4),
                 subsample=getattr(self.cfg, "xgb_subsample", 0.9),
-                colsample_bytree=getattr(self.cfg, "xgb_colsample_bytree", 0.8),
-                min_child_weight=getattr(self.cfg, "xgb_min_child_weight", 1.0),
+                colsample_bytree=getattr(self.cfg, "xgb_colsample_bytree", 0.9),
+                min_child_weight=getattr(self.cfg, "xgb_min_child_weight", 2),
                 tree_method="auto",
             )
-            num_round = int(self.cfg.xgb_rounds_cold if (self.booster is None) else self.cfg.xgb_rounds_warm)
-            self.booster = xgb.train(params, dtrain, num_boost_round=num_round, xgb_model=self.booster)
+            
+            # Warm start: используем существующую модель если есть
+            num_round = int(
+                self.cfg.xgb_rounds_cold if (self.booster is None) 
+                else self.cfg.xgb_rounds_warm
+            )
+            
+            # Обучение
+            self.booster = xgb.train(
+                params, 
+                dtrain, 
+                num_boost_round=num_round, 
+                xgb_model=self.booster
+            )
+            
+            # Сброс счетчика новых примеров
             self.new_since_train_ph[ph] = 0
+            
+            # Сохранение состояния
             self._save_all()
+            
+            print(f"[XGB] ✅ Trained on phase {ph}: {len(X_all)} samples, {num_round} rounds")
+            
         except Exception as e:
-            print(f"[xgb ] train error (ph={ph}): {e}")
-
-    # В самом конце метода _maybe_train_phase
+            print(f"[XGB] ❌ Training error (ph={ph}): {e}")
+            import traceback
+            traceback.print_exc()
+            return
+        
+        # ========== БЛОК 6: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
         try:
             from training_visualizer import get_visualizer
             viz = get_visualizer()
             
-            wr_all = sum(self.active_hits + self.shadow_hits) / len(self.active_hits + self.shadow_hits) if (self.active_hits + self.shadow_hits) else 0.0
+            # Вычисляем общий winrate
+            all_hits = self.active_hits + self.shadow_hits
+            wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
             
+            # Получаем CV метрики текущей фазы
+            cv_metrics = self.cv_metrics.get(ph, {})
+            cv_accuracy = cv_metrics.get("oof_accuracy")
+            cv_ci_lower = cv_metrics.get("ci_lower")
+            cv_ci_upper = cv_metrics.get("ci_upper")
+            
+            # Отправляем метрики в visualizer
             viz.record_expert_metrics(
-                expert_name="XGB",  # Меняйте на RF, NN
+                expert_name="XGB",
                 accuracy=wr_all,
-                n_samples=len(self.active_hits + self.shadow_hits),
+                n_samples=len(all_hits),
+                cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
                 mode=self.mode
             )
-        except:
-            pass
+            
+        except ImportError:
+            pass  # TrainingVisualizer не установлен
+        except Exception as e:
+            print(f"[XGB] Warning: Failed to send metrics to visualizer: {e}")
 
     def _run_cv_validation(self, ph: int) -> Dict:
         """
@@ -3342,24 +3483,32 @@ class XGBExpert(_BaseExpert):
         Записывает результат предсказания и обновляет модель.
         
         Теперь включает:
+        - Валидацию и очистку фичей от NaN/Inf
         - Сохранение в глобальную и фазовую память
         - Трекинг хитов для оценки качества
         - Out-of-fold predictions для cross-validation
         - Периодическую CV проверку для валидации модели
         - Обучение модели при накоплении данных
         - Переключение режимов SHADOW/ACTIVE на основе метрик
+        - Интеграцию с TrainingVisualizer для мониторинга
         """
         
+        # ========== БЛОК 0: ПРОВЕРКА АКТИВНОСТИ ЭКСПЕРТА ==========
+        if not self.enabled:
+            return
+        
+        # ========== БЛОК 0.5: ВАЛИДАЦИЯ И ОЧИСТКА ФИЧЕЙ ==========
+        x_raw = validate_and_clean_features(x_raw, self.__class__.__name__)
+        if x_raw is None:
+            return
+        
         # ========== БЛОК 1: ИНИЦИАЛИЗАЦИЯ И ПРОВЕРКА РАЗМЕРНОСТИ ==========
-        # Убеждаемся, что размерность фичей корректна и инициализирована
         self._ensure_dim(x_raw)
 
         # ========== БЛОК 2: СОХРАНЕНИЕ В ГЛОБАЛЬНУЮ ПАМЯТЬ ==========
-        # Глобальная память используется как fallback, когда в фазе мало данных
         self.X.append(x_raw.astype(np.float32).ravel().tolist())
         self.y.append(int(y_up))
         
-        # Ограничиваем размер глобальной памяти, чтобы не раздувалась
         if len(self.X) > int(getattr(self.cfg, "max_memory", 10_000)):
             self.X = self.X[-self.cfg.max_memory:]
             self.y = self.y[-self.cfg.max_memory:]
@@ -3367,19 +3516,15 @@ class XGBExpert(_BaseExpert):
         self.new_since_train += 1
 
         # ========== БЛОК 3: ОПРЕДЕЛЕНИЕ ФАЗЫ ==========
-        # Извлекаем текущую фазу из контекста (0-5 для 6 фаз)
         ph = 0
         if isinstance(reg_ctx, dict):
             ph = int(reg_ctx.get("phase", 0))
         self._last_seen_phase = ph
 
         # ========== БЛОК 4: СОХРАНЕНИЕ В ФАЗОВУЮ ПАМЯТЬ ==========
-        # Каждая фаза хранит свою собственную историю примеров
-        # Это позволяет модели специализироваться на разных рыночных режимах
         self.X_ph[ph].append(x_raw.astype(np.float32).ravel().tolist())
         self.y_ph[ph].append(int(y_up))
         
-        # Ограничиваем размер фазовой памяти
         cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
         if len(self.X_ph[ph]) > cap:
             self.X_ph[ph] = self.X_ph[ph][-cap:]
@@ -3388,40 +3533,29 @@ class XGBExpert(_BaseExpert):
         self.new_since_train_ph[ph] = self.new_since_train_ph.get(ph, 0) + 1
 
         # ========== БЛОК 5: ТРЕКИНГ ХИТОВ И DRIFT DETECTION ==========
-        # Оцениваем качество предсказания и отслеживаем дрейф концепции
         if p_pred is not None:
             try:
-                # Считаем hit: правильно ли предсказали направление?
                 hit = int((float(p_pred) >= 0.5) == bool(y_up))
                 
                 if self.mode == "ACTIVE" and used_in_live:
-                    # В активном режиме отслеживаем реальные сделки
                     self.active_hits.append(hit)
                     
-                    # ADWIN детектирует дрейф распределения ошибок
                     if self.adwin is not None:
-                        in_drift = self.adwin.update(1 - hit)  # 1=correct, 0=error
+                        in_drift = self.adwin.update(1 - hit)
                         if in_drift:
-                            # Обнаружен дрейф - возвращаемся в shadow режим
                             self.mode = "SHADOW"
                             self.active_hits = []
                 else:
-                    # В shadow режиме накапливаем "что было бы, если бы входили"
                     self.shadow_hits.append(hit)
             except Exception:
                 log_exception("Failed to update")
 
-        # ========== БЛОК 6: НОВОЕ - СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
-        # Out-of-fold predictions нужны для расчета метрик cross-validation
-        # Эти предсказания были сделаны на данных, которые модель НЕ видела при обучении
+        # ========== БЛОК 6: СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
         if self.cfg.cv_enabled and p_pred is not None:
             self.cv_oof_preds[ph].append(float(p_pred))
             self.cv_oof_labels[ph].append(int(y_up))
 
         # ========== БЛОК 7: ФАЗОВАЯ КАЛИБРОВКА ==========
-        # Калибратор корректирует вероятности для каждой фазы отдельно
-        # Это важно, потому что модель может быть по-разному откалибрована в разных режимах
-        # стало
         try:
             p_raw = self._predict_raw(x_raw)
             if p_raw is not None:
@@ -3438,27 +3572,18 @@ class XGBExpert(_BaseExpert):
             import logging
             logging.getLogger("errors").error("[xgb] calibrator failed ph=%s: %s", ph, e, exc_info=True)
 
-
-        # ========== БЛОК 8: НОВОЕ - ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
-        # Каждые N примеров запускаем полную cross-validation для оценки реального качества
-        # Это защищает от переобучения и дает честную оценку обобщающей способности
+        # ========== БЛОК 8: ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
         self.cv_last_check[ph] += 1
         
         if self.cfg.cv_enabled and self.cv_last_check[ph] >= self.cfg.cv_check_every:
-            # Сбрасываем счетчик
             self.cv_last_check[ph] = 0
             
-            # Запускаем полную walk-forward cross-validation с purging
             cv_results = self._run_cv_validation(ph)
-            
-            # Сохраняем результаты для использования в _maybe_flip_modes
             self.cv_metrics[ph] = cv_results
             
-            # Если CV прошла успешно, помечаем фазу как валидированную
             if cv_results.get("status") == "ok":
                 self.validation_passed[ph] = True
             
-            # Логируем результаты для мониторинга
             if cv_results.get("status") == "ok":
                 print(f"[{self.__class__.__name__}] CV ph={ph}: "
                     f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
@@ -3466,15 +3591,12 @@ class XGBExpert(_BaseExpert):
                     f"folds={cv_results['n_folds']}")
 
         # ========== БЛОК 9: ОБУЧЕНИЕ МОДЕЛИ ПО ФАЗЕ ==========
-        # Когда накопилось достаточно новых примеров в фазе, запускаем переобучение
         self._maybe_train_phase(ph)
 
         # ========== БЛОК 10: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ==========
-        # Проверяем метрики (включая CV) и решаем, переключать ли SHADOW ↔ ACTIVE
         self._maybe_flip_modes()
         
         # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
-        # Периодически сохраняем все на диск для восстановления после перезапуска
         self._save_all()
 
     # ---------- режимы ----------
@@ -3706,74 +3828,145 @@ class RFCalibratedExpert(_BaseExpert):
         return X, y
 
     def _maybe_train_phase(self, ph: int) -> None:
-        # тренируем ровно по фазе ph (с подмешиванием прошлых фаз 0..ph при нехватке)
+        """
+        Обучает Random Forest модель для конкретной фазы.
+        
+        Включает:
+        - Проверку накопленных данных
+        - Валидацию фичей
+        - Периодический анализ корреляции
+        - Обучение с калибровкой вероятностей
+        - Интеграцию с TrainingVisualizer
+        """
+        
+        # ========== БЛОК 1: БАЗОВЫЕ ПРОВЕРКИ ==========
         if self.n_feats is None or not self.enabled:
             return
+        
         if self.new_since_train_ph.get(ph, 0) < int(self.cfg.retrain_every):
             return
-
+        
+        # ========== БЛОК 2: ПОЛУЧЕНИЕ ДАННЫХ ==========
         X_all, y_all = self._get_phase_train(ph)
+        
         if len(X_all) < int(self.cfg.phase_min_ready):
             return
-
-
-        # ограничим окно обучения
+        
+        # Ограничиваем окно обучения
         if len(X_all) > int(self.cfg.train_window):
             X_all = X_all[-int(self.cfg.train_window):]
             y_all = y_all[-int(self.cfg.train_window):]
-
+        
+        # ========== БЛОК 3: ВАЛИДАЦИЯ ДАННЫХ ==========
+        # Проверяем на NaN/Inf перед обучением
+        if np.any(np.isnan(X_all)) or np.any(np.isinf(X_all)):
+            print(f"[RF] ⚠️  Warning: NaN/Inf detected in training data for phase {ph}, cleaning...")
+            X_all = np.nan_to_num(X_all, nan=0.0, posinf=1e10, neginf=-1e10)
+        
+        # ========== БЛОК 4: ПЕРИОДИЧЕСКИЙ АНАЛИЗ ФИЧЕЙ ==========
+        # Каждые 500 примеров проверяем корреляцию фичей с целью
+        if len(X_all) % 500 == 0 and len(X_all) >= 500:
+            try:
+                from feature_validator import analyze_feature_correlation, check_data_leakage
+                
+                print(f"\n[RF] 📊 Запуск валидации фичей для фазы {ph}...")
+                
+                # Анализ корреляции
+                correlations = analyze_feature_correlation(
+                    X_all, 
+                    y_all,
+                    feature_names=[f"f{i}" for i in range(X_all.shape[1])],
+                    top_n=20
+                )
+                
+                # Проверка на утечку
+                suspicious = check_data_leakage(
+                    X_all,
+                    feature_names=[f"f{i}" for i in range(X_all.shape[1])]
+                )
+                
+            except ImportError:
+                pass  # feature_validator не установлен
+            except Exception as e:
+                print(f"[RF] Ошибка валидации фичей: {e}")
+        
+        # ========== БЛОК 5: ОБУЧЕНИЕ МОДЕЛИ ==========
         try:
-            # (пере)инициализация модели при необходимости
-            if self.clf is None:
-                # (пере)инициализация МОДЕЛИ ДЛЯ КОНКРЕТНОЙ ФАЗЫ
-                from sklearn.ensemble import RandomForestClassifier
-                from sklearn.calibration import CalibratedClassifierCV
-
-                model = self.clf_ph.get(ph)
-                if model is None:
-                    base = RandomForestClassifier(
-                        n_estimators=getattr(self.cfg, "rf_n_estimators", 300),
-                        max_depth=getattr(self.cfg, "rf_max_depth", None),
-                        min_samples_leaf=getattr(self.cfg, "rf_min_samples_leaf", 2),
-                        n_jobs=-1,
-                        random_state=42,
-                        class_weight=None
-                    )
-                    cal_method = getattr(self.cfg, "rf_calibration_method", "sigmoid")
-                    try:
-                        model = CalibratedClassifierCV(estimator=base, method=cal_method, cv=3)
-                    except TypeError:
-                        model = CalibratedClassifierCV(base_estimator=base, method=cal_method, cv=3)
-
-                # обучение на фазовом батче
-                model.fit(X_all, y_all)
-
-                # сохранить в контейнер фаз
-                self.clf_ph[ph] = model
-                # для обратной совместимости оставим ссылку на "последнюю обученную"
-                self.clf = model
-
-
+            from sklearn.ensemble import RandomForestClassifier
+            from sklearn.calibration import CalibratedClassifierCV
+            
+            # Создаем базовую модель Random Forest
+            base = RandomForestClassifier(
+                n_estimators=getattr(self.cfg, "rf_n_estimators", 300),
+                max_depth=getattr(self.cfg, "rf_max_depth", None),
+                min_samples_leaf=getattr(self.cfg, "rf_min_samples_leaf", 2),
+                n_jobs=-1,
+                random_state=42,
+                class_weight=None
+            )
+            
+            # Оборачиваем в калибратор для получения откалиброванных вероятностей
+            cal_method = getattr(self.cfg, "rf_calibration_method", "sigmoid")
+            try:
+                # Новый API sklearn
+                model = CalibratedClassifierCV(estimator=base, method=cal_method, cv=3)
+            except TypeError:
+                # Старый API sklearn
+                model = CalibratedClassifierCV(base_estimator=base, method=cal_method, cv=3)
+            
+            # Обучение на фазовом батче
+            model.fit(X_all, y_all)
+            
+            # Сохраняем модель для конкретной фазы
+            self.clf_ph[ph] = model
+            
+            # Обратная совместимость: ссылка на последнюю обученную модель
+            self.clf = model
+            
+            # Сбрасываем счетчик новых примеров
             self.new_since_train_ph[ph] = 0
-            # опционально: self._save_all()
+            
+            # Сохраняем состояние на диск
+            self._save_all()
+            
+            print(f"[RF] ✅ Trained on phase {ph}: {len(X_all)} samples, {cal_method} calibration")
+            
         except Exception as e:
-            print(f"[rf  ] train error (ph={ph}): {e}")
-
-    # В самом конце метода _maybe_train_phase
+            print(f"[RF] ❌ Training error (ph={ph}): {e}")
+            import traceback
+            traceback.print_exc()
+            return
+        
+        # ========== БЛОК 6: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
         try:
             from training_visualizer import get_visualizer
             viz = get_visualizer()
             
-            wr_all = sum(self.active_hits + self.shadow_hits) / len(self.active_hits + self.shadow_hits) if (self.active_hits + self.shadow_hits) else 0.0
+            # Вычисляем общий winrate
+            all_hits = self.active_hits + self.shadow_hits
+            wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
             
+            # Получаем CV метрики текущей фазы
+            cv_metrics = self.cv_metrics.get(ph, {})
+            cv_accuracy = cv_metrics.get("oof_accuracy")
+            cv_ci_lower = cv_metrics.get("ci_lower")
+            cv_ci_upper = cv_metrics.get("ci_upper")
+            
+            # Отправляем метрики в visualizer
             viz.record_expert_metrics(
-                expert_name="RF",  # Меняйте на RF, NN
+                expert_name="RF",
                 accuracy=wr_all,
-                n_samples=len(self.active_hits + self.shadow_hits),
+                n_samples=len(all_hits),
+                cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
                 mode=self.mode
             )
-        except:
-            pass
+            
+        except ImportError:
+            pass  # TrainingVisualizer не установлен
+        except Exception as e:
+            print(f"[RF] Warning: Failed to send metrics to visualizer: {e}")
 
 
     def _run_cv_validation(self, ph: int) -> Dict:
@@ -4176,24 +4369,32 @@ class RFCalibratedExpert(_BaseExpert):
         Записывает результат предсказания и обновляет модель.
         
         Теперь включает:
+        - Валидацию и очистку фичей от NaN/Inf
         - Сохранение в глобальную и фазовую память
         - Трекинг хитов для оценки качества
         - Out-of-fold predictions для cross-validation
         - Периодическую CV проверку для валидации модели
         - Обучение модели при накоплении данных
         - Переключение режимов SHADOW/ACTIVE на основе метрик
+        - Интеграцию с TrainingVisualizer для мониторинга
         """
         
+        # ========== БЛОК 0: ПРОВЕРКА АКТИВНОСТИ ЭКСПЕРТА ==========
+        if not self.enabled:
+            return
+        
+        # ========== БЛОК 0.5: ВАЛИДАЦИЯ И ОЧИСТКА ФИЧЕЙ ==========
+        x_raw = validate_and_clean_features(x_raw, "RF")
+        if x_raw is None:
+            return
+        
         # ========== БЛОК 1: ИНИЦИАЛИЗАЦИЯ И ПРОВЕРКА РАЗМЕРНОСТИ ==========
-        # Убеждаемся, что размерность фичей корректна и инициализирована
         self._ensure_dim(x_raw)
 
         # ========== БЛОК 2: СОХРАНЕНИЕ В ГЛОБАЛЬНУЮ ПАМЯТЬ ==========
-        # Глобальная память используется как fallback, когда в фазе мало данных
         self.X.append(x_raw.astype(np.float32).ravel().tolist())
         self.y.append(int(y_up))
         
-        # Ограничиваем размер глобальной памяти, чтобы не раздувалась
         if len(self.X) > int(getattr(self.cfg, "max_memory", 10_000)):
             self.X = self.X[-self.cfg.max_memory:]
             self.y = self.y[-self.cfg.max_memory:]
@@ -4201,19 +4402,15 @@ class RFCalibratedExpert(_BaseExpert):
         self.new_since_train += 1
 
         # ========== БЛОК 3: ОПРЕДЕЛЕНИЕ ФАЗЫ ==========
-        # Извлекаем текущую фазу из контекста (0-5 для 6 фаз)
         ph = 0
         if isinstance(reg_ctx, dict):
             ph = int(reg_ctx.get("phase", 0))
         self._last_seen_phase = ph
 
         # ========== БЛОК 4: СОХРАНЕНИЕ В ФАЗОВУЮ ПАМЯТЬ ==========
-        # Каждая фаза хранит свою собственную историю примеров
-        # Это позволяет модели специализироваться на разных рыночных режимах
         self.X_ph[ph].append(x_raw.astype(np.float32).ravel().tolist())
         self.y_ph[ph].append(int(y_up))
         
-        # Ограничиваем размер фазовой памяти
         cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
         if len(self.X_ph[ph]) > cap:
             self.X_ph[ph] = self.X_ph[ph][-cap:]
@@ -4222,40 +4419,29 @@ class RFCalibratedExpert(_BaseExpert):
         self.new_since_train_ph[ph] = self.new_since_train_ph.get(ph, 0) + 1
 
         # ========== БЛОК 5: ТРЕКИНГ ХИТОВ И DRIFT DETECTION ==========
-        # Оцениваем качество предсказания и отслеживаем дрейф концепции
         if p_pred is not None:
             try:
-                # Считаем hit: правильно ли предсказали направление?
                 hit = int((float(p_pred) >= 0.5) == bool(y_up))
                 
                 if self.mode == "ACTIVE" and used_in_live:
-                    # В активном режиме отслеживаем реальные сделки
                     self.active_hits.append(hit)
                     
-                    # ADWIN детектирует дрейф распределения ошибок
                     if self.adwin is not None:
-                        in_drift = self.adwin.update(1 - hit)  # 1=correct, 0=error
+                        in_drift = self.adwin.update(1 - hit)
                         if in_drift:
-                            # Обнаружен дрейф - возвращаемся в shadow режим
                             self.mode = "SHADOW"
                             self.active_hits = []
                 else:
-                    # В shadow режиме накапливаем "что было бы, если бы входили"
                     self.shadow_hits.append(hit)
             except Exception:
                 log_exception("Failed to update")
 
-        # ========== БЛОК 6: НОВОЕ - СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
-        # Out-of-fold predictions нужны для расчета метрик cross-validation
-        # Эти предсказания были сделаны на данных, которые модель НЕ видела при обучении
+        # ========== БЛОК 6: СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
         if self.cfg.cv_enabled and p_pred is not None:
             self.cv_oof_preds[ph].append(float(p_pred))
             self.cv_oof_labels[ph].append(int(y_up))
 
         # ========== БЛОК 7: ФАЗОВАЯ КАЛИБРОВКА ==========
-        # Калибратор корректирует вероятности для каждой фазы отдельно
-        # Это важно, потому что модель может быть по-разному откалибрована в разных режимах
-        # стало
         try:
             p_raw = self._predict_raw(x_raw)
             if p_raw is not None:
@@ -4272,27 +4458,18 @@ class RFCalibratedExpert(_BaseExpert):
             import logging
             logging.getLogger("errors").error("[rf ] calibrator failed ph=%s: %s", ph, e, exc_info=True)
 
-
-        # ========== БЛОК 8: НОВОЕ - ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
-        # Каждые N примеров запускаем полную cross-validation для оценки реального качества
-        # Это защищает от переобучения и дает честную оценку обобщающей способности
+        # ========== БЛОК 8: ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
         self.cv_last_check[ph] += 1
         
         if self.cfg.cv_enabled and self.cv_last_check[ph] >= self.cfg.cv_check_every:
-            # Сбрасываем счетчик
             self.cv_last_check[ph] = 0
             
-            # Запускаем полную walk-forward cross-validation с purging
             cv_results = self._run_cv_validation(ph)
-            
-            # Сохраняем результаты для использования в _maybe_flip_modes
             self.cv_metrics[ph] = cv_results
             
-            # Если CV прошла успешно, помечаем фазу как валидированную
             if cv_results.get("status") == "ok":
                 self.validation_passed[ph] = True
             
-            # Логируем результаты для мониторинга
             if cv_results.get("status") == "ok":
                 print(f"[{self.__class__.__name__}] CV ph={ph}: "
                     f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
@@ -4300,16 +4477,14 @@ class RFCalibratedExpert(_BaseExpert):
                     f"folds={cv_results['n_folds']}")
 
         # ========== БЛОК 9: ОБУЧЕНИЕ МОДЕЛИ ПО ФАЗЕ ==========
-        # Когда накопилось достаточно новых примеров в фазе, запускаем переобучение
         self._maybe_train_phase(ph)
 
         # ========== БЛОК 10: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ==========
-        # Проверяем метрики (включая CV) и решаем, переключать ли SHADOW ↔ ACTIVE
         self._maybe_flip_modes()
         
         # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
-        # Периодически сохраняем все на диск для восстановления после перезапуска
         self._save_all()
+
 
     def _maybe_flip_modes(self):
         """
@@ -4615,14 +4790,31 @@ class RiverARFExpert(_BaseExpert):
         """
         Записывает результат и обновляет модель онлайн.
         River ARF обучается инкрементально без полного переобучения.
+        
+        Теперь включает:
+        - Валидацию и очистку фичей от NaN/Inf
+        - Онлайн-обучение на каждом примере
+        - Дедупликацию по epoch
+        - Трекинг качества и drift detection
+        - Out-of-fold predictions для CV
+        - Фазовую калибровку вероятностей
+        - Периодическую CV проверку
+        - Интеграцию с TrainingVisualizer
         """
+        
+        # ========== БЛОК 0: ПРОВЕРКА АКТИВНОСТИ ==========
         if not self.enabled or self.clf is None:
             return
-
-        # Проверка размерности
+        
+        # ========== БЛОК 0.5: ВАЛИДАЦИЯ И ОЧИСТКА ФИЧЕЙ ==========
+        x_raw = validate_and_clean_features(x_raw, "ARF")
+        if x_raw is None:
+            return
+        
+        # ========== БЛОК 1: ПРОВЕРКА РАЗМЕРНОСТИ ==========
         self._ensure_dim(x_raw)
 
-        # Дедупликация по epoch
+        # ========== БЛОК 2: ДЕДУПЛИКАЦИЯ ПО EPOCH ==========
         try:
             eid = int(reg_ctx.get("epoch")) if isinstance(reg_ctx, dict) and "epoch" in reg_ctx else None
         except Exception:
@@ -4632,30 +4824,29 @@ class RiverARFExpert(_BaseExpert):
         if eid is not None:
             self._seen_epochs.append(eid)
 
-        # === ОНЛАЙН-ОБУЧЕНИЕ RIVER ARF ===
-        # Главное преимущество River: учится на каждом примере без переобучения
+        # ========== БЛОК 3: ОНЛАЙН-ОБУЧЕНИЕ RIVER ARF ==========
         try:
             self.clf.learn_one(self._to_dict(x_raw), bool(y_up))
         except Exception:
             log_exception("Unhandled exception")
 
-        # === СОХРАНЕНИЕ В БУФЕРЫ (для CV и метрик) ===
+        # ========== БЛОК 4: СОХРАНЕНИЕ В БУФЕРЫ ==========
         self.X.append(x_raw.astype(np.float32).ravel().tolist())
         self.y.append(int(y_up))
         self.new_since_train += 1
 
-        # Фаза
+        # ========== БЛОК 5: ОПРЕДЕЛЕНИЕ ФАЗЫ ==========
         ph = 0
         if isinstance(reg_ctx, dict):
             ph = int(reg_ctx.get("phase", 0))
         self._last_seen_phase = ph
 
-        # Фазовая память
+        # ========== БЛОК 6: ФАЗОВАЯ ПАМЯТЬ ==========
         self.X_ph[ph].append(x_raw.astype(np.float32).ravel().tolist())
         self.y_ph[ph].append(int(y_up))
         self.new_since_train_ph[ph] = self.new_since_train_ph.get(ph, 0) + 1
 
-        # === ТРЕКИНГ КАЧЕСТВА И DRIFT DETECTION ===
+        # ========== БЛОК 7: ТРЕКИНГ КАЧЕСТВА И DRIFT DETECTION ==========
         if p_pred is not None:
             try:
                 hit = int((float(p_pred) >= 0.5) == bool(y_up))
@@ -4675,13 +4866,12 @@ class RiverARFExpert(_BaseExpert):
             except Exception:
                 log_exception("Failed to update")
 
-        # === OOF PREDICTIONS ДЛЯ CV ===
+        # ========== БЛОК 8: OOF PREDICTIONS ДЛЯ CV ==========
         if getattr(self.cfg, "cv_enabled", False) and p_pred is not None:
             self.cv_oof_preds[ph].append(float(p_pred))
             self.cv_oof_labels[ph].append(int(y_up))
 
-        # === ФАЗОВАЯ КАЛИБРОВКА ===
-        # стало
+        # ========== БЛОК 9: ФАЗОВАЯ КАЛИБРОВКА ==========
         try:
             p_raw = self._predict_raw(x_raw)
             if p_raw is not None:
@@ -4698,8 +4888,7 @@ class RiverARFExpert(_BaseExpert):
             import logging
             logging.getLogger("errors").error("[arf] calibrator failed ph=%s: %s", ph, e, exc_info=True)
 
-
-        # === ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ===
+        # ========== БЛОК 10: ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
         self.cv_last_check[ph] = self.cv_last_check.get(ph, 0) + 1
         
         if getattr(self.cfg, "cv_enabled", False):
@@ -4716,11 +4905,36 @@ class RiverARFExpert(_BaseExpert):
                         f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
                         f"n={cv_results['oof_samples']}")
 
-        # === ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ===
+        # ========== БЛОК 11: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ==========
         self._maybe_flip_modes()
         
-        # === СОХРАНЕНИЕ ===
+        # ========== БЛОК 12: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
         self._save_all()
+
+        # ========== БЛОК 13: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            
+            all_hits = self.active_hits + self.shadow_hits
+            wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
+            
+            cv_metrics = self.cv_metrics.get(ph, {})
+            cv_accuracy = cv_metrics.get("oof_accuracy")
+            cv_ci_lower = cv_metrics.get("ci_lower")
+            cv_ci_upper = cv_metrics.get("ci_upper")
+            
+            viz.record_expert_metrics(
+                expert_name="ARF",
+                accuracy=wr_all,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
+                mode=self.mode
+            )
+        except Exception:
+            pass
 
     def _get_phase_train(self, ph: int) -> Tuple[np.ndarray, np.ndarray]:
         """Получает данные для обучения/валидации фазы"""
@@ -5233,24 +5447,32 @@ class NNExpert(_BaseExpert):
         Записывает результат предсказания и обновляет модель.
         
         Теперь включает:
+        - Валидацию и очистку фичей от NaN/Inf
         - Сохранение в глобальную и фазовую память
         - Трекинг хитов для оценки качества
         - Out-of-fold predictions для cross-validation
         - Периодическую CV проверку для валидации модели
         - Обучение модели при накоплении данных
         - Переключение режимов SHADOW/ACTIVE на основе метрик
+        - Интеграцию с TrainingVisualizer для мониторинга
         """
         
+        # ========== БЛОК 0: ПРОВЕРКА АКТИВНОСТИ ЭКСПЕРТА ==========
+        if not self.enabled:
+            return
+        
+        # ========== БЛОК 0.5: ВАЛИДАЦИЯ И ОЧИСТКА ФИЧЕЙ ==========
+        x_raw = validate_and_clean_features(x_raw, "NN")
+        if x_raw is None:
+            return
+        
         # ========== БЛОК 1: ИНИЦИАЛИЗАЦИЯ И ПРОВЕРКА РАЗМЕРНОСТИ ==========
-        # Убеждаемся, что размерность фичей корректна и инициализирована
         self._ensure_dim(x_raw)
 
         # ========== БЛОК 2: СОХРАНЕНИЕ В ГЛОБАЛЬНУЮ ПАМЯТЬ ==========
-        # Глобальная память используется как fallback, когда в фазе мало данных
         self.X.append(x_raw.astype(np.float32).ravel().tolist())
         self.y.append(int(y_up))
         
-        # Ограничиваем размер глобальной памяти, чтобы не раздувалась
         if len(self.X) > int(getattr(self.cfg, "max_memory", 10_000)):
             self.X = self.X[-self.cfg.max_memory:]
             self.y = self.y[-self.cfg.max_memory:]
@@ -5258,19 +5480,15 @@ class NNExpert(_BaseExpert):
         self.new_since_train += 1
 
         # ========== БЛОК 3: ОПРЕДЕЛЕНИЕ ФАЗЫ ==========
-        # Извлекаем текущую фазу из контекста (0-5 для 6 фаз)
         ph = 0
         if isinstance(reg_ctx, dict):
             ph = int(reg_ctx.get("phase", 0))
         self._last_seen_phase = ph
 
         # ========== БЛОК 4: СОХРАНЕНИЕ В ФАЗОВУЮ ПАМЯТЬ ==========
-        # Каждая фаза хранит свою собственную историю примеров
-        # Это позволяет модели специализироваться на разных рыночных режимах
         self.X_ph[ph].append(x_raw.astype(np.float32).ravel().tolist())
         self.y_ph[ph].append(int(y_up))
         
-        # Ограничиваем размер фазовой памяти
         cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
         if len(self.X_ph[ph]) > cap:
             self.X_ph[ph] = self.X_ph[ph][-cap:]
@@ -5279,80 +5497,58 @@ class NNExpert(_BaseExpert):
         self.new_since_train_ph[ph] = self.new_since_train_ph.get(ph, 0) + 1
 
         # ========== БЛОК 5: ТРЕКИНГ ХИТОВ И DRIFT DETECTION ==========
-        # Оцениваем качество предсказания и отслеживаем дрейф концепции
         if p_pred is not None:
             try:
-                # Считаем hit: правильно ли предсказали направление?
                 hit = int((float(p_pred) >= 0.5) == bool(y_up))
                 
                 if self.mode == "ACTIVE" and used_in_live:
-                    # В активном режиме отслеживаем реальные сделки
                     self.active_hits.append(hit)
                     
-                    # ADWIN детектирует дрейф распределения ошибок
                     if self.adwin is not None:
-                        in_drift = self.adwin.update(1 - hit)  # 1=correct, 0=error
+                        in_drift = self.adwin.update(1 - hit)
                         if in_drift:
-                            # Обнаружен дрейф - возвращаемся в shadow режим
                             self.mode = "SHADOW"
                             self.active_hits = []
                 else:
-                    # В shadow режиме накапливаем "что было бы, если бы входили"
                     self.shadow_hits.append(hit)
             except Exception:
                 log_exception("Failed to update")
 
-        # ========== БЛОК 6: НОВОЕ - СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
-        # Out-of-fold predictions нужны для расчета метрик cross-validation
-        # Эти предсказания были сделаны на данных, которые модель НЕ видела при обучении
+        # ========== БЛОК 6: СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
         if self.cfg.cv_enabled and p_pred is not None:
             self.cv_oof_preds[ph].append(float(p_pred))
             self.cv_oof_labels[ph].append(int(y_up))
 
         # ========== БЛОК 7: ФАЗОВАЯ КАЛИБРОВКА ==========
-        # Калибратор корректирует вероятности для каждой фазы отдельно
-        # Это важно, потому что модель может быть по-разному откалибрована в разных режимах
         try:
             p_raw = self._predict_raw(x_raw)
             if p_raw is not None:
-                # Инициализируем калибратор для этой фазы, если его нет
                 if self.cal_ph[ph] is None:
                     from prob_calibrators import make_calibrator
                     method = getattr(self.cfg, "nn_calibration_method",
                                     getattr(self.cfg, "xgb_calibration_method", "logistic"))
                     self.cal_ph[ph] = make_calibrator(method)
 
-                # Показываем калибратору истинную пару (предсказание, результат)
                 self.cal_ph[ph].observe(float(p_raw), int(y_up))
 
-                # Периодически пересчитываем калибровку
                 if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
                     cal_path = self._cal_path(getattr(self.cfg, "nn_cal_path", self.cfg.xgb_cal_path), ph)
                     self.cal_ph[ph].save(cal_path)
         except Exception:
             log_exception("Failed to observe")
 
-
-        # ========== БЛОК 8: НОВОЕ - ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
-        # Каждые N примеров запускаем полную cross-validation для оценки реального качества
-        # Это защищает от переобучения и дает честную оценку обобщающей способности
+        # ========== БЛОК 8: ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
         self.cv_last_check[ph] += 1
         
         if self.cfg.cv_enabled and self.cv_last_check[ph] >= self.cfg.cv_check_every:
-            # Сбрасываем счетчик
             self.cv_last_check[ph] = 0
             
-            # Запускаем полную walk-forward cross-validation с purging
             cv_results = self._run_cv_validation(ph)
-            
-            # Сохраняем результаты для использования в _maybe_flip_modes
             self.cv_metrics[ph] = cv_results
             
-            # Если CV прошла успешно, помечаем фазу как валидированную
             if cv_results.get("status") == "ok":
                 self.validation_passed[ph] = True
             
-            # Логируем результаты для мониторинга
             if cv_results.get("status") == "ok":
                 print(f"[{self.__class__.__name__}] CV ph={ph}: "
                     f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
@@ -5360,16 +5556,15 @@ class NNExpert(_BaseExpert):
                     f"folds={cv_results['n_folds']}")
 
         # ========== БЛОК 9: ОБУЧЕНИЕ МОДЕЛИ ПО ФАЗЕ ==========
-        # Когда накопилось достаточно новых примеров в фазе, запускаем переобучение
         self._maybe_train_phase(ph)
 
         # ========== БЛОК 10: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ==========
-        # Проверяем метрики (включая CV) и решаем, переключать ли SHADOW ↔ ACTIVE
         self._maybe_flip_modes()
         
         # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
-        # Периодически сохраняем все на диск для восстановления после перезапуска
         self._save_all()
+    
+
 
     def _maybe_flip_modes(self):
         """
@@ -5444,22 +5639,69 @@ class NNExpert(_BaseExpert):
     # --- обучение NN по ФАЗЕ ---
     # --- обучение NN по ФАЗЕ ---
     def _maybe_train_phase(self, ph: int) -> None:
-        # перезапуск обучения только когда в фазе накопилось достаточно новых примеров
+        """
+        Обучает Neural Network модель для конкретной фазы.
+        
+        Включает:
+        - Проверку накопленных данных
+        - Валидацию фичей
+        - Периодический анализ корреляции
+        - Градиентное обучение с эпохами
+        - Стандартизацию данных
+        - Интеграцию с TrainingVisualizer
+        """
+        
+        # ========== БЛОК 1: БАЗОВЫЕ ПРОВЕРКИ ==========
         if self.new_since_train_ph.get(ph, 0) < int(getattr(self.cfg, "nn_retrain_every", 100)):
             return
-
-        # собираем батч конкретной фазы
+        
+        # ========== БЛОК 2: ПОЛУЧЕНИЕ ДАННЫХ ==========
         X_all, y_all = self._get_phase_train(ph)
+        
         if len(X_all) < int(self.cfg.phase_min_ready):
             return
-
-        # ограничим окно обучения по свежести
+        
+        # Ограничиваем окно обучения по свежести
         train_window = int(getattr(self.cfg, "train_window", 5000))
         if len(X_all) > train_window:
             X_all = X_all[-train_window:]
             y_all = y_all[-train_window:]
-
-        # гарантируем сеть и скейлер для КОНКРЕТНОЙ фазы
+        
+        # ========== БЛОК 3: ВАЛИДАЦИЯ ДАННЫХ ==========
+        # Проверяем на NaN/Inf перед обучением
+        if np.any(np.isnan(X_all)) or np.any(np.isinf(X_all)):
+            print(f"[NN] ⚠️  Warning: NaN/Inf detected in training data for phase {ph}, cleaning...")
+            X_all = np.nan_to_num(X_all, nan=0.0, posinf=1e10, neginf=-1e10)
+        
+        # ========== БЛОК 4: ПЕРИОДИЧЕСКИЙ АНАЛИЗ ФИЧЕЙ ==========
+        # Каждые 500 примеров проверяем корреляцию фичей с целью
+        if len(X_all) % 500 == 0 and len(X_all) >= 500:
+            try:
+                from feature_validator import analyze_feature_correlation, check_data_leakage
+                
+                print(f"\n[NN] 📊 Запуск валидации фичей для фазы {ph}...")
+                
+                # Анализ корреляции
+                correlations = analyze_feature_correlation(
+                    X_all, 
+                    y_all,
+                    feature_names=[f"f{i}" for i in range(X_all.shape[1])],
+                    top_n=20
+                )
+                
+                # Проверка на утечку
+                suspicious = check_data_leakage(
+                    X_all,
+                    feature_names=[f"f{i}" for i in range(X_all.shape[1])]
+                )
+                
+            except ImportError:
+                pass  # feature_validator не установлен
+            except Exception as e:
+                print(f"[NN] Ошибка валидации фичей: {e}")
+        
+        # ========== БЛОК 5: ИНИЦИАЛИЗАЦИЯ СЕТИ И СКЕЙЛЕРА ==========
+        # Гарантируем сеть для конкретной фазы
         net = self.net_ph.get(ph)
         if net is None and self.n_feats is not None:
             net = _SimpleMLP(
@@ -5468,50 +5710,82 @@ class NNExpert(_BaseExpert):
                 eta=float(getattr(self.cfg, "nn_eta", 0.01)),
                 l2=float(getattr(self.cfg, "nn_l2", 0.0)),
             )
-
-        # скейлер по батчу фазы
+            print(f"[NN] 🆕 Created new network for phase {ph}: {self.n_feats}→{int(getattr(self.cfg, 'nn_hidden', 32))}→1")
+        
+        # Скейлер по батчу фазы
         scaler = None
         if HAVE_SKLEARN:
             try:
                 scaler = StandardScaler().fit(X_all)
-            except Exception:
+            except Exception as e:
+                print(f"[NN] Warning: Failed to create scaler: {e}")
                 scaler = None
-
-        # трансформация и обучение
-        Xt = scaler.transform(X_all) if (scaler is not None) else X_all
-        y_float = y_all.astype(np.float32)
-
+        
+        # ========== БЛОК 6: ОБУЧЕНИЕ МОДЕЛИ ==========
         try:
+            # Трансформация данных
+            Xt = scaler.transform(X_all) if (scaler is not None) else X_all
+            y_float = y_all.astype(np.float32)
+            
+            # Градиентное обучение с эпохами
             epochs = int(getattr(self.cfg, "nn_epochs", 1))
-            for _ in range(max(1, epochs)):
-                net.fit_epoch(Xt, y_float, batch_size=128)
-
-            # сохранить модель/скейлер фазы и обновить «последние» глобальные ссылки
+            batch_size = int(getattr(self.cfg, "nn_batch_size", 128))
+            
+            for epoch in range(max(1, epochs)):
+                net.fit_epoch(Xt, y_float, batch_size=batch_size)
+            
+            # Сохраняем модель и скейлер для конкретной фазы
             self.net_ph[ph] = net
             self.scaler_ph[ph] = scaler
+            
+            # Обратная совместимость: глобальные ссылки
             self.net = net
             self.scaler = scaler
-
-            # сброс счётчика «новых с последнего тренинга» для этой фазы
+            
+            # Сбрасываем счетчик новых примеров
             self.new_since_train_ph[ph] = 0
+            
+            # Сохраняем состояние на диск
+            self._save_all()
+            
+            print(f"[NN] ✅ Trained on phase {ph}: {len(X_all)} samples, {epochs} epochs, batch_size={batch_size}")
+            
         except Exception as e:
-            print(f"[nn  ] train error (ph={ph}): {e}")
-
-    # В самом конце метода _maybe_train_phase
+            print(f"[NN] ❌ Training error (ph={ph}): {e}")
+            import traceback
+            traceback.print_exc()
+            return
+        
+        # ========== БЛОК 7: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
         try:
             from training_visualizer import get_visualizer
             viz = get_visualizer()
             
-            wr_all = sum(self.active_hits + self.shadow_hits) / len(self.active_hits + self.shadow_hits) if (self.active_hits + self.shadow_hits) else 0.0
+            # Вычисляем общий winrate
+            all_hits = self.active_hits + self.shadow_hits
+            wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
             
+            # Получаем CV метрики текущей фазы
+            cv_metrics = self.cv_metrics.get(ph, {})
+            cv_accuracy = cv_metrics.get("oof_accuracy")
+            cv_ci_lower = cv_metrics.get("ci_lower")
+            cv_ci_upper = cv_metrics.get("ci_upper")
+            
+            # Отправляем метрики в visualizer
             viz.record_expert_metrics(
-                expert_name="NN",  # Меняйте на RF, NN
+                expert_name="NN",
                 accuracy=wr_all,
-                n_samples=len(self.active_hits + self.shadow_hits),
+                n_samples=len(all_hits),
+                cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
                 mode=self.mode
             )
-        except:
-            pass
+            
+        except ImportError:
+            pass  # TrainingVisualizer не установлен
+        except Exception as e:
+            print(f"[NN] Warning: Failed to send metrics to visualizer: {e}")
 
 
     def _run_cv_validation(self, ph: int) -> Dict:
