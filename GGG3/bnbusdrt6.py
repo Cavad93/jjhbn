@@ -902,11 +902,48 @@ def sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
 def softmax2(z_up: float, z_dn: float) -> Tuple[float, float]:
+    """Обычный softmax (сохраняем для обратной совместимости)"""
     m = max(z_up, z_dn)
     e_up = math.exp(z_up - m)
     e_dn = math.exp(z_dn - m)
     s = e_up + e_dn
     return e_up / s, e_dn / s
+
+def softmax2_with_temperature(z_up: float, z_dn: float, temperature: float = 1.0) -> Tuple[float, float]:
+    """
+    Softmax с температурным коэффициентом:
+    - T > 1: более «размытые» вероятности (консервативнее)
+    - T < 1: более «острые» вероятности (агрессивнее)
+    - T = 1: обычный softmax
+    """
+    z_up_scaled = z_up / max(1e-3, float(temperature))
+    z_dn_scaled = z_dn / max(1e-3, float(temperature))
+    
+    m = max(z_up_scaled, z_dn_scaled)
+    e_up = math.exp(z_up_scaled - m)
+    e_dn = math.exp(z_dn_scaled - m)
+    s = e_up + e_dn
+    
+    return e_up / s, e_dn / s
+
+def adaptive_temperature(volAmp: float, atr_norm: float) -> float:
+    """
+    Адаптивный выбор температуры на основе волатильности:
+    - Высокая волатильность → T > 1 (консервативнее)
+    - Низкая волатильность → T ≈ 1 (обычно)
+    - Очень низкая → T < 1 (агрессивнее)
+    """
+    # Защита от некорректных значений
+    volAmp = max(0.5, min(2.0, float(volAmp)))
+    atr_norm = max(0.3, min(3.0, float(atr_norm)))
+    
+    # Если волатильность высокая, увеличиваем T
+    if atr_norm > 1.5 or volAmp > 1.4:
+        return 1.2  # более размытые вероятности
+    elif atr_norm < 0.7 and volAmp < 1.0:
+        return 0.9  # более острые вероятности
+    else:
+        return 1.0  # дефолт
 
 def session_vwap(df: pd.DataFrame, src: pd.Series) -> pd.Series:
     day = df.index.tz_convert("UTC").date
@@ -1055,6 +1092,26 @@ class RoundInfo:
         if self.oracle_called and self.reward_base > 0:
             return self.reward_amt / self.reward_base
         return None
+
+
+# =============================
+# Мониторинг качества базовой модели
+# =============================
+def track_base_model_quality(P_up_base, outcome, csv_path="base_model_quality.csv"):
+    """Логирует качество базовой модели ДО всех улучшений"""
+    try:
+        hit = int((P_up_base >= 0.5) == (outcome == "UP"))
+        log_loss = -np.log(P_up_base if outcome == "UP" else (1 - P_up_base))
+        brier = (P_up_base - (1 if outcome == "UP" else 0)) ** 2
+        
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if f.tell() == 0:
+                writer.writerow(["timestamp", "p_up_base", "outcome", "hit", "log_loss", "brier"])
+            writer.writerow([int(time.time()), P_up_base, outcome, hit, log_loss, brier])
+    except Exception:
+        log_exception("track_base_model_quality failed")
+
 
 class OnlineLogReg:
     def __init__(self, eta=ETA, l2=L2, w_clip=W_CLIP, g_clip=G_CLIP, state_path: str = "calib_logreg_state.json"):
@@ -1339,36 +1396,69 @@ def elder_logit_adjust(df_1m: pd.DataFrame, tstamp: pd.Timestamp, p_up_hat: floa
         return p_up_hat
 
 # ====== Вероятности из фич (+ авто-веса WF) ======
-def prob_up_down_at_time(feats: Dict[str, pd.Series], tstamp: pd.Timestamp, w_dyn: Optional[np.ndarray] = None) -> Tuple[float, float, Dict[str, float]]:
+def prob_up_down_at_time(feats, tstamp, w_dyn=None, volAmp=None, atr_norm=None):
     i = _index_pad(feats["M_up"], tstamp)
     if i is None:
         return 0.5, 0.5, {}
-    M_up = float(feats["M_up"].iloc[i]); M_dn = float(feats["M_dn"].iloc[i])
-    S_up = float(feats["S_up"].iloc[i]); S_dn = float(feats["S_dn"].iloc[i])
-    B_up = float(feats["B_up"].iloc[i]); B_dn = float(feats["B_dn"].iloc[i])
-    R_up = float(feats["R_up"].iloc[i]); R_dn = float(feats["R_dn"].iloc[i])
-    volAmp = float(feats["volAmp"].iloc[i])
-
+    
+    M_up = float(feats["M_up"].iloc[i])
+    M_dn = float(feats["M_dn"].iloc[i])
+    S_up = float(feats["S_up"].iloc[i])
+    S_dn = float(feats["S_dn"].iloc[i])
+    B_up = float(feats["B_up"].iloc[i])
+    B_dn = float(feats["B_dn"].iloc[i])
+    R_up = float(feats["R_up"].iloc[i])
+    R_dn = float(feats["R_dn"].iloc[i])
+    
+    if volAmp is None:
+        volAmp = float(feats["volAmp"].iloc[i])
+    if atr_norm is None:
+        atr_norm = float(feats["atr"].iloc[i] / (feats["atr_sma"].iloc[i] + 1e-12))
+    
+    # НОВОЕ: Плавная нормализация весов
+    w_default = np.array([0.35, 0.20, 0.20, 0.25], dtype=float)
+    
     if w_dyn is None or len(w_dyn) != 4:
-        w_mom, w_vwp, w_brk, w_rev = 0.35, 0.20, 0.20, 0.25
+        w = w_default
     else:
-        w_mom, w_vwp, w_brk, w_rev = [float(x) for x in w_dyn]
-        # анти-усушка: если ||w|| слишком мала — откат к стартовым
-        if float(np.linalg.norm([w_mom, w_vwp, w_brk, w_rev])) < 0.15:
-            w_mom, w_vwp, w_brk, w_rev = 0.35, 0.20, 0.20, 0.25
-
-
+        w = np.array(w_dyn, dtype=float)
+        w_norm = np.linalg.norm(w)
+        
+        # Плавная интерполяция при усушке
+        if w_norm < 0.15:
+            alpha_shrink = max(0.0, w_norm / 0.15)
+            w = alpha_shrink * w + (1 - alpha_shrink) * w_default
+            w_norm = np.linalg.norm(w)  # пересчитываем после интерполяции
+        
+        # ИСПРАВЛЕНО: L1-нормализация ТОЛЬКО если ||w|| сильно отличается от 1.0
+        # Это сохраняет масштаб логитов, но предотвращает экстремальные веса
+        w_sum = np.sum(np.abs(w))
+        if w_sum < 0.8 or w_sum > 1.5:  # если веса "сбились" — нормализуем
+            w = w / (w_sum + 1e-12)
+    
+    w_mom, w_vwp, w_brk, w_rev = w
+    
+    # Линейная комбинация
     Z_up = (w_mom * M_up * volAmp) + (w_vwp * S_up) + (w_brk * B_up) + (w_rev * R_up)
     Z_dn = (w_mom * M_dn * volAmp) + (w_vwp * S_dn) + (w_brk * B_dn) + (w_rev * R_dn)
-    P_up, P_dn = softmax2(Z_up, Z_dn)
-
+    
+    # НОВОЕ: Softmax с адаптивной температурой
+    T = adaptive_temperature(volAmp, atr_norm)
+    P_up, P_dn = softmax2_with_temperature(Z_up, Z_dn, temperature=T)
+    
+    # Контекст для Walk-Forward
     phi_wf = np.array([
         (M_up - M_dn) * volAmp,
         (S_up - S_dn),
         (B_up - B_dn),
         (R_up - R_dn)
     ], dtype=float)
-    return P_up, P_dn, {"phi_wf0": phi_wf[0], "phi_wf1": phi_wf[1], "phi_wf2": phi_wf[2], "phi_wf3": phi_wf[3]}
+    
+    return P_up, P_dn, {
+        "phi_wf0": phi_wf[0], "phi_wf1": phi_wf[1],
+        "phi_wf2": phi_wf[2], "phi_wf3": phi_wf[3],
+        "temperature": T  # для отладки
+    }
 
 # ====== Кросс-активы ======
 def features_for_symbols(df_map: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, pd.Series]]:
@@ -6401,19 +6491,66 @@ def main_loop():
                             P_dn = 1.0 - P_up
 
                         # NN-калибратор поверх фич (старый)
+                        # NN-калибратор с расширенными признаками (НОВЫЙ)
                         phi, i = None, _index_pad(feats["M_up"], t_lock)
                         if NN_USE and i is not None:
+                            # Базовые фичи из основной модели
+                            M_diff = float(feats["M_up"].iloc[i] - feats["M_dn"].iloc[i])
+                            S_diff = float(feats["S_up"].iloc[i] - feats["S_dn"].iloc[i])
+                            B_diff = float(feats["B_up"].iloc[i] - feats["B_dn"].iloc[i])
+                            R_diff = float(feats["R_up"].iloc[i] - feats["R_dn"].iloc[i])
+                            
+                            # НОВЫЕ фичи из микроструктуры, пулов, фьючерсов и газа
+                            # Безопасное извлечение с fallback на 0.0
+                            def safe_get(d, k, default=0.0):
+                                if d is None or not isinstance(d, dict):
+                                    return default
+                                v = d.get(k, default)
+                                return float(v) if (v is not None and math.isfinite(float(v))) else default
+                            
+                            pool_logit_val = safe_get(pool_feats, "pool_logit", 0.0)
+                            pool_d30_val = safe_get(pool_feats, "pool_logit_d30", 0.0)
+                            book_imb_val = safe_get(micro_feats, "book_imb", 0.0)
+                            ofi_15s_val = safe_get(micro_feats, "ofi_15s", 0.0)
+                            basis_pct_val = safe_get(fut_feats, "basis_now", 0.0)
+                            
+                            # Газ: недавняя медиана (используем метод из GasHistory)
+                            gas_median_val = 0.0
+                            if gas_hist is not None:
+                                try:
+                                    recent_samples = [g for _, g in list(gas_hist.hist)[-20:]]
+                                    if recent_samples:
+                                        gas_median_val = float(np.median(recent_samples))
+                                except Exception:
+                                    gas_median_val = 0.0
+                            
+                            # Собираем вектор признаков (11 фичей + bias = 12)
                             phi = np.array([
-                                float(feats["M_up"].iloc[i] - feats["M_dn"].iloc[i]),
-                                float(feats["S_up"].iloc[i] - feats["S_dn"].iloc[i]),
-                                float(feats["B_up"].iloc[i] - feats["B_dn"].iloc[i]),
-                                float(feats["R_up"].iloc[i] - feats["R_dn"].iloc[i]),
-                                1.0
+                                M_diff,            # 0: momentum разность
+                                S_diff,            # 1: VWAP slope разность
+                                B_diff,            # 2: Keltner breakout разность
+                                R_diff,            # 3: Bollinger reversion разность
+                                pool_logit_val,    # 4: логит дисбаланса пулов
+                                pool_d30_val,      # 5: динамика пулов за 30 секунд
+                                book_imb_val,      # 6: дисбаланс стакана (bid vs ask)
+                                ofi_15s_val,       # 7: order flow imbalance за 15с
+                                basis_pct_val,     # 8: фьючерсный базис (%)
+                                gas_median_val,    # 9: медианная цена газа за 20 последних наблюдений
+                                1.0                # 10: bias (intercept)
                             ], dtype=float)
+                            
+                            # Клиппинг экстремальных значений для стабильности
+                            phi = np.clip(phi, -10.0, 10.0)
+                            
+                            # Применяем калибратор
                             if logreg is not None:
-                                p_nncal = logreg.predict(phi)
-                                P_up = (1.0 - BLEND_NN) * P_up + BLEND_NN * p_nncal
-                                P_dn = 1.0 - P_up
+                                try:
+                                    p_nncal = logreg.predict(phi)
+                                    # Blend с базовой вероятностью
+                                    P_up = (1.0 - BLEND_NN) * P_up + BLEND_NN * p_nncal
+                                    P_dn = 1.0 - P_up
+                                except Exception:
+                                    log_exception("NN calibrator prediction failed")
 
                         # кросс-активы
                         if USE_CROSS_ASSETS:
@@ -7635,6 +7772,17 @@ def main_loop():
                                 )
                             except Exception as e:
                                 print(f"[ens ] meta.record_result error: {e}")
+
+                            # ========== ТРЕКИНГ КАЧЕСТВА БАЗОВОЙ МОДЕЛИ ==========
+                            # Логируем качество базовой вероятности ДО мета-стекинга и калибровки
+                            try:
+                                if p_base is not None:
+                                    outcome_str = "UP" if up_won else "DOWN"
+                                    track_base_model_quality(p_base, outcome_str)
+                            except Exception:
+                                log_exception("track_base_model_quality call failed")
+                            # ======================================================
+
 
                             # Затем — эксперты (по-прежнему только если x_ml валиден)
                             try:
