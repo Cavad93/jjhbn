@@ -6084,24 +6084,21 @@ def main_loop():
     logreg = OnlineLogReg(state_path="calib_logreg_state.json") if NN_USE else None
     
     # ========== АВТОМАТИЧЕСКАЯ АДАПТАЦИЯ К НОВОЙ РАЗМЕРНОСТИ NN-КАЛИБРАТОРА ==========
-    # КРИТИЧНО: После добавления признаков (микроструктура, пулы, фьючерсы, газ)
-    # размерность изменилась с 5 → 11. Требуется переинициализация весов.
+    # ========== АВТОМАТИЧЕСКАЯ АДАПТАЦИЯ К НОВОЙ РАЗМЕРНОСТИ NN-КАЛИБРАТОРА ==========
     if logreg is not None:
         EXPECTED_PHI_DIM = 11  # 10 признаков + 1 bias
-        # Признаки NN-калибратора:
-        # 0-3: M_diff, S_diff, B_diff, R_diff (базовые из основной модели)
-        # 4-5: pool_logit, pool_logit_d30 (дисбаланс и динамика пулов)
-        # 6-7: book_imb, ofi_15s (микроструктура: стакан и order flow)
-        # 8:   basis_pct (фьючерсный базис)
-        # 9:   gas_median (медианная цена газа)
-        # 10:  bias (intercept)
         
         if len(logreg.w) != EXPECTED_PHI_DIM:
             print(f"[nn  ] ⚠️  Размерность logreg изменилась: {len(logreg.w)} → {EXPECTED_PHI_DIM}")
             print(f"[nn  ] Переинициализация весов для новых признаков...")
-            logreg.w = np.zeros(EXPECTED_PHI_DIM, dtype=float)
+            
+            # Используем numpy напрямую, чтобы избежать конфликта с локальной переменной np
+            import numpy
+            logreg.w = numpy.zeros(EXPECTED_PHI_DIM, dtype=numpy.float64)
             logreg.save()
+            
             print(f"[nn  ] ✅ logreg готов к использованию с {EXPECTED_PHI_DIM} признаками")
+    # ==================================================================================
     # ==================================================================================
     
     wf = WalkForwardWeighter() if WF_USE else None
