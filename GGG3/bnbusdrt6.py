@@ -2826,20 +2826,18 @@ class MLConfig:
     phase_state_path: str = "phase_state.json"
 
     # для файлов калибраторов по фазе (будем апеллировать к существующим путям)
-    # у XGB/NN: base_path → base_path_ph{φ}.pkl
-    # Cross-validation parameters
     cv_enabled: bool = True
-    cv_n_splits: int = 5              # количество фолдов
+    cv_n_splits: int = 3              # количество фолдов (ИЗМЕНЕНО: 5 → 3)
     cv_embargo_pct: float = 0.02      # 2% gap между train/test
     cv_purge_pct: float = 0.01        # 1% purge перед test
-    cv_min_train_size: int = 200      # минимум для обучения
+    cv_min_train_size: int = 150      # минимум для обучения (ИЗМЕНЕНО: 200 → 150)
     cv_bootstrap_n: int = 1000        # итераций bootstrap для CI
     cv_confidence: float = 0.95       # уровень доверия (95%)
     cv_min_improvement: float = 0.02  # минимум +2% для значимости
     
     # Validation tracking
     cv_oof_window: int = 500          # окно out-of-fold predictions
-    cv_check_every: int = 50          # проверка каждые N примеров
+    cv_check_every: int = 100         # проверка каждые N примеров (ИЗМЕНЕНО: 50 → 100)
 
 
 # ===== Фильтр фазы с гистерезисом =====
@@ -3184,33 +3182,104 @@ class XGBExpert(_BaseExpert):
         if np.any(np.isnan(X_all)) or np.any(np.isinf(X_all)):
             print(f"[XGB] ⚠️  Warning: NaN/Inf detected in training data for phase {ph}, cleaning...")
             X_all = np.nan_to_num(X_all, nan=0.0, posinf=1e10, neginf=-1e10)
-        
+
         # ========== БЛОК 4: ПЕРИОДИЧЕСКИЙ АНАЛИЗ ФИЧЕЙ ==========
-        # Каждые 500 примеров проверяем корреляцию фичей с целью
-        if len(X_all) % 500 == 0 and len(X_all) >= 500:
+        # Проверяем каждые 1000 примеров (или при первом достижении 500)
+        should_validate = (
+            (len(X_all) == 500) or  # Первый раз при 500
+            (len(X_all) % 1000 == 0 and len(X_all) >= 1000)  # Потом каждые 1000
+        )
+
+        if should_validate:
             try:
                 from feature_validator import analyze_feature_correlation, check_data_leakage
                 
                 print(f"\n[XGB] 📊 Запуск валидации фичей для фазы {ph}...")
+                print(f"[XGB] Примеров: {len(X_all)}, Фичей: {X_all.shape[1]}")
                 
-                # Анализ корреляции
-                correlations = analyze_feature_correlation(
+                # Анализ корреляции с сохранением отчета
+                results = analyze_feature_correlation(
                     X_all, 
                     y_all,
                     feature_names=[f"f{i}" for i in range(X_all.shape[1])],
-                    top_n=20
+                    top_n=20,
+                    save_report=True,
+                    report_path=f"feature_analysis_xgb_ph{ph}_n{len(X_all)}.txt"
                 )
                 
-                # Проверка на утечку
+                # Проверка на утечку данных (ИСПРАВЛЕНО: добавлен y_all)
                 suspicious = check_data_leakage(
                     X_all,
+                    y_all,  # ✅ ДОБАВЛЕНО
                     feature_names=[f"f{i}" for i in range(X_all.shape[1])]
                 )
+                
+                # ========== ДЕЙСТВИЯ НА ОСНОВЕ РЕЗУЛЬТАТОВ ==========
+                
+                # 1. Подсчет проблемных фичей
+                excellent = sum(1 for r in results if r.status == "отлично")
+                useless = sum(1 for r in results if r.status in ["бесполезно", "константа"])
+                
+                print(f"\n[XGB] 📈 Итоги валидации:")
+                print(f"[XGB]    Отличных фичей: {excellent}/{len(results)}")
+                print(f"[XGB]    Бесполезных фичей: {useless}/{len(results)}")
+                print(f"[XGB]    Подозрительных фичей: {len(suspicious)}")
+                
+                # 2. Критическая проблема: более 50% фичей бесполезны
+                if useless > len(results) * 0.5:
+                    print(f"\n[XGB] ❌ КРИТИЧЕСКАЯ ПРОБЛЕМА: {useless}/{len(results)} фичей бесполезны!")
+                    print(f"[XGB] Рекомендуется пересмотреть feature engineering")
+                    
+                    # Отправляем уведомление в Telegram
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"⚠️ <b>XGB: Проблема с фичами!</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Примеров: {len(X_all)}\n"
+                                f"Бесполезных фичей: {useless}/{len(results)} ({100*useless/len(results):.1f}%)\n\n"
+                                f"Требуется проверка feature engineering!")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 3. Обнаружен data leakage
+                if suspicious:
+                    print(f"\n[XGB] ⚠️  ВНИМАНИЕ: Data leakage обнаружен!")
+                    print(f"[XGB] Подозрительные фичи ({len(suspicious)}):")
+                    for feat in suspicious[:5]:  # Показываем первые 5
+                        print(f"[XGB]    - {feat}")
+                    if len(suspicious) > 5:
+                        print(f"[XGB]    ... и еще {len(suspicious) - 5}")
+                    
+                    # Уведомление в Telegram
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"🚨 <b>XGB: Data Leakage!</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Обнаружено {len(suspicious)} подозрительных фичей\n\n"
+                                f"Срочно требуется проверка!")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 4. Все хорошо
+                if useless < len(results) * 0.3 and not suspicious:
+                    print(f"\n[XGB] ✅ Качество фичей в норме!")
+                
+                print(f"[XGB] 📄 Отчет сохранен: feature_analysis_xgb_ph{ph}_n{len(X_all)}.txt\n")
                 
             except ImportError:
                 pass  # feature_validator не установлен
             except Exception as e:
-                print(f"[XGB] Ошибка валидации фичей: {e}")
+                print(f"[XGB] ⚠️  Ошибка валидации фичей: {e}")
+                # Логируем ошибку, но не останавливаем обучение
+                try:
+                    from error_logger import log_exception
+                    log_exception(f"Feature validation failed for XGB ph={ph}")
+                except ImportError:
+                    pass
         
         # ========== БЛОК 5: ОБУЧЕНИЕ МОДЕЛИ ==========
         try:
@@ -3599,6 +3668,31 @@ class XGBExpert(_BaseExpert):
         # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
         self._save_all()
 
+        # ========== БЛОК 12: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            
+            all_hits = self.active_hits + self.shadow_hits
+            wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
+            
+            cv_metrics = self.cv_metrics.get(ph, {})
+            cv_accuracy = cv_metrics.get("oof_accuracy")
+            cv_ci_lower = cv_metrics.get("ci_lower")
+            cv_ci_upper = cv_metrics.get("ci_upper")
+            
+            viz.record_expert_metrics(
+                expert_name="XGB",
+                accuracy=wr_all,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
+                mode=self.mode
+            )
+        except Exception:
+            pass
+
     # ---------- режимы ----------
     def _maybe_flip_modes(self):
         """
@@ -3863,32 +3957,167 @@ class RFCalibratedExpert(_BaseExpert):
             print(f"[RF] ⚠️  Warning: NaN/Inf detected in training data for phase {ph}, cleaning...")
             X_all = np.nan_to_num(X_all, nan=0.0, posinf=1e10, neginf=-1e10)
         
+
         # ========== БЛОК 4: ПЕРИОДИЧЕСКИЙ АНАЛИЗ ФИЧЕЙ ==========
-        # Каждые 500 примеров проверяем корреляцию фичей с целью
-        if len(X_all) % 500 == 0 and len(X_all) >= 500:
+        # Проверяем каждые 1000 примеров (или при первом достижении 500)
+        should_validate = (
+            (len(X_all) == 500) or  # Первый раз при 500
+            (len(X_all) % 1000 == 0 and len(X_all) >= 1000)  # Потом каждые 1000
+        )
+
+        if should_validate:
             try:
                 from feature_validator import analyze_feature_correlation, check_data_leakage
                 
                 print(f"\n[RF] 📊 Запуск валидации фичей для фазы {ph}...")
+                print(f"[RF] Примеров: {len(X_all)}, Фичей: {X_all.shape[1]}")
                 
-                # Анализ корреляции
-                correlations = analyze_feature_correlation(
+                # Анализ корреляции с сохранением отчета
+                results = analyze_feature_correlation(
                     X_all, 
                     y_all,
                     feature_names=[f"f{i}" for i in range(X_all.shape[1])],
-                    top_n=20
+                    top_n=20,
+                    save_report=True,
+                    report_path=f"feature_analysis_rf_ph{ph}_n{len(X_all)}.txt"
                 )
                 
-                # Проверка на утечку
+                # Проверка на утечку данных (ИСПРАВЛЕНО: добавлен y_all)
                 suspicious = check_data_leakage(
                     X_all,
+                    y_all,  # ✅ ДОБАВЛЕНО
                     feature_names=[f"f{i}" for i in range(X_all.shape[1])]
                 )
                 
+                # ========== ДЕЙСТВИЯ НА ОСНОВЕ РЕЗУЛЬТАТОВ ==========
+                
+                # 1. Подсчет проблемных фичей
+                excellent = sum(1 for r in results if r.status == "отлично")
+                good = sum(1 for r in results if r.status == "хорошо")
+                useless = sum(1 for r in results if r.status in ["бесполезно", "константа"])
+                
+                print(f"\n[RF] 📈 Итоги валидации:")
+                print(f"[RF]    Отличных фичей: {excellent}/{len(results)}")
+                print(f"[RF]    Хороших фичей: {good}/{len(results)}")
+                print(f"[RF]    Бесполезных фичей: {useless}/{len(results)}")
+                print(f"[RF]    Подозрительных фичей: {len(suspicious)}")
+                
+                # 2. Критическая проблема: более 50% фичей бесполезны
+                if useless > len(results) * 0.5:
+                    print(f"\n[RF] ❌ КРИТИЧЕСКАЯ ПРОБЛЕМА: {useless}/{len(results)} фичей бесполезны!")
+                    print(f"[RF] Рекомендуется пересмотреть feature engineering")
+                    
+                    # Отправляем уведомление в Telegram
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"⚠️ <b>RF: Проблема с фичами!</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Примеров: {len(X_all)}\n"
+                                f"Бесполезных фичей: {useless}/{len(results)} ({100*useless/len(results):.1f}%)\n\n"
+                                f"Требуется проверка feature engineering!")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 3. Предупреждение: мало значимых фичей
+                elif (excellent + good) < len(results) * 0.2:
+                    print(f"\n[RF] ⚠️  ПРОБЛЕМА: Только {excellent + good}/{len(results)} фичей значимы (<20%)")
+                    print(f"[RF] Рекомендуется добавить feature interactions")
+                    
+                    # Уведомление в Telegram (менее критичное)
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"🟡 <b>RF: Мало значимых фичей</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Значимых: {excellent + good}/{len(results)} ({100*(excellent + good)/len(results):.1f}%)\n\n"
+                                f"Рекомендуется feature engineering")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 4. Обнаружен data leakage
+                if suspicious:
+                    print(f"\n[RF] ⚠️  ВНИМАНИЕ: Data leakage обнаружен!")
+                    print(f"[RF] Подозрительные фичи ({len(suspicious)}):")
+                    for feat in suspicious[:5]:  # Показываем первые 5
+                        print(f"[RF]    - {feat}")
+                    if len(suspicious) > 5:
+                        print(f"[RF]    ... и еще {len(suspicious) - 5}")
+                    
+                    # Критическое уведомление в Telegram
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"🚨 <b>RF: Data Leakage!</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Обнаружено {len(suspicious)} подозрительных фичей\n\n"
+                                f"Срочно требуется проверка!\n\n"
+                                f"Список:\n" + "\n".join([f"- {f}" for f in suspicious[:5]]))
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 5. Все хорошо
+                if useless < len(results) * 0.3 and (excellent + good) >= len(results) * 0.2 and not suspicious:
+                    print(f"\n[RF] ✅ Качество фичей в норме!")
+                    
+                    # Позитивное уведомление (опционально, только при первой проверке)
+                    if len(X_all) == 500 and getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"✅ <b>RF: Валидация пройдена</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Примеров: {len(X_all)}\n"
+                                f"Отличных фичей: {excellent}/{len(results)}\n"
+                                f"Хороших фичей: {good}/{len(results)}\n\n"
+                                f"Качество фичей в норме!")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                print(f"[RF] 📄 Отчет сохранен: feature_analysis_rf_ph{ph}_n{len(X_all)}.txt\n")
+                
+                # ========== СОХРАНЕНИЕ СТАТИСТИКИ ==========
+                try:
+                    import json
+                    import time
+                    
+                    stats = {
+                        "timestamp": int(time.time()),
+                        "expert": "RF",
+                        "phase": ph,
+                        "n_samples": len(X_all),
+                        "n_features": X_all.shape[1],
+                        "excellent": excellent,
+                        "good": good,
+                        "useless": useless,
+                        "suspicious_count": len(suspicious),
+                        "suspicious_list": suspicious[:10],  # Первые 10
+                        "quality_score": (excellent * 2 + good) / len(results)  # Оценка 0-2
+                    }
+                    
+                    stats_file = f"feature_stats_rf_ph{ph}.json"
+                    with open(stats_file, 'w') as f:
+                        json.dump(stats, f, indent=2)
+                    
+                    print(f"[RF] 💾 Статистика сохранена: {stats_file}")
+                    
+                except Exception as e:
+                    print(f"[RF] ⚠️  Не удалось сохранить статистику: {e}")
+                
             except ImportError:
-                pass  # feature_validator не установлен
+                # feature_validator не установлен - не критично
+                pass
             except Exception as e:
-                print(f"[RF] Ошибка валидации фичей: {e}")
+                print(f"[RF] ⚠️  Ошибка валидации фичей: {e}")
+                # Логируем ошибку, но не останавливаем обучение
+                try:
+                    from error_logger import log_exception
+                    log_exception(f"Feature validation failed for RF ph={ph}")
+                except ImportError:
+                    pass
         
         # ========== БЛОК 5: ОБУЧЕНИЕ МОДЕЛИ ==========
         try:
@@ -4484,6 +4713,31 @@ class RFCalibratedExpert(_BaseExpert):
         
         # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
         self._save_all()
+
+        # ========== БЛОК 12: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            
+            all_hits = self.active_hits + self.shadow_hits
+            wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
+            
+            cv_metrics = self.cv_metrics.get(ph, {})
+            cv_accuracy = cv_metrics.get("oof_accuracy")
+            cv_ci_lower = cv_metrics.get("ci_lower")
+            cv_ci_upper = cv_metrics.get("ci_upper")
+            
+            viz.record_expert_metrics(
+                expert_name="RF",
+                accuracy=wr_all,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
+                mode=self.mode
+            )
+        except Exception:
+            pass
 
 
     def _maybe_flip_modes(self):
@@ -5564,7 +5818,30 @@ class NNExpert(_BaseExpert):
         # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
         self._save_all()
     
-
+        # ========== БЛОК 12: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            
+            all_hits = self.active_hits + self.shadow_hits
+            wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
+            
+            cv_metrics = self.cv_metrics.get(ph, {})
+            cv_accuracy = cv_metrics.get("oof_accuracy")
+            cv_ci_lower = cv_metrics.get("ci_lower")
+            cv_ci_upper = cv_metrics.get("ci_upper")
+            
+            viz.record_expert_metrics(
+                expert_name="NN",
+                accuracy=wr_all,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
+                mode=self.mode
+            )
+        except Exception:
+            pass
 
     def _maybe_flip_modes(self):
         """
@@ -5673,32 +5950,206 @@ class NNExpert(_BaseExpert):
             print(f"[NN] ⚠️  Warning: NaN/Inf detected in training data for phase {ph}, cleaning...")
             X_all = np.nan_to_num(X_all, nan=0.0, posinf=1e10, neginf=-1e10)
         
+
+
         # ========== БЛОК 4: ПЕРИОДИЧЕСКИЙ АНАЛИЗ ФИЧЕЙ ==========
-        # Каждые 500 примеров проверяем корреляцию фичей с целью
-        if len(X_all) % 500 == 0 and len(X_all) >= 500:
+        # Проверяем каждые 1000 примеров (или при первом достижении 500)
+        should_validate = (
+            (len(X_all) == 500) or  # Первый раз при 500
+            (len(X_all) % 1000 == 0 and len(X_all) >= 1000)  # Потом каждые 1000
+        )
+
+        if should_validate:
             try:
                 from feature_validator import analyze_feature_correlation, check_data_leakage
                 
                 print(f"\n[NN] 📊 Запуск валидации фичей для фазы {ph}...")
+                print(f"[NN] Примеров: {len(X_all)}, Фичей: {X_all.shape[1]}")
                 
-                # Анализ корреляции
-                correlations = analyze_feature_correlation(
+                # Анализ корреляции с сохранением отчета
+                results = analyze_feature_correlation(
                     X_all, 
                     y_all,
                     feature_names=[f"f{i}" for i in range(X_all.shape[1])],
-                    top_n=20
+                    top_n=20,
+                    save_report=True,
+                    report_path=f"feature_analysis_nn_ph{ph}_n{len(X_all)}.txt"
                 )
                 
-                # Проверка на утечку
+                # Проверка на утечку данных (ИСПРАВЛЕНО: добавлен y_all)
                 suspicious = check_data_leakage(
                     X_all,
+                    y_all,  # ✅ ДОБАВЛЕНО
                     feature_names=[f"f{i}" for i in range(X_all.shape[1])]
                 )
                 
+                # ========== ДЕЙСТВИЯ НА ОСНОВЕ РЕЗУЛЬТАТОВ ==========
+                
+                # 1. Подсчет проблемных фичей
+                excellent = sum(1 for r in results if r.status == "отлично")
+                good = sum(1 for r in results if r.status == "хорошо")
+                weak = sum(1 for r in results if r.status == "слабо")
+                useless = sum(1 for r in results if r.status in ["бесполезно", "константа"])
+                
+                print(f"\n[NN] 📈 Итоги валидации:")
+                print(f"[NN]    Отличных фичей: {excellent}/{len(results)}")
+                print(f"[NN]    Хороших фичей: {good}/{len(results)}")
+                print(f"[NN]    Слабых фичей: {weak}/{len(results)}")
+                print(f"[NN]    Бесполезных фичей: {useless}/{len(results)}")
+                print(f"[NN]    Подозрительных фичей: {len(suspicious)}")
+                
+                # 2. Критическая проблема: более 50% фичей бесполезны
+                if useless > len(results) * 0.5:
+                    print(f"\n[NN] ❌ КРИТИЧЕСКАЯ ПРОБЛЕМА: {useless}/{len(results)} фичей бесполезны!")
+                    print(f"[NN] Рекомендуется пересмотреть feature engineering")
+                    print(f"[NN] Нейронная сеть не может обучиться на бесполезных фичах!")
+                    
+                    # Отправляем уведомление в Telegram
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"⚠️ <b>NN: Проблема с фичами!</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Примеров: {len(X_all)}\n"
+                                f"Бесполезных фичей: {useless}/{len(results)} ({100*useless/len(results):.1f}%)\n\n"
+                                f"⚠️ Нейронная сеть не может обучиться!\n"
+                                f"Требуется проверка feature engineering!")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 3. Предупреждение: мало значимых фичей
+                elif (excellent + good) < len(results) * 0.2:
+                    print(f"\n[NN] ⚠️  ПРОБЛЕМА: Только {excellent + good}/{len(results)} фичей значимы (<20%)")
+                    print(f"[NN] Рекомендуется:")
+                    print(f"[NN]    - Добавить feature interactions")
+                    print(f"[NN]    - Проверить нормализацию данных")
+                    print(f"[NN]    - Использовать feature selection")
+                    
+                    # Уведомление в Telegram (менее критичное)
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"🟡 <b>NN: Мало значимых фичей</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Значимых: {excellent + good}/{len(results)} ({100*(excellent + good)/len(results):.1f}%)\n\n"
+                                f"Рекомендуется улучшить feature engineering")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 4. Обнаружен data leakage
+                if suspicious:
+                    print(f"\n[NN] ⚠️  ВНИМАНИЕ: Data leakage обнаружен!")
+                    print(f"[NN] Подозрительные фичи ({len(suspicious)}):")
+                    for feat in suspicious[:5]:  # Показываем первые 5
+                        print(f"[NN]    - {feat}")
+                    if len(suspicious) > 5:
+                        print(f"[NN]    ... и еще {len(suspicious) - 5}")
+                    
+                    print(f"\n[NN] ⚠️  Data leakage может привести к переобучению!")
+                    print(f"[NN] Модель будет отлично работать на train, но плохо на test")
+                    
+                    # Критическое уведомление в Telegram
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"🚨 <b>NN: Data Leakage!</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Обнаружено {len(suspicious)} подозрительных фичей\n\n"
+                                f"⚠️ Риск переобучения!\n"
+                                f"Срочно требуется проверка!\n\n"
+                                f"Список:\n" + "\n".join([f"- {f}" for f in suspicious[:5]]))
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 5. Все хорошо
+                if useless < len(results) * 0.3 and (excellent + good) >= len(results) * 0.2 and not suspicious:
+                    print(f"\n[NN] ✅ Качество фичей в норме!")
+                    print(f"[NN] Нейронная сеть может успешно обучаться на этих данных")
+                    
+                    # Позитивное уведомление (только при первой проверке)
+                    if len(X_all) == 500 and getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"✅ <b>NN: Валидация пройдена</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Примеров: {len(X_all)}\n"
+                                f"Отличных фичей: {excellent}/{len(results)}\n"
+                                f"Хороших фичей: {good}/{len(results)}\n\n"
+                                f"Качество фичей в норме!\n"
+                                f"NN готова к обучению.")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 6. Специфичные рекомендации для нейронной сети
+                if weak > len(results) * 0.5:
+                    print(f"\n[NN] 💡 СОВЕТ: Много слабых фичей ({weak}/{len(results)})")
+                    print(f"[NN] Для нейронной сети это может быть нормально")
+                    print(f"[NN] NN может находить нелинейные комбинации слабых фичей")
+                
+                print(f"[NN] 📄 Отчет сохранен: feature_analysis_nn_ph{ph}_n{len(X_all)}.txt\n")
+                
+                # ========== СОХРАНЕНИЕ СТАТИСТИКИ ==========
+                try:
+                    import json
+                    import time
+                    
+                    stats = {
+                        "timestamp": int(time.time()),
+                        "expert": "NN",
+                        "phase": ph,
+                        "n_samples": len(X_all),
+                        "n_features": X_all.shape[1],
+                        "excellent": excellent,
+                        "good": good,
+                        "weak": weak,
+                        "useless": useless,
+                        "suspicious_count": len(suspicious),
+                        "suspicious_list": suspicious[:10],  # Первые 10
+                        "quality_score": (excellent * 2 + good) / len(results),  # Оценка 0-2
+                        "nn_specific_score": (excellent * 2 + good + weak * 0.5) / len(results)  # NN может использовать слабые фичи
+                    }
+                    
+                    stats_file = f"feature_stats_nn_ph{ph}.json"
+                    with open(stats_file, 'w') as f:
+                        json.dump(stats, f, indent=2)
+                    
+                    print(f"[NN] 💾 Статистика сохранена: {stats_file}")
+                    
+                    # Вывод NN-specific score
+                    nn_score = stats['nn_specific_score']
+                    if nn_score >= 1.5:
+                        score_status = "отлично"
+                    elif nn_score >= 1.0:
+                        score_status = "хорошо"
+                    elif nn_score >= 0.5:
+                        score_status = "средне"
+                    else:
+                        score_status = "плохо"
+                    
+                    print(f"[NN] 📊 NN Quality Score: {nn_score:.2f} ({score_status})")
+                    
+                except Exception as e:
+                    print(f"[NN] ⚠️  Не удалось сохранить статистику: {e}")
+                
             except ImportError:
-                pass  # feature_validator не установлен
+                # feature_validator не установлен - не критично
+                pass
             except Exception as e:
-                print(f"[NN] Ошибка валидации фичей: {e}")
+                print(f"[NN] ⚠️  Ошибка валидации фичей: {e}")
+                import traceback
+                print(f"[NN] Traceback:")
+                traceback.print_exc()
+                
+                # Логируем ошибку, но не останавливаем обучение
+                try:
+                    from error_logger import log_exception
+                    log_exception(f"Feature validation failed for NN ph={ph}: {e}")
+                except ImportError:
+                    pass
         
         # ========== БЛОК 5: ИНИЦИАЛИЗАЦИЯ СЕТИ И СКЕЙЛЕРА ==========
         # Гарантируем сеть для конкретной фазы
