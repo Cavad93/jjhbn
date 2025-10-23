@@ -6509,6 +6509,84 @@ def main_loop():
                             P_up = p_up_ema
                             P_dn = 1.0 - P_up
 
+                        # --- NEW: microstructure/futures/pools/jumps/liquidity/time/gas/idio
+                        # ВАЖНО: вычисляем эти фичи ПЕРЕД NN-калибратором, чтобы они были доступны
+
+                        # 1) Микроструктура к lock-1s
+                        end_ms = int(t_lock.timestamp()*1000)
+                        micro_feats = micro.compute(end_ms)  # rel_spread, book_imb, microprice_delta, ofi_5s/15s/30s, ob_slope, mid
+
+                        # 2) Фьючерсы (refresh ≈ раз в 30с)
+                        fut.refresh()
+                        spot_mid = micro_feats.get("mid", float(kl_df["close"].iloc[-1]))
+                        fut_feats = fut.features(spot_mid)
+
+                        # 3) Пулы Prediction: копим наблюдения и извлекаем фичи к lock-1s
+                        pool.observe(epoch, now, rd.bull_amount, rd.bear_amount)
+                        pool.update_streak_from_rounds(lambda e: get_round(w3, c, e), cur)
+                        pool_feats = pool.features(epoch, rd.lock_ts)
+
+                        # 4) Волатильность/джампы (BV/RQ/RV) на окнах 20/60/120 баров
+                        RV20,BV20,RQ20,n20 = realized_metrics(kl_df["close"], 20)
+                        RV60,BV60,RQ60,n60 = realized_metrics(kl_df["close"], 60)
+                        RV120,BV120,RQ120,n120 = realized_metrics(kl_df["close"], 120)
+                        jump20 = jump_flag_from_rv_bv_rq(RV20,BV20,RQ20,n20, z_thr=3.0)
+                        jump60 = jump_flag_from_rv_bv_rq(RV60,BV60,RQ60,n60, z_thr=3.0)
+
+                        # 5) Ликвидность/импакт
+                        amihud = amihud_illiq(kl_df, win=20)
+                        kyle   = kyle_lambda(kl_df, win=20)
+
+                        # 6) Интрадей-профиль времени
+                        time_feats = intraday_time_features(t_lock)
+
+                        # 7) Кросс-активы: «очищенный» ретёрн и динамика беты
+                        btc_df = cross_df_map.get("BTCUSDT")
+                        eth_df = cross_df_map.get("ETHUSDT")
+                        idio = idio_features(kl_df, btc_df, eth_df, look_min=240)
+
+                        # 8) Газ — дельта/волатильность
+                        gas_gwei_now = float(get_gas_price_wei(w3))/1e9
+                        gas_hist.push(now, gas_gwei_now)
+                        gas_feats = gas_hist.features(now)
+
+                        # Сбор всех новых фич в единый вектор (фиксированный порядок ключей):
+                        addon_dict = {}
+                        addon_dict.update({
+                            "rel_spread": micro_feats.get("rel_spread", 0.0),
+                            "book_imb": micro_feats.get("book_imb", 0.0),
+                            "microprice_delta": micro_feats.get("microprice_delta", 0.0),
+                            "ofi_5s": micro_feats.get("ofi_5s", 0.0),
+                            "ofi_15s": micro_feats.get("ofi_15s", 0.0),
+                            "ofi_30s": micro_feats.get("ofi_30s", 0.0),
+                            "ob_slope": micro_feats.get("ob_slope", 0.0),
+                            "funding_sign": fut_feats.get("funding_sign", 0.0),
+                            "funding_timeleft": fut_feats.get("funding_timeleft", 0.0),
+                            "dOI_1m": fut_feats.get("dOI_1m", 0.0),
+                            "dOI_5m": fut_feats.get("dOI_5m", 0.0),
+                            "basis_now": fut_feats.get("basis_now", 0.0),
+                            "pool_logit": pool_feats.get("pool_logit", 0.0),
+                            "pool_logit_d30": pool_feats.get("pool_logit_d30", 0.0),
+                            "pool_logit_d60": pool_feats.get("pool_logit_d60", 0.0),
+                            "late_money_share": pool_feats.get("late_money_share", 0.0),
+                            "last_k_outcomes_mean": pool_feats.get("last_k_outcomes_mean", 0.0),
+                            "last_k_payout_median": pool_feats.get("last_k_payout_median", 0.0),
+                            "bv_over_rv_20": (BV20/max(1e-12, RV20)),
+                            "bv_over_rv_60": (BV60/max(1e-12, RV60)),
+                            "rq_norm_20": RQ20,
+                            "rq_norm_60": RQ60,
+                            "jump20": float(jump20),
+                            "jump60": float(jump60),
+                            "amihud_illq": amihud,
+                            "kyle_lambda": kyle,
+                            "resid_ret_1m": idio.get("resid_ret_1m", 0.0),
+                            "beta_sum": idio.get("beta_sum", 0.0),
+                            "beta_sum_d60": idio.get("beta_sum_d60", 0.0),
+                            "gas_d1m": gas_feats.get("gas_d1m", 0.0),
+                            "gas_vol5m": gas_feats.get("gas_vol5m", 0.0),
+                        })
+                        addon_dict.update(time_feats)
+
                         # NN-калибратор поверх фич (старый)
                         # NN-калибратор с расширенными признаками (НОВЫЙ)
                         phi, i = None, _index_pad(feats["M_up"], t_lock)
@@ -6609,85 +6687,6 @@ def main_loop():
                             z_pred = logit_ou.predict_future(z_now, horizon_sec)
                             P_up = from_logit(z_pred)
                             P_dn = 1.0 - P_up
-
-
-
-                        # --- NEW: microstructure/futures/pools/jumps/liquidity/time/gas/idio
-
-                        # 1) Микроструктура к lock-1s
-                        end_ms = int(t_lock.timestamp()*1000)
-                        micro_feats = micro.compute(end_ms)  # rel_spread, book_imb, microprice_delta, ofi_5s/15s/30s, ob_slope, mid
-
-                        # 2) Фьючерсы (refresh ≈ раз в 30с)
-                        fut.refresh()
-                        spot_mid = micro_feats.get("mid", float(kl_df["close"].iloc[-1]))
-                        fut_feats = fut.features(spot_mid)
-
-                        # 3) Пулы Prediction: копим наблюдения и извлекаем фичи к lock-1s
-                        pool.observe(epoch, now, rd.bull_amount, rd.bear_amount)
-                        pool.update_streak_from_rounds(lambda e: get_round(w3, c, e), cur)
-                        pool_feats = pool.features(epoch, rd.lock_ts)
-
-                        # 4) Волатильность/джампы (BV/RQ/RV) на окнах 20/60/120 баров
-                        RV20,BV20,RQ20,n20 = realized_metrics(kl_df["close"], 20)
-                        RV60,BV60,RQ60,n60 = realized_metrics(kl_df["close"], 60)
-                        RV120,BV120,RQ120,n120 = realized_metrics(kl_df["close"], 120)
-                        jump20 = jump_flag_from_rv_bv_rq(RV20,BV20,RQ20,n20, z_thr=3.0)
-                        jump60 = jump_flag_from_rv_bv_rq(RV60,BV60,RQ60,n60, z_thr=3.0)
-
-                        # 5) Ликвидность/импакт
-                        amihud = amihud_illiq(kl_df, win=20)
-                        kyle   = kyle_lambda(kl_df, win=20)
-
-                        # 6) Интрадей-профиль времени
-                        time_feats = intraday_time_features(t_lock)
-
-                        # 7) Кросс-активы: «очищенный» ретёрн и динамика беты
-                        btc_df = cross_df_map.get("BTCUSDT")
-                        eth_df = cross_df_map.get("ETHUSDT")
-                        idio = idio_features(kl_df, btc_df, eth_df, look_min=240)
-
-                        # 8) Газ — дельта/волатильность
-                        gas_gwei_now = float(get_gas_price_wei(w3))/1e9
-                        gas_hist.push(now, gas_gwei_now)
-                        gas_feats = gas_hist.features(now)
-
-                        # Сбор всех новых фич в единый вектор (фиксированный порядок ключей):
-                        addon_dict = {}
-                        addon_dict.update({
-                            "rel_spread": micro_feats.get("rel_spread", 0.0),
-                            "book_imb": micro_feats.get("book_imb", 0.0),
-                            "microprice_delta": micro_feats.get("microprice_delta", 0.0),
-                            "ofi_5s": micro_feats.get("ofi_5s", 0.0),
-                            "ofi_15s": micro_feats.get("ofi_15s", 0.0),
-                            "ofi_30s": micro_feats.get("ofi_30s", 0.0),
-                            "ob_slope": micro_feats.get("ob_slope", 0.0),
-                            "funding_sign": fut_feats.get("funding_sign", 0.0),
-                            "funding_timeleft": fut_feats.get("funding_timeleft", 0.0),
-                            "dOI_1m": fut_feats.get("dOI_1m", 0.0),
-                            "dOI_5m": fut_feats.get("dOI_5m", 0.0),
-                            "basis_now": fut_feats.get("basis_now", 0.0),
-                            "pool_logit": pool_feats.get("pool_logit", 0.0),
-                            "pool_logit_d30": pool_feats.get("pool_logit_d30", 0.0),
-                            "pool_logit_d60": pool_feats.get("pool_logit_d60", 0.0),
-                            "late_money_share": pool_feats.get("late_money_share", 0.0),
-                            "last_k_outcomes_mean": pool_feats.get("last_k_outcomes_mean", 0.0),
-                            "last_k_payout_median": pool_feats.get("last_k_payout_median", 0.0),
-                            "bv_over_rv_20": (BV20/max(1e-12, RV20)),
-                            "bv_over_rv_60": (BV60/max(1e-12, RV60)),
-                            "rq_norm_20": RQ20,
-                            "rq_norm_60": RQ60,
-                            "jump20": float(jump20),
-                            "jump60": float(jump60),
-                            "amihud_illq": amihud,
-                            "kyle_lambda": kyle,
-                            "resid_ret_1m": idio.get("resid_ret_1m", 0.0),
-                            "beta_sum": idio.get("beta_sum", 0.0),
-                            "beta_sum_d60": idio.get("beta_sum_d60", 0.0),
-                            "gas_d1m": gas_feats.get("gas_d1m", 0.0),
-                            "gas_vol5m": gas_feats.get("gas_vol5m", 0.0),
-                        })
-                        addon_dict.update(time_feats)
 
                         addon_names = [
                             "rel_spread","book_imb","microprice_delta","ofi_5s","ofi_15s","ofi_30s","ob_slope",
