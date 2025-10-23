@@ -483,6 +483,39 @@ class MetaCEMMC:
             except Exception as e:
                 print(f"[MetaCEMMC] flip-modes error: {e.__class__.__name__}: {e}\n{traceback.format_exc()}")
 
+            # ===== ШАГ 8: МОНИТОРИНГ ПРОГРЕССА =====
+            try:
+                if len(self.shadow_hits) % 100 == 0 and len(self.shadow_hits) > 0:
+                    wr = 100 * sum(self.shadow_hits) / len(self.shadow_hits)
+                    last_100_wr = 100 * sum(self.shadow_hits[-100:]) / 100 if len(self.shadow_hits) >= 100 else wr
+                    
+                    print(f"\n{'='*60}")
+                    print(f"📊 META ПРОГРЕСС (каждые 100 примеров)")
+                    print(f"{'='*60}")
+                    print(f"   Всего примеров: {len(self.shadow_hits)}")
+                    print(f"   Общий WR: {wr:.2f}%")
+                    print(f"   Последние 100: {last_100_wr:.2f}%")
+                    print(f"   До активации: {58.0 - wr:.2f}% points")
+                    print(f"   Фаза: {self._last_phase}")
+                    print(f"   Режим: {self.mode}")
+                    print(f"{'='*60}\n")
+                    
+                    if wr >= 55.0 and getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from meta_report import send_telegram_text
+                            token = getattr(self.cfg, 'tg_bot_token', '')
+                            chat_id = getattr(self.cfg, 'tg_chat_id', '')
+                            if token and chat_id:
+                                msg = (f"🎯 <b>META близка к активации!</b>\n"
+                                    f"WR: {wr:.2f}% (цель: 58%)\n"
+                                    f"Примеров: {len(self.shadow_hits)}\n"
+                                    f"Последние 100: {last_100_wr:.2f}%")
+                                send_telegram_text(token, chat_id, msg)
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"[MetaCEMMC] monitoring error: {e}")
+
         except Exception as e:
             print(f"[ens ] meta.record_result error: {e.__class__.__name__}: {e}\n{traceback.format_exc()}")
 
