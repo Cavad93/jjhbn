@@ -415,6 +415,7 @@ from dataclasses import dataclass
 
 # NEW: контекст для меты
 from meta_ctx import build_regime_ctx, pack_ctx
+from market_features import MarketFeaturesCalculator, MarketSnapshot
 
 # --- добавили для финальной пост-калибровки мета-вероятности ---
 from collections import deque
@@ -6891,6 +6892,33 @@ def main_loop():
     print("[ens ] " + _status_line("ARF", arf_exp.status()))
     print("[ens ] " + _status_line("NN ", nn_exp.status()))
     print("[ens ] " + _status_line("META", meta.status()))
+
+    # --- NEW: contexts for addons ---
+    micro = MicrostructureClient(SESSION, SYMBOL)
+    fut   = FuturesContext(SESSION, SYMBOL, min_refresh_sec=30)
+    pool  = PoolFeaturesCtx(k=10, late_sec=30)
+
+    # НОВОЕ: персистентная 2D-таблица квантилей r̂ по (t_rem × pool)
+    r2d   = RHat2D(state_path="rhat2d_state.json", pending_path="rhat2d_pending.json")
+
+    gas_hist = GasHistory(maxlen=1200)
+
+    # НОВОЕ: калькулятор рыночных фич для META
+    market_calc = MarketFeaturesCalculator(
+        max_history=300,
+        trend_window=5,
+        vol_window=20,
+        jump_threshold=0.005
+    )
+    print("[init] MarketFeaturesCalculator инициализирован")
+
+    # Вывод статистики калькулятора (ПОСЛЕ инициализации!)
+    market_stats = market_calc.get_stats()
+    print(f"[market] History: {market_stats['history_size']}/{market_stats['max_history']} | "
+        f"OrderBook: {market_stats['has_orderbook']} | "
+        f"Futures: {market_stats['has_futures']} | "
+        f"Funding: {market_stats['has_funding']}")
+
     if tg_enabled():
         tg_send("🧠 Ensemble init:\n" +
                 _status_line("XGB", xgb_exp.status()) + "\n" +
@@ -6898,16 +6926,6 @@ def main_loop():
                 _status_line("ARF", arf_exp.status()) + "\n" +
                 _status_line("NN ",  nn_exp.status())  + "\n" +
                 _status_line("META", meta.status()))
-        # --- NEW: contexts for addons ---
-    micro = MicrostructureClient(SESSION, SYMBOL)
-    fut   = FuturesContext(SESSION, SYMBOL, min_refresh_sec=30)
-    # bnbusdrt6.py (инициализация контекстов)
-    pool  = PoolFeaturesCtx(k=10, late_sec=30)
-
-    # НОВОЕ: персистентная 2D-таблица квантилей r̂ по (t_rem × pool)
-    r2d   = RHat2D(state_path="rhat2d_state.json", pending_path="rhat2d_pending.json")
-
-    gas_hist = GasHistory(maxlen=1200)  # ~20 минут при шаге 1с
 
 
 
@@ -7433,12 +7451,46 @@ def main_loop():
                         x_ml = np.concatenate([x_ml, x_addon], axis=0)
 
                         # --- NEW: режим (ψ) для контекстного гейтинга
-                        reg_ctx = build_regime_ctx(
-                            kl_df, feats, t_lock,
-                            micro_feats=micro_feats,
-                            fut_feats=fut_feats,
-                            jump_flag=max(float(jump20), float(jump60))
-                        )
+                        # --- ОБНОВЛЕНИЕ: подаем снимок рынка в калькулятор ---
+                        try:
+                            current_price = float(kl_df["close"].iloc[-1])
+                            current_volume = float(kl_df["volume"].iloc[-1])
+                            
+                            # Получаем bid/ask данные напрямую из микроструктуры
+                            depth_snapshot = micro.fetch_depth(limit=5, ts_ms=end_ms)
+                            
+                            # Формируем снимок для MarketFeaturesCalculator
+                            snapshot = MarketSnapshot(
+                                timestamp=t_lock.timestamp(),
+                                price=current_price,
+                                volume=current_volume,
+                                bid_price=depth_snapshot.bid1 if depth_snapshot else None,
+                                ask_price=depth_snapshot.ask1 if depth_snapshot else None,
+                                bid_volume=depth_snapshot.bids[0][1] if (depth_snapshot and depth_snapshot.bids) else None,
+                                ask_volume=depth_snapshot.asks[0][1] if (depth_snapshot and depth_snapshot.asks) else None,
+                                funding_rate=fut.last_funding_rate if fut.last_funding_rate is not None else None,
+                                futures_price=fut.mark_price if fut.mark_price is not None else None
+                            )
+                            
+                            market_calc.update(snapshot)
+                            market_features = market_calc.calculate_features()
+                            
+                        except Exception as e:
+                            print(f"[ERROR] MarketFeaturesCalculator update failed: {e}")
+                            market_features = market_calc._default_features()
+
+                        # --- NEW: режим (ψ) для контекстного гейтинга ---
+                        # ВАЖНО: используем фичи из market_calc
+                        reg_ctx = {
+                            "trend_sign": market_features["trend_sign"],
+                            "trend_abs": market_features["trend_abs"],
+                            "vol_ratio": market_features["vol_ratio"],
+                            "jump_flag": market_features["jump_flag"],
+                            "ofi_sign": market_features["ofi_sign"],
+                            "book_imb": market_features["book_imb"],
+                            "basis_sign": market_features["basis_sign"],
+                            "funding_sign": market_features["funding_sign"],
+                        }
 
 
                         # анти-дрожь фазы
