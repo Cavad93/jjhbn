@@ -83,8 +83,8 @@ class TrainingVisualizer:
         self.data_file = os.path.join(output_dir, "training_data.json")
         self.html_file = os.path.join(output_dir, "dashboard.html")
         
-        # Лок для потокобезопасности
-        self.lock = threading.Lock()
+        # Лок для потокобезопасности - используем RLock для рекурсивного захвата
+        self.lock = threading.RLock()
         
         # Генерируем HTML при инициализации
         self._generate_html_dashboard()
