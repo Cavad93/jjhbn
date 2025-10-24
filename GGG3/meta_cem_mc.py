@@ -1154,13 +1154,40 @@ class MetaCEMMC:
     # ========== РАБОТА С ФАЙЛАМИ ==========
     def _append_example(self, ph: int, x: np.ndarray, y: int) -> List:
         """
-        Добавляет пример в буфер фазы и сохраняет в CSV с временной меткой
+        Добавляет пример в буфер фазы и сохраняет в CSV с временной меткой.
+        Проверяет размер каждые 100 записей для оптимизации.
         """
         self.buf_ph[ph].append((x.tolist(), int(y)))
         
         csv_path = self._phase_csv_paths.get(ph)
         if csv_path:
             try:
+                # Инициализируем счетчик если его нет
+                if not hasattr(self, '_csv_counters'):
+                    self._csv_counters = {}
+                if ph not in self._csv_counters:
+                    self._csv_counters[ph] = 0
+                
+                # Проверяем размер каждые 100 записей для производительности
+                self._csv_counters[ph] += 1
+                should_check = (self._csv_counters[ph] % 100 == 0)
+                
+                if should_check and os.path.exists(csv_path):
+                    # Быстрый подсчет строк
+                    with open(csv_path, "r", encoding="utf-8") as f:
+                        line_count = sum(1 for _ in f) - 1  # минус header
+                    
+                    # Если превышен лимит - делаем ротацию
+                    if line_count >= 4000:
+                        import pandas as pd
+                        df = pd.read_csv(csv_path, encoding="utf-8")
+                        # Оставляем последние 3000 записей
+                        df = df.tail(3000)
+                        df.to_csv(csv_path, index=False, encoding="utf-8")
+                        print(f"[MetaCEMMC] Rotated phase {ph} CSV: {line_count} → 3000 records")
+                        self._csv_counters[ph] = 3000  # Сбрасываем счетчик
+                
+                # Добавляем новую запись
                 file_exists = os.path.isfile(csv_path)
                 current_timestamp = time.time()
                 with open(csv_path, "a", newline="", encoding="utf-8") as f:
@@ -1170,9 +1197,11 @@ class MetaCEMMC:
                         writer.writerow(header)
                     row = list(x) + [int(y), current_timestamp]
                     writer.writerow(row)
+                    
             except Exception:
                 from error_logger import log_exception
-                log_exception("Unhandled exception")
+                log_exception("Failed to append example to phase CSV")
+        
         return self.buf_ph[ph]
 
     def _load_phase_buffer_from_disk(self, ph: int, max_age_days: Optional[float] = None) -> Tuple[List, List, List]:
