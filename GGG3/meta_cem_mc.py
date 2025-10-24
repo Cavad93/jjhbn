@@ -386,32 +386,57 @@ class MetaCEMMC:
         reg_ctx: Optional[dict] = None
     ) -> None:
         """
-        Записывает результат предсказания и триггерит обучение при необходимости
+        Записывает результат предсказания и триггерит обучение при необходимости.
+        
+        КРИТИЧЕСКИ ВАЖНО: Всегда сохраняет примеры для накопления опыта,
+        даже если некоторые эксперты не дали предсказаний.
         """
         try:
             # ===== ШАГ 1: ИЗВЛЕЧЕНИЕ ФАЗЫ И ПОСТРОЕНИЕ ФИЧЕЙ =====
             ph = phase_from_ctx(reg_ctx)
             self._last_phase = ph
+            
+            # ОТЛАДКА: проверяем входные данные
+            if len(self.shadow_hits) % 20 == 0:
+                available_preds = sum([
+                    1 for p in [p_xgb, p_rf, p_arf, p_nn] 
+                    if p is not None
+                ])
+                print(f"[MetaCEMMC] Input check: {available_preds}/4 experts available, "
+                    f"p_base={p_base:.4f if p_base else None}, phase={ph}")
 
+            # Пытаемся построить фичи обычным способом
             x_orig = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
-
+            
+            # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Всегда создаем фичи, даже если _phi вернул None
             if x_orig is not None:
                 x = x_orig
                 has_expert_predictions = True
             else:
+                # Используем безопасные значения для гарантированного накопления опыта
                 p_xgb_safe  = p_xgb  if p_xgb  is not None else (p_base if p_base is not None else 0.5)
                 p_rf_safe   = p_rf   if p_rf   is not None else (p_base if p_base is not None else 0.5)
                 p_arf_safe  = p_arf  if p_arf  is not None else (p_base if p_base is not None else 0.5)
                 p_nn_safe   = p_nn   if p_nn   is not None else (p_base if p_base is not None else 0.5)
                 p_base_safe = p_base if p_base is not None else 0.5
+                
                 x = self._phi_forced(p_xgb_safe, p_rf_safe, p_arf_safe, p_nn_safe, p_base_safe, reg_ctx)
                 has_expert_predictions = False
+                
+                # ОТЛАДКА: логируем использование forced mode
+                if self.seen_ph.get(ph, 0) % 10 == 0:
+                    print(f"[MetaCEMMC] ⚠️ Using forced phi mode for phase {ph} "
+                        f"(no expert predictions)")
 
-            # ===== ШАГ 2: ВСЕГДА СОХРАНЯЕМ ПРИМЕР =====
             # ===== ШАГ 2: ВСЕГДА СОХРАНЯЕМ ПРИМЕР =====
             buf = self._append_example(ph, x, int(y_up))
             self.seen_ph[ph] = int(self.seen_ph.get(ph, 0)) + 1
-
+            
+            # ОТЛАДКА: проверяем накопление данных
+            if self.seen_ph[ph] == 1:
+                print(f"[MetaCEMMC] ✅ First sample saved for phase {ph}")
+            elif self.seen_ph[ph] % 50 == 0:
+                print(f"[MetaCEMMC] 📊 Phase {ph}: {self.seen_ph[ph]} samples accumulated")
 
             # ===== ШАГ 3: ОБНОВЛЕНИЕ МЕТРИК =====
             if has_expert_predictions:
@@ -430,9 +455,11 @@ class MetaCEMMC:
                     if in_drift:
                         self.mode = "SHADOW"
                         self.active_hits = []
+                        print(f"[MetaCEMMC] 🔄 ACTIVE→SHADOW: drift detected")
             else:
                 self.shadow_hits.append(hit)
 
+            # Ограничиваем размер массивов
             self.active_hits = self.active_hits[-2000:]
             self.shadow_hits = self.shadow_hits[-2000:]
 
@@ -445,11 +472,10 @@ class MetaCEMMC:
                 self.cv_oof_labels[ph].append(int(y_up))
 
             # ===== ШАГ 5: ПЕРИОДИЧЕСКАЯ CV =====
-            # стало (meta_cem_mc.py, тот же блок — безопасный инкремент и чтение)
             cv_check_every = int(getattr(self.cfg, "cv_check_every", 50))
             self.cv_last_check[ph] = int(self.cv_last_check.get(ph, 0)) + 1
 
-            if getattr(self.cfg, "cv_enabled", True) and int(self.cv_last_check.get(ph, 0)) >= cv_check_every:
+            if getattr(self.cfg, "cv_enabled", True) and self.cv_last_check[ph] >= cv_check_every:
                 self.cv_last_check[ph] = 0
                 try:
                     cv_results = self._run_cv_validation(ph)
@@ -457,31 +483,36 @@ class MetaCEMMC:
                     if cv_results.get("status") == "ok":
                         self.validation_passed[ph] = True
                         print(
-                            f"[MetaCEMMC] CV ph={ph}: "
+                            f"[MetaCEMMC] ✅ CV ph={ph}: "
                             f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
                             f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
                             f"folds={cv_results['n_folds']}"
                         )
                 except Exception as e:
-                    print(f"[MetaCEMMC] CV failed for phase {ph}: {e.__class__.__name__}: {e}\n{traceback.format_exc()}")
+                    print(f"[MetaCEMMC] ❌ CV failed for phase {ph}: {e}")
+                    import traceback
+                    traceback.print_exc()
 
-
-            # ===== ШАГ 6: ЛЕНИВОЕ ОБУЧЕНИЕ =====
             # ===== ШАГ 6: ЛЕНИВОЕ ОБУЧЕНИЕ =====
             if self._phase_ready(ph):
                 try:
+                    print(f"[MetaCEMMC] 🎯 Starting training for phase {ph} "
+                        f"({self.seen_ph[ph]} samples)")
                     self._train_phase(ph)
                     self._trim_phase_storage(ph)
                     self.buf_ph[ph] = []
                     self._save()
+                    print(f"[MetaCEMMC] ✅ Training completed for phase {ph}")
                 except Exception as e:
-                    print(f"[MetaCEMMC] Training failed for phase {ph}: {e.__class__.__name__}: {e}\n{traceback.format_exc()}")
+                    print(f"[MetaCEMMC] ❌ Training failed for phase {ph}: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             # ===== ШАГ 7: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ =====
             try:
                 self._maybe_flip_modes()
             except Exception as e:
-                print(f"[MetaCEMMC] flip-modes error: {e.__class__.__name__}: {e}\n{traceback.format_exc()}")
+                print(f"[MetaCEMMC] flip-modes error: {e}")
 
             # ===== ШАГ 8: МОНИТОРИНГ ПРОГРЕССА =====
             try:
@@ -498,8 +529,10 @@ class MetaCEMMC:
                     print(f"   До активации: {58.0 - wr:.2f}% points")
                     print(f"   Фаза: {self._last_phase}")
                     print(f"   Режим: {self.mode}")
+                    print(f"   Накоплено по фазам: {dict(self.seen_ph)}")
                     print(f"{'='*60}\n")
                     
+                    # Уведомление в Telegram при приближении к активации
                     if wr >= 55.0 and getattr(self.cfg, 'tg_bot_token', None):
                         try:
                             from meta_report import send_telegram_text
@@ -516,8 +549,57 @@ class MetaCEMMC:
             except Exception as e:
                 print(f"[MetaCEMMC] monitoring error: {e}")
 
+            # ===== ШАГ 9: ИНТЕГРАЦИЯ С TRAINING VISUALIZER =====
+            try:
+                from training_visualizer import get_visualizer
+                viz = get_visualizer()
+                
+                # Собираем метрики для визуализатора
+                all_hits = self.active_hits + self.shadow_hits
+                wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
+                
+                cv_metrics = self.cv_metrics.get(ph, {})
+                cv_accuracy = cv_metrics.get("oof_accuracy")
+                cv_ci_lower = cv_metrics.get("ci_lower")
+                cv_ci_upper = cv_metrics.get("ci_upper")
+                
+                # Отправляем метрики META в визуализатор
+                viz.record_expert_metrics(
+                    expert_name="META",
+                    accuracy=wr_all,
+                    n_samples=len(all_hits),
+                    cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                    cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                    cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
+                    mode=self.mode
+                )
+                
+                # Отладка отправки метрик
+                if len(all_hits) == 1:
+                    print(f"[MetaCEMMC] ✅ First META metrics sent to viz: "
+                        f"WR={wr_all:.2%}, n={len(all_hits)}")
+                elif len(all_hits) % 50 == 0:
+                    print(f"[MetaCEMMC] 📈 META metrics update: WR={wr_all:.2%}, "
+                        f"n={len(all_hits)}, mode={self.mode}, "
+                        f"CV={cv_accuracy:.1f}%" if cv_accuracy else "")
+                    
+                    # Дополнительная информация о состоянии весов
+                    non_zero_phases = sum(1 for p in range(self.P) 
+                                        if not np.allclose(self.w_meta_ph[p], 0.0))
+                    print(f"[MetaCEMMC] Trained phases: {non_zero_phases}/{self.P}")
+                    
+            except ImportError:
+                pass  # TrainingVisualizer не установлен
+            except Exception as e:
+                print(f"[MetaCEMMC] ERROR: Failed to send metrics to visualizer: {e}")
+                import traceback
+                traceback.print_exc()
+
         except Exception as e:
-            print(f"[ens ] meta.record_result error: {e.__class__.__name__}: {e}\n{traceback.format_exc()}")
+            print(f"[ens ] meta.record_result error: {e.__class__.__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            # НЕ прерываем работу - продолжаем накапливать данные
 
     # ========== НОВОЕ: CROSS-VALIDATION ФУНКЦИИ ==========
     def _run_cv_validation(self, ph: int) -> Dict:
@@ -698,7 +780,13 @@ class MetaCEMMC:
         sample_weights: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """
-        Cross-Entropy Method оптимизация с визуализацией
+        Cross-Entropy Method оптимизация с полной визуализацией
+        
+        Включает:
+        - Отправку метрик на каждой итерации
+        - Отслеживание конвергенции
+        - Мониторинг разнообразия популяции
+        - Детальную отладку процесса
         """
         D = X.shape[1]
         n_elite = max(1, int(pop_size * elite_frac))
@@ -709,54 +797,154 @@ class MetaCEMMC:
         clip_val = float(getattr(self.cfg, "meta_w_clip", 8.0))
         best_loss = float('inf')
         best_w = mu.copy()
-
-        # НОВОЕ: визуализатор
+        
+        # Получаем текущую фазу
+        ph = getattr(self, "_last_phase", 0)
+        
+        # КРИТИЧЕСКОЕ: Инициализация визуализатора ДО начала обучения
+        viz_enabled = False
+        viz = None
         try:
             from training_visualizer import get_visualizer
             viz = get_visualizer()
             viz_enabled = True
-        except Exception:
-            viz_enabled = False
+            print(f"[MetaCEMMC] ✅ Visualizer connected for CEM training (phase={ph})")
+        except ImportError:
+            print(f"[MetaCEMMC] ⚠️ TrainingVisualizer not available")
+        except Exception as e:
+            print(f"[MetaCEMMC] ❌ Visualizer init failed: {e}")
+        
+        # НОВОЕ: Отправляем начало обучения
+        if viz_enabled and viz is not None:
+            try:
+                viz.record_meta_training_step(
+                    phase=ph,
+                    iteration=0,
+                    best_loss=float('inf'),
+                    median_loss=float('inf'),
+                    sigma=float(np.mean(sigma))
+                )
+                print(f"[MetaCEMMC] 📊 Training START sent to viz: phase={ph}, n_iter={n_iter}, "
+                    f"pop_size={pop_size}, n_samples={len(X)}")
+            except Exception as e:
+                print(f"[MetaCEMMC] ERROR: Failed to send start signal: {e}")
+                viz_enabled = False
 
+        # Трекинг для конвергенции
+        loss_history = []
+        sigma_history = []
+        improvement_count = 0
+        
         for iteration in range(n_iter):
+            # Генерация популяции
             population = []
             for _ in range(pop_size):
                 w = mu + sigma * np.random.randn(D)
                 w = np.clip(w, -clip_val, clip_val)
                 population.append(w)
             
+            # Оценка популяции
             scores = []
             for w in population:
                 loss = self._mc_eval(w, X, y, n_bootstrap=10, sample_weights=sample_weights)
                 scores.append(loss)
             
+            # Отбор элиты
             elite_idx = np.argsort(scores)[:n_elite]
             elite = [population[i] for i in elite_idx]
             
+            # Обновление лучшего решения
             if scores[elite_idx[0]] < best_loss:
+                improvement_count += 1
                 best_loss = scores[elite_idx[0]]
                 best_w = population[elite_idx[0]].copy()
+                
+                # ОТЛАДКА: логируем улучшения
+                if iteration > 0:
+                    print(f"[MetaCEMMC] 🎯 Improvement #{improvement_count} at iter {iteration}: "
+                        f"loss={best_loss:.6f}")
             
+            # Обновление параметров распределения
             elite_arr = np.array(elite)
             mu = elite_arr.mean(axis=0)
             current_sigma = elite_arr.std(axis=0) + 1e-6
-            sigma = current_sigma
+            sigma = current_sigma * 0.9 + sigma * 0.1  # Сглаживание для стабильности
             
-            if viz_enabled and iteration % 5 == 0:
+            # Метрики для визуализации
+            median_loss = float(np.median(scores))
+            avg_sigma = float(np.mean(sigma))
+            diversity = float(np.std([np.linalg.norm(w) for w in elite]))
+            
+            loss_history.append(best_loss)
+            sigma_history.append(avg_sigma)
+            
+            # КРИТИЧЕСКОЕ: Отправка метрик в визуализатор
+            # Часто в начале (каждую итерацию для первых 10), потом реже
+            should_send = (iteration < 10) or (iteration % 5 == 0) or (iteration == n_iter - 1)
+            
+            if viz_enabled and viz is not None and should_send:
                 try:
-                    ph = getattr(self, "_last_phase", 0)
-                    median_loss = float(np.median(scores))
-                    avg_sigma = float(np.mean(sigma))
                     viz.record_meta_training_step(
                         phase=ph,
-                        iteration=iteration,
+                        iteration=iteration + 1,  # +1 чтобы начиналось с 1, не 0
                         best_loss=float(best_loss),
                         median_loss=median_loss,
                         sigma=avg_sigma
                     )
-                except Exception:
-                    log_exception("MetaCEMMC: record_meta_training_step failed")
-
+                    
+                    # Детальная отладка для первых итераций и ключевых моментов
+                    if iteration < 3 or iteration % 10 == 0 or iteration == n_iter - 1:
+                        print(f"[MetaCEMMC] 📈 CEM iter {iteration+1}/{n_iter}: "
+                            f"best_loss={best_loss:.6f}, median={median_loss:.6f}, "
+                            f"sigma={avg_sigma:.4f}, diversity={diversity:.4f}")
+                        
+                        if iteration == 0:
+                            print(f"[MetaCEMMC] ✅ First META training metrics sent to visualizer")
+                            
+                except Exception as e:
+                    print(f"[MetaCEMMC] ERROR at iter {iteration}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    viz_enabled = False  # Отключаем если ошибка
+            
+            # Ранняя остановка при конвергенции
+            if iteration > 20 and len(loss_history) > 10:
+                recent_improvement = abs(loss_history[-1] - loss_history[-10])
+                if recent_improvement < 1e-6 and avg_sigma < 0.1:
+                    print(f"[MetaCEMMC] 🏁 Early stopping at iter {iteration}: converged")
+                    break
+        
+        # НОВОЕ: Финальная отправка результатов
+        if viz_enabled and viz is not None:
+            try:
+                # Отправляем финальное состояние
+                viz.record_meta_training_step(
+                    phase=ph,
+                    iteration=n_iter,
+                    best_loss=float(best_loss),
+                    median_loss=float(best_loss),  # В конце median = best
+                    sigma=0.0  # Сигнал завершения
+                )
+                
+                # Итоговая статистика
+                convergence_rate = (loss_history[0] - best_loss) / max(loss_history[0], 1e-6) if loss_history else 0
+                print(f"\n[MetaCEMMC] 🎉 CEM Training Complete:")
+                print(f"  Phase: {ph}")
+                print(f"  Final loss: {best_loss:.6f}")
+                print(f"  Improvements: {improvement_count}/{n_iter}")
+                print(f"  Convergence: {convergence_rate:.2%}")
+                print(f"  Final sigma: {np.mean(sigma):.4f}")
+                print(f"  ✅ All metrics sent to visualizer")
+                
+            except Exception as e:
+                print(f"[MetaCEMMC] ERROR sending final metrics: {e}")
+        
+        # Проверка что визуализатор получил данные
+        if viz_enabled and improvement_count > 0:
+            print(f"[MetaCEMMC] 📊 Check training_data.json - should have {min(n_iter, 10 + (n_iter-10)//5)} META points")
+        elif not viz_enabled:
+            print(f"[MetaCEMMC] ⚠️ Training completed without visualization")
+        
         return best_w
 
     def _train_cma_es(self, X: np.ndarray, y: np.ndarray, ph: int, sample_weights: Optional[np.ndarray] = None) -> np.ndarray:
