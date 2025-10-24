@@ -2773,7 +2773,7 @@ class MLConfig:
     arf_model_path: str = "arf_model.pkl"
     arf_cal_path: str = "arf_cal.pkl"                # 👈 НОВОЕ
     arf_calibration_method: str = "platt"
-    arf_n_models: int = 10
+    arf_n_models: int = 25
     arf_max_depth: Optional[int] = None
 
     # NN Expert (MLP)
