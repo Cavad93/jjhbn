@@ -53,6 +53,22 @@ class TrainingVisualizer:
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
         
+        # Thread-safe блокировка для защиты от race conditions
+        self.lock = threading.RLock()  # RLock позволяет повторный захват из того же потока
+        
+        # Хранилища метрик с ограничением размера
+        from collections import deque
+        self.expert_metrics: Dict[str, deque] = {
+            "XGB": deque(maxlen=1000),
+            "RF": deque(maxlen=1000), 
+            "ARF": deque(maxlen=1000),
+            "NN": deque(maxlen=1000)
+        }
+        
+        self.meta_training_history: Dict[int, deque] = {
+            i: deque(maxlen=500) for i in range(6)  # 6 фаз
+        }
+
         # Хранилища метрик
         self.expert_metrics: Dict[str, List[ExpertMetrics]] = {
             "XGB": [],
@@ -191,34 +207,110 @@ class TrainingVisualizer:
             print(f"[TrainingVisualizer] Failed to send Telegram notification: {e}")
     
     def _save_data(self):
-        """Сохраняет данные в JSON для HTML dashboard"""
+        """
+        Сохраняет данные в JSON для HTML dashboard.
+        Thread-safe версия с блокировкой и защитой от race conditions.
+        """
+        # Используем блокировку для thread-safety
+        with self.lock:
+            try:
+                # Создаем копию данных под блокировкой для избежания изменений во время сериализации
+                data_snapshot = {
+                    "expert_metrics": {
+                        name: [asdict(m) for m in list(metrics)]  # list() создает копию
+                        for name, metrics in self.expert_metrics.items()
+                    },
+                    "meta_training": {
+                        str(phase): [asdict(s) for s in list(steps)]  # list() создает копию
+                        for phase, steps in self.meta_training_history.items()
+                    },
+                    "last_update": time.time()
+                }
+                
+                # Ограничиваем размер истории для предотвращения неограниченного роста
+                MAX_POINTS_PER_EXPERT = 1000
+                MAX_POINTS_PER_PHASE = 500
+                
+                # Обрезаем данные экспертов если слишком много
+                for name in data_snapshot["expert_metrics"]:
+                    if len(data_snapshot["expert_metrics"][name]) > MAX_POINTS_PER_EXPERT:
+                        # Оставляем последние MAX_POINTS_PER_EXPERT записей
+                        data_snapshot["expert_metrics"][name] = \
+                            data_snapshot["expert_metrics"][name][-MAX_POINTS_PER_EXPERT:]
+                
+                # Обрезаем данные META обучения
+                for phase in data_snapshot["meta_training"]:
+                    if len(data_snapshot["meta_training"][phase]) > MAX_POINTS_PER_PHASE:
+                        # Оставляем последние MAX_POINTS_PER_PHASE записей
+                        data_snapshot["meta_training"][phase] = \
+                            data_snapshot["meta_training"][phase][-MAX_POINTS_PER_PHASE:]
+                
+            except Exception as e:
+                print(f"[TrainingVisualizer] Failed to prepare data snapshot: {e}")
+                traceback.print_exc()
+                return
+        
+        # Записываем вне блокировки чтобы не держать lock долго при I/O операциях
         try:
-            data = {
-                "expert_metrics": {
-                    name: [asdict(m) for m in metrics]
-                    for name, metrics in self.expert_metrics.items()
-                },
-                "meta_training": {
-                    str(phase): [asdict(s) for s in steps]
-                    for phase, steps in self.meta_training_history.items()
-                },
-                "last_update": time.time()
-            }
+            # Используем временный файл для атомарной записи
+            tmp_file = self.data_file + f".tmp.{os.getpid()}.{threading.get_ident()}"
             
-            # Атомарная запись через временный файл
-            tmp_file = self.data_file + ".tmp"
+            # Записываем во временный файл
             with open(tmp_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_file, self.data_file)
+                # Используем компактную сериализацию для больших объемов данных
+                if len(json.dumps(data_snapshot)) > 1_000_000:  # Если больше 1MB
+                    json.dump(data_snapshot, f, ensure_ascii=False, separators=(',', ':'))
+                else:
+                    json.dump(data_snapshot, f, ensure_ascii=False, indent=2)
+            
+            # Проверяем что файл записался корректно
+            with open(tmp_file, "r", encoding="utf-8") as f:
+                json.load(f)  # Проверка что JSON валидный
+            
+            # Атомарная замена основного файла
+            # На Windows os.replace может не работать если файл открыт, используем fallback
+            try:
+                os.replace(tmp_file, self.data_file)
+            except OSError:
+                # Fallback для Windows
+                if os.path.exists(self.data_file):
+                    backup = self.data_file + ".backup"
+                    if os.path.exists(backup):
+                        os.remove(backup)
+                    os.rename(self.data_file, backup)
+                os.rename(tmp_file, self.data_file)
             
             # Подсчитываем статистику
-            total_expert_points = sum(len(m) for m in self.expert_metrics.values())
-            total_meta_points = sum(len(s) for s in self.meta_training_history.values())
-            print(f"[TrainingVisualizer] Data saved: {total_expert_points} expert points, {total_meta_points} META points")
+            total_expert_points = sum(len(m) for m in data_snapshot["expert_metrics"].values())
+            total_meta_points = sum(len(s) for s in data_snapshot["meta_training"].values())
             
+            # Размер файла для мониторинга
+            file_size_mb = os.path.getsize(self.data_file) / (1024 * 1024)
+            
+            print(f"[TrainingVisualizer] Data saved: "
+                f"{total_expert_points} expert points, "
+                f"{total_meta_points} META points, "
+                f"file size: {file_size_mb:.2f} MB")
+            
+            # Предупреждение если файл слишком большой
+            if file_size_mb > 10:
+                print(f"[TrainingVisualizer] WARNING: Data file is getting large ({file_size_mb:.2f} MB). "
+                    f"Consider cleaning old data.")
+            
+        except json.JSONDecodeError as e:
+            print(f"[TrainingVisualizer] JSON validation failed: {e}")
+            # Удаляем поврежденный временный файл
+            if os.path.exists(tmp_file):
+                os.remove(tmp_file)
         except Exception as e:
             print(f"[TrainingVisualizer] Failed to save data: {e.__class__.__name__}: {e}")
             traceback.print_exc()
+            # Очистка временного файла при ошибке
+            if 'tmp_file' in locals() and os.path.exists(tmp_file):
+                try:
+                    os.remove(tmp_file)
+                except:
+                    pass
     
     def _generate_html_dashboard(self):
         """Генерирует HTML dashboard с живыми графиками"""
