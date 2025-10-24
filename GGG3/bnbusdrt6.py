@@ -2762,8 +2762,11 @@ class MLConfig:
     xgb_rounds_warm: int = 30
 
     # RF
+    # bnbusdrt6.py, класс MLConfig, строка ~1155
+    # RF
     rf_model_path: str = "rf_calibrated.pkl"
     rf_state_path: str = "rf_state.json"
+    rf_cal_path: str = "rf_cal.pkl"  # ✅ ДОБАВИЛИ путь для калибратора RF
     rf_n_estimators: int = 300
     rf_max_depth: Optional[int] = None
     rf_min_samples_leaf: int = 2
@@ -3869,8 +3872,20 @@ class RFCalibratedExpert(_BaseExpert):
         self.cv_last_check: Dict[int, int] = {p: 0 for p in range(self.P)}
         
         # Validation mode tracking
+        # Validation mode tracking
         self.validation_passed: Dict[int, bool] = {p: False for p in range(self.P)}
 
+        # ===== ФАЗОВЫЕ КАЛИБРАТОРЫ =====
+        self.cal_ph: Dict[int, Optional[_BaseCal]] = {p: None for p in range(self.P)}
+        import os as _os
+        self._cal_path = lambda base, ph: f"{_os.path.splitext(base)[0]}_ph{int(ph)}{_os.path.splitext(base)[1]}"
+
+        # ✅ ДОБАВИЛИ: попытка загрузить фазовые калибраторы
+        for p in range(self.P):
+            try:
+                self.cal_ph[p] = _BaseCal.load(self._cal_path(self.cfg.rf_cal_path, p))
+            except Exception:
+                self.cal_ph[p] = None
 
         # Техническое: число фич (заполним при первом вызове)
         self.n_feats: Optional[int] = None
@@ -4712,7 +4727,7 @@ class RFCalibratedExpert(_BaseExpert):
                 if self.cal_ph[ph] is not None:
                     self.cal_ph[ph].observe(float(p_raw), int(y_up))
                     if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
-                        cal_path = self._cal_path(getattr(self.cfg, "rf_cal_path", self.cfg.xgb_cal_path), ph)
+                        cal_path = self._cal_path(self.cfg.rf_cal_path, ph)
                         self.cal_ph[ph].save(cal_path)
         except Exception as e:
             import logging
