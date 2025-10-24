@@ -1124,12 +1124,13 @@ class OnlineLogReg:
         self.state_path = state_path
         self._load()
 
+    # bnbusdrt6.py, класс OnlineLogReg._load()
     def _load(self):
         try:
             with open(self.state_path, "r") as f:
                 obj = json.load(f)
             w = obj.get("w", [])
-            if isinstance(w, list) and len(w) == len(self.w):
+            if isinstance(w, list) and len(w) > 0:  # ✅ Загружаем любой непустой массив
                 self.w = np.array(w, dtype=float)
         except Exception:
             log_exception("Failed to load JSON")
@@ -6933,18 +6934,28 @@ def main_loop():
     
     # ========== АВТОМАТИЧЕСКАЯ АДАПТАЦИЯ К НОВОЙ РАЗМЕРНОСТИ NN-КАЛИБРАТОРА ==========
     # ========== АВТОМАТИЧЕСКАЯ АДАПТАЦИЯ К НОВОЙ РАЗМЕРНОСТИ NN-КАЛИБРАТОРА ==========
+    # bnbusdrt6.py, строка ~3560
     if logreg is not None:
-        EXPECTED_PHI_DIM = 11  # 10 признаков + 1 bias
+        EXPECTED_PHI_DIM = 11
         
         if len(logreg.w) != EXPECTED_PHI_DIM:
-            print(f"[nn  ] ⚠️  Размерность logreg изменилась: {len(logreg.w)} → {EXPECTED_PHI_DIM}")
-            print(f"[nn  ] Переинициализация весов для новых признаков...")
+            old_dim = len(logreg.w)
+            print(f"[nn  ] ⚠️  Размерность logreg изменилась: {old_dim} → {EXPECTED_PHI_DIM}")
             
-            # Используем numpy напрямую, чтобы избежать конфликта с локальной переменной np
             import numpy
-            logreg.w = numpy.zeros(EXPECTED_PHI_DIM, dtype=numpy.float64)
-            logreg.save()
             
+            # ✅ СОХРАНЯЕМ СТАРЫЕ ВЕСА при расширении
+            if old_dim < EXPECTED_PHI_DIM:
+                print(f"[nn  ] Расширение весов с {old_dim} до {EXPECTED_PHI_DIM} (сохраняем старые)")
+                new_w = numpy.zeros(EXPECTED_PHI_DIM, dtype=numpy.float64)
+                new_w[:old_dim] = logreg.w[:old_dim]  # ✅ Копируем старые веса
+                logreg.w = new_w
+            else:
+                # ✅ Урезаем лишние веса
+                print(f"[nn  ] Урезание весов с {old_dim} до {EXPECTED_PHI_DIM}")
+                logreg.w = logreg.w[:EXPECTED_PHI_DIM]
+            
+            logreg.save()
             print(f"[nn  ] ✅ logreg готов к использованию с {EXPECTED_PHI_DIM} признаками")
     # ==================================================================================
     # ==================================================================================
