@@ -3617,8 +3617,13 @@ class XGBExpert(_BaseExpert):
                             self.active_hits = []
                 else:
                     self.shadow_hits.append(hit)
+                
+                # КРИТИЧЕСКОЕ ДОПОЛНЕНИЕ: ограничиваем размер массивов хитов
+                self.active_hits = self.active_hits[-2000:]
+                self.shadow_hits = self.shadow_hits[-2000:]
+                
             except Exception:
-                log_exception("Failed to update")
+                log_exception("Failed to update hits")
 
         # ========== БЛОК 6: СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
         if self.cfg.cv_enabled and p_pred is not None:
@@ -3643,7 +3648,7 @@ class XGBExpert(_BaseExpert):
             logging.getLogger("errors").error("[xgb] calibrator failed ph=%s: %s", ph, e, exc_info=True)
 
         # ========== БЛОК 8: ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
-        self.cv_last_check[ph] += 1
+        self.cv_last_check[ph] = self.cv_last_check.get(ph, 0) + 1
         
         if self.cfg.cv_enabled and self.cv_last_check[ph] >= self.cfg.cv_check_every:
             self.cv_last_check[ph] = 0
@@ -3653,8 +3658,6 @@ class XGBExpert(_BaseExpert):
             
             if cv_results.get("status") == "ok":
                 self.validation_passed[ph] = True
-            
-            if cv_results.get("status") == "ok":
                 print(f"[{self.__class__.__name__}] CV ph={ph}: "
                     f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
                     f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
@@ -3674,6 +3677,7 @@ class XGBExpert(_BaseExpert):
             from training_visualizer import get_visualizer
             viz = get_visualizer()
             
+            # Теперь массивы гарантированно содержат актуальные данные
             all_hits = self.active_hits + self.shadow_hits
             wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
             
@@ -3682,6 +3686,7 @@ class XGBExpert(_BaseExpert):
             cv_ci_lower = cv_metrics.get("ci_lower")
             cv_ci_upper = cv_metrics.get("ci_upper")
             
+            # Отправляем реальные метрики в визуализатор
             viz.record_expert_metrics(
                 expert_name="XGB",
                 accuracy=wr_all,
@@ -3691,8 +3696,15 @@ class XGBExpert(_BaseExpert):
                 cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
                 mode=self.mode
             )
-        except Exception:
-            pass
+            
+            # Дополнительная отладка для первых примеров
+            if len(all_hits) > 0 and len(all_hits) % 10 == 0:
+                print(f"[XGB] Metrics sent to viz: WR={wr_all:.2%}, n={len(all_hits)}, mode={self.mode}")
+                
+        except ImportError:
+            pass  # TrainingVisualizer не установлен
+        except Exception as e:
+            print(f"[XGB] Warning: Failed to send metrics to visualizer: {e}")
 
     # ---------- режимы ----------
     def _maybe_flip_modes(self):
@@ -4663,8 +4675,25 @@ class RFCalibratedExpert(_BaseExpert):
                             self.active_hits = []
                 else:
                     self.shadow_hits.append(hit)
-            except Exception:
-                log_exception("Failed to update")
+                
+                # КРИТИЧЕСКОЕ ДОПОЛНЕНИЕ: ограничиваем размер массивов хитов
+                self.active_hits = self.active_hits[-2000:]
+                self.shadow_hits = self.shadow_hits[-2000:]
+                
+                # ОТЛАДКА: проверяем накопление хитов каждые 10 примеров
+                total_hits = len(self.active_hits) + len(self.shadow_hits)
+                if total_hits > 0 and total_hits % 10 == 0:
+                    wr = sum(self.shadow_hits[-100:]) / min(100, len(self.shadow_hits)) if self.shadow_hits else 0
+                    print(f"[RF] Hits accumulated: shadow={len(self.shadow_hits)}, active={len(self.active_hits)}, "
+                        f"last_100_wr={wr:.2%}")
+                    
+            except Exception as e:
+                print(f"[RF] ERROR updating hits: {e}, p_pred={p_pred}, y_up={y_up}")
+                log_exception("Failed to update RF hits")
+        else:
+            # ОТЛАДКА: логируем если p_pred отсутствует
+            if self.new_since_train % 50 == 0:
+                print(f"[RF] WARNING: p_pred is None for {self.new_since_train} samples")
 
         # ========== БЛОК 6: СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
         if self.cfg.cv_enabled and p_pred is not None:
@@ -4686,10 +4715,11 @@ class RFCalibratedExpert(_BaseExpert):
                         self.cal_ph[ph].save(cal_path)
         except Exception as e:
             import logging
-            logging.getLogger("errors").error("[rf ] calibrator failed ph=%s: %s", ph, e, exc_info=True)
+            logging.getLogger("errors").error("[rf] calibrator failed ph=%s: %s", ph, e, exc_info=True)
 
         # ========== БЛОК 8: ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
-        self.cv_last_check[ph] += 1
+        # ИСПРАВЛЕНО: безопасная инициализация cv_last_check
+        self.cv_last_check[ph] = self.cv_last_check.get(ph, 0) + 1
         
         if self.cfg.cv_enabled and self.cv_last_check[ph] >= self.cfg.cv_check_every:
             self.cv_last_check[ph] = 0
@@ -4699,9 +4729,7 @@ class RFCalibratedExpert(_BaseExpert):
             
             if cv_results.get("status") == "ok":
                 self.validation_passed[ph] = True
-            
-            if cv_results.get("status") == "ok":
-                print(f"[{self.__class__.__name__}] CV ph={ph}: "
+                print(f"[RF] CV ph={ph}: "
                     f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
                     f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
                     f"folds={cv_results['n_folds']}")
@@ -4720,6 +4748,7 @@ class RFCalibratedExpert(_BaseExpert):
             from training_visualizer import get_visualizer
             viz = get_visualizer()
             
+            # Теперь массивы гарантированно содержат актуальные данные
             all_hits = self.active_hits + self.shadow_hits
             wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
             
@@ -4728,6 +4757,7 @@ class RFCalibratedExpert(_BaseExpert):
             cv_ci_lower = cv_metrics.get("ci_lower")
             cv_ci_upper = cv_metrics.get("ci_upper")
             
+            # Отправляем реальные метрики в визуализатор
             viz.record_expert_metrics(
                 expert_name="RF",
                 accuracy=wr_all,
@@ -4737,8 +4767,20 @@ class RFCalibratedExpert(_BaseExpert):
                 cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
                 mode=self.mode
             )
-        except Exception:
-            pass
+            
+            # Дополнительная отладка для контроля отправки метрик
+            if len(all_hits) == 1:  # Первый пример
+                print(f"[RF] First metrics sent to viz: WR={wr_all:.2%}, n={len(all_hits)}, mode={self.mode}")
+            elif len(all_hits) % 50 == 0:  # Каждые 50 примеров
+                print(f"[RF] Metrics update: WR={wr_all:.2%}, n={len(all_hits)}, mode={self.mode}, "
+                    f"CV={cv_accuracy:.1f}%" if cv_accuracy else "")
+                
+        except ImportError:
+            pass  # TrainingVisualizer не установлен
+        except Exception as e:
+            print(f"[RF] ERROR: Failed to send metrics to visualizer: {e}")
+            import traceback
+            traceback.print_exc()
 
 
     def _maybe_flip_modes(self):
@@ -5082,8 +5124,9 @@ class RiverARFExpert(_BaseExpert):
         # ========== БЛОК 3: ОНЛАЙН-ОБУЧЕНИЕ RIVER ARF ==========
         try:
             self.clf.learn_one(self._to_dict(x_raw), bool(y_up))
-        except Exception:
-            log_exception("Unhandled exception")
+        except Exception as e:
+            print(f"[ARF] ERROR in online learning: {e}")
+            log_exception("ARF learn_one failed")
 
         # ========== БЛОК 4: СОХРАНЕНИЕ В БУФЕРЫ ==========
         self.X.append(x_raw.astype(np.float32).ravel().tolist())
@@ -5115,11 +5158,29 @@ class RiverARFExpert(_BaseExpert):
                                 self.mode = "SHADOW"
                                 self.active_hits = []
                         except Exception:
-                            log_exception("Failed to update")
+                            log_exception("ARF ADWIN failed")
                 else:
                     self.shadow_hits.append(hit)
-            except Exception:
-                log_exception("Failed to update")
+                
+                # КРИТИЧЕСКОЕ ДОПОЛНЕНИЕ: ограничиваем размер массивов хитов
+                self.active_hits = self.active_hits[-2000:]
+                self.shadow_hits = self.shadow_hits[-2000:]
+                
+                # ОТЛАДКА: проверяем накопление хитов каждые 10 примеров
+                total_hits = len(self.active_hits) + len(self.shadow_hits)
+                if total_hits > 0 and total_hits % 10 == 0:
+                    wr = sum(self.shadow_hits[-100:]) / min(100, len(self.shadow_hits)) if self.shadow_hits else 0
+                    active_wr = sum(self.active_hits[-100:]) / min(100, len(self.active_hits)) if self.active_hits else 0
+                    print(f"[ARF] Hits accumulated: shadow={len(self.shadow_hits)} (WR={wr:.2%}), "
+                        f"active={len(self.active_hits)} (WR={active_wr:.2%})")
+                    
+            except Exception as e:
+                print(f"[ARF] ERROR updating hits: {e}, p_pred={p_pred}, y_up={y_up}")
+                log_exception("Failed to update ARF hits")
+        else:
+            # ОТЛАДКА: логируем если p_pred отсутствует
+            if self.new_since_train % 50 == 0:
+                print(f"[ARF] WARNING: p_pred is None for {self.new_since_train} samples")
 
         # ========== БЛОК 8: OOF PREDICTIONS ДЛЯ CV ==========
         if getattr(self.cfg, "cv_enabled", False) and p_pred is not None:
@@ -5171,6 +5232,7 @@ class RiverARFExpert(_BaseExpert):
             from training_visualizer import get_visualizer
             viz = get_visualizer()
             
+            # Теперь массивы гарантированно содержат актуальные данные
             all_hits = self.active_hits + self.shadow_hits
             wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
             
@@ -5179,6 +5241,7 @@ class RiverARFExpert(_BaseExpert):
             cv_ci_lower = cv_metrics.get("ci_lower")
             cv_ci_upper = cv_metrics.get("ci_upper")
             
+            # Отправляем реальные метрики в визуализатор
             viz.record_expert_metrics(
                 expert_name="ARF",
                 accuracy=wr_all,
@@ -5188,8 +5251,30 @@ class RiverARFExpert(_BaseExpert):
                 cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
                 mode=self.mode
             )
-        except Exception:
-            pass
+            
+            # КРИТИЧЕСКАЯ ОТЛАДКА: проверяем что данные действительно отправляются
+            if len(all_hits) == 1:  # Первый пример
+                print(f"[ARF] ✅ First metrics sent to viz: WR={wr_all:.2%}, n={len(all_hits)}, mode={self.mode}")
+            elif len(all_hits) % 20 == 0:  # Каждые 20 примеров (чаще чем у других)
+                print(f"[ARF] ✅ Metrics update sent: WR={wr_all:.2%}, n={len(all_hits)}, mode={self.mode}, "
+                    f"CV={cv_accuracy:.1f}%" if cv_accuracy else "")
+                
+                # Проверка состояния модели ARF
+                if hasattr(self.clf, 'n_models'):
+                    print(f"[ARF] Model status: n_models={self.clf.n_models}, "
+                        f"n_features={self.n_feats}")
+            
+            # Дополнительная проверка что визуализатор получил данные
+            if len(all_hits) == 10:
+                print(f"[ARF] 📊 Viz integration check: metrics should be visible in training_data.json now")
+                
+        except ImportError:
+            print("[ARF] WARNING: TrainingVisualizer not imported")
+        except Exception as e:
+            print(f"[ARF] ERROR: Failed to send metrics to visualizer: {e}")
+            import traceback
+            traceback.print_exc()
+            # Продолжаем работу даже если визуализатор сломан
 
     def _get_phase_train(self, ph: int) -> Tuple[np.ndarray, np.ndarray]:
         """Получает данные для обучения/валидации фазы"""
@@ -5766,8 +5851,25 @@ class NNExpert(_BaseExpert):
                             self.active_hits = []
                 else:
                     self.shadow_hits.append(hit)
-            except Exception:
-                log_exception("Failed to update")
+                
+                # КРИТИЧЕСКОЕ ДОПОЛНЕНИЕ: ограничиваем размер массивов хитов
+                self.active_hits = self.active_hits[-2000:]
+                self.shadow_hits = self.shadow_hits[-2000:]
+                
+                # ОТЛАДКА: проверяем накопление хитов каждые 10 примеров
+                total_hits = len(self.active_hits) + len(self.shadow_hits)
+                if total_hits > 0 and total_hits % 10 == 0:
+                    wr = sum(self.shadow_hits[-100:]) / min(100, len(self.shadow_hits)) if self.shadow_hits else 0
+                    print(f"[NN] Hits accumulated: shadow={len(self.shadow_hits)}, active={len(self.active_hits)}, "
+                        f"last_100_wr={wr:.2%}")
+                    
+            except Exception as e:
+                print(f"[NN] ERROR updating hits: {e}, p_pred={p_pred}, y_up={y_up}")
+                log_exception("Failed to update NN hits")
+        else:
+            # ОТЛАДКА: логируем если p_pred отсутствует
+            if self.new_since_train % 50 == 0:
+                print(f"[NN] WARNING: p_pred is None for {self.new_since_train} samples")
 
         # ========== БЛОК 6: СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
         if self.cfg.cv_enabled and p_pred is not None:
@@ -5783,17 +5885,20 @@ class NNExpert(_BaseExpert):
                     method = getattr(self.cfg, "nn_calibration_method",
                                     getattr(self.cfg, "xgb_calibration_method", "logistic"))
                     self.cal_ph[ph] = make_calibrator(method)
-
-                self.cal_ph[ph].observe(float(p_raw), int(y_up))
-
-                if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
-                    cal_path = self._cal_path(getattr(self.cfg, "nn_cal_path", self.cfg.xgb_cal_path), ph)
-                    self.cal_ph[ph].save(cal_path)
-        except Exception:
-            log_exception("Failed to observe")
+                
+                if self.cal_ph[ph] is not None:
+                    self.cal_ph[ph].observe(float(p_raw), int(y_up))
+                    
+                    if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
+                        cal_path = self._cal_path(getattr(self.cfg, "nn_cal_path", self.cfg.xgb_cal_path), ph)
+                        self.cal_ph[ph].save(cal_path)
+        except Exception as e:
+            print(f"[NN] Calibration error: {e}")
+            log_exception("Failed to observe NN calibration")
 
         # ========== БЛОК 8: ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
-        self.cv_last_check[ph] += 1
+        # ИСПРАВЛЕНО: безопасная инициализация cv_last_check
+        self.cv_last_check[ph] = self.cv_last_check.get(ph, 0) + 1
         
         if self.cfg.cv_enabled and self.cv_last_check[ph] >= self.cfg.cv_check_every:
             self.cv_last_check[ph] = 0
@@ -5803,9 +5908,7 @@ class NNExpert(_BaseExpert):
             
             if cv_results.get("status") == "ok":
                 self.validation_passed[ph] = True
-            
-            if cv_results.get("status") == "ok":
-                print(f"[{self.__class__.__name__}] CV ph={ph}: "
+                print(f"[NN] CV ph={ph}: "
                     f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
                     f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
                     f"folds={cv_results['n_folds']}")
@@ -5818,12 +5921,13 @@ class NNExpert(_BaseExpert):
         
         # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
         self._save_all()
-    
+
         # ========== БЛОК 12: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
         try:
             from training_visualizer import get_visualizer
             viz = get_visualizer()
             
+            # Теперь массивы гарантированно содержат актуальные данные
             all_hits = self.active_hits + self.shadow_hits
             wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
             
@@ -5832,6 +5936,7 @@ class NNExpert(_BaseExpert):
             cv_ci_lower = cv_metrics.get("ci_lower")
             cv_ci_upper = cv_metrics.get("ci_upper")
             
+            # Отправляем реальные метрики в визуализатор
             viz.record_expert_metrics(
                 expert_name="NN",
                 accuracy=wr_all,
@@ -5841,8 +5946,25 @@ class NNExpert(_BaseExpert):
                 cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
                 mode=self.mode
             )
-        except Exception:
-            pass
+            
+            # Дополнительная отладка для контроля отправки метрик
+            if len(all_hits) == 1:  # Первый пример
+                print(f"[NN] First metrics sent to viz: WR={wr_all:.2%}, n={len(all_hits)}, mode={self.mode}")
+            elif len(all_hits) % 50 == 0:  # Каждые 50 примеров
+                print(f"[NN] Metrics update: WR={wr_all:.2%}, n={len(all_hits)}, mode={self.mode}, "
+                    f"CV={cv_accuracy:.1f}%" if cv_accuracy else "")
+                
+                # Проверка корректности нейросети
+                if hasattr(self, 'net') and self.net is not None:
+                    print(f"[NN] Network status: layers={len(self.net.layers) if hasattr(self.net, 'layers') else 'unknown'}, "
+                        f"trained={self.net is not None}")
+                
+        except ImportError:
+            pass  # TrainingVisualizer не установлен
+        except Exception as e:
+            print(f"[NN] ERROR: Failed to send metrics to visualizer: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _maybe_flip_modes(self):
         """
