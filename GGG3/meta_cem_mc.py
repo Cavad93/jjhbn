@@ -397,13 +397,15 @@ class MetaCEMMC:
             self._last_phase = ph
             
             # ОТЛАДКА: проверяем входные данные
+            # ОТЛАДКА: проверяем входные данные
             if len(self.shadow_hits) % 20 == 0:
                 available_preds = sum([
                     1 for p in [p_xgb, p_rf, p_arf, p_nn] 
                     if p is not None
                 ])
+                p_base_str = f"{p_base:.4f}" if p_base is not None else "None"
                 print(f"[MetaCEMMC] Input check: {available_preds}/4 experts available, "
-                    f"p_base={p_base:.4f if p_base else None}, phase={ph}")
+                    f"p_base={p_base_str}, phase={ph}")
 
             # Пытаемся построить фичи обычным способом
             x_orig = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
