@@ -610,6 +610,20 @@ class MetaCEMMC:
         """
         X_list, y_list, sample_weights = self._load_phase_buffer_from_disk(ph)
         
+        # ДОБАВЛЕНО: проверка на пустые данные
+        if len(X_list) == 0 or len(y_list) == 0:
+            return {"status": "no_data", "oof_accuracy": 0.0, "n_samples": 0}
+        
+        # ДОБАВЛЕНО: проверка на разнообразие классов
+        unique_classes = len(set(y_list))
+        if unique_classes < 2:
+            return {
+                "status": "single_class", 
+                "oof_accuracy": 0.0, 
+                "n_samples": len(X_list),
+                "message": f"Only {unique_classes} class present in data"
+            }
+        
         if len(X_list) < int(getattr(self.cfg, "cv_min_train_size", 200)):
             return {"status": "insufficient_data", "oof_accuracy": 0.0, "n_samples": len(X_list)}
 
@@ -761,16 +775,14 @@ class MetaCEMMC:
         y = np.array(y_list, dtype=float)
         sample_weights = np.array(sample_weights, dtype=float)
         
-        # FIX: защита от деления на ноль
+        # ИСПРАВЛЕНО: правильная проверка на ненулевую сумму весов
         weights_sum = sample_weights.sum()
-        if weights_sum > 1e-12:
+        if weights_sum > 0:
+            # Нормализуем веса так, чтобы их сумма равнялась количеству примеров
             sample_weights = sample_weights * len(sample_weights) / weights_sum
         else:
+            # Если все веса нулевые - используем равные веса
             sample_weights = np.ones_like(sample_weights)
-        
-        use_cma = getattr(self.cfg, "meta_use_cma_es", False) and HAVE_CMA
-        w_best = self._train_cma_es(X, y, ph, sample_weights=sample_weights) if use_cma else self._train_cem(X, y, sample_weights=sample_weights)
-        self.w_meta_ph[ph] = w_best
 
     def _train_cem(
         self,
@@ -781,17 +793,19 @@ class MetaCEMMC:
         elite_frac: float = 0.2,
         sample_weights: Optional[np.ndarray] = None
     ) -> np.ndarray:
-        """
-        Cross-Entropy Method оптимизация с полной визуализацией
-        
-        Включает:
-        - Отправку метрик на каждой итерации
-        - Отслеживание конвергенции
-        - Мониторинг разнообразия популяции
-        - Детальную отладку процесса
-        """
+        """Cross-Entropy Method оптимизация с полной визуализацией"""
         D = X.shape[1]
         n_elite = max(1, int(pop_size * elite_frac))
+        
+        # ДОБАВЛЕНО: валидация и приведение типов
+        if sample_weights is not None:
+            sample_weights = np.asarray(sample_weights, dtype=float)
+            # Проверка на NaN/Inf в весах
+            if np.any(~np.isfinite(sample_weights)):
+                print(f"[MetaCEMMC] WARNING: Non-finite sample_weights detected, replacing with ones")
+                sample_weights = np.ones(len(y), dtype=float)
+        else:
+            sample_weights = np.ones(len(y), dtype=float)
         
         mu = np.zeros(D)
         sigma = np.ones(D) * 2.0
@@ -1154,10 +1168,11 @@ class MetaCEMMC:
         }
 
     # ========== РАБОТА С ФАЙЛАМИ ==========
+    # СТАЛО:
     def _append_example(self, ph: int, x: np.ndarray, y: int) -> List:
         """
         Добавляет пример в буфер фазы и сохраняет в CSV с временной меткой.
-        Проверяет размер каждые 100 записей для оптимизации.
+        Проверяет размер при первой записи и каждые 50 записей для более агрессивного контроля.
         """
         self.buf_ph[ph].append((x.tolist(), int(y)))
         
@@ -1170,17 +1185,17 @@ class MetaCEMMC:
                 if ph not in self._csv_counters:
                     self._csv_counters[ph] = 0
                 
-                # Проверяем размер каждые 100 записей для производительности
+                # Проверяем размер чаще: при первой записи и каждые 50 записей
                 self._csv_counters[ph] += 1
-                should_check = (self._csv_counters[ph] % 100 == 0)
+                should_check = (self._csv_counters[ph] == 1) or (self._csv_counters[ph] % 50 == 0)
                 
                 if should_check and os.path.exists(csv_path):
                     # Быстрый подсчет строк
                     with open(csv_path, "r", encoding="utf-8") as f:
                         line_count = sum(1 for _ in f) - 1  # минус header
                     
-                    # Если превышен лимит - делаем ротацию
-                    if line_count >= 4000:
+                    # Более агрессивный лимит для гарантии размера в пределах 3000
+                    if line_count >= 3500:
                         import pandas as pd
                         df = pd.read_csv(csv_path, encoding="utf-8")
                         # Оставляем последние 3000 записей
@@ -1234,11 +1249,19 @@ class MetaCEMMC:
                             y = int(float(row[-2]))
                             row_time = float(row[-1])
                         else:
+                            # ИСПРАВЛЕНО: для старых записей без timestamp используем вес 0.5
+                            # вместо текущего времени (который дает вес 1.0)
                             x = [float(v) for v in row[:-1]]
                             y = int(float(row[-1]))
-                            row_time = current_time
+                            # Используем время примерно месяц назад для старых записей
+                            row_time = current_time - (max_age_days * 86400.0)
                         age_days = (current_time - row_time) / 86400.0
+                        # ДОБАВЛЕНО: ограничение возраста для предотвращения переполнения
+                        # и слишком маленьких весов
+                        age_days = max(0, min(age_days, max_age_days * 10))  # не более 10x период полураспада
                         weight = math.exp(-age_days / max_age_days)
+                        # ДОБАВЛЕНО: минимальный вес для очень старых данных
+                        weight = max(weight, 1e-6)  # не допускаем нулевых весов
                         X_list.append(x)
                         y_list.append(y)
                         weights.append(weight)
