@@ -3902,18 +3902,23 @@ class RFCalibratedExpert(_BaseExpert):
         return Xg, yg
 
     def _get_past_phases_tail(self, ph: int, n: int) -> Tuple[np.ndarray, np.ndarray]:
-        # Берет последние n записей только из фаз 0..ph-1 (исключая текущую)
-        # Исключает данные из будущих фаз → нет утечки
         if n <= 0:
             return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
         
-        # Собираем все данные из прошлых фаз (0..ph-1)
         X_past = []
         y_past = []
-        for p in range(ph):  # ✅ ИСПРАВЛЕНО: было range(min(ph + 1, self.P))
-            if self.X_ph.get(p):
-                X_past.extend(self.X_ph[p])
-                y_past.extend(self.y_ph[p])
+        for p in range(ph):
+            # ✅ ИСПРАВЛЕНО: явная проверка существования и непустоты + синхронизация X и y
+            if p in self.X_ph and p in self.y_ph:
+                X_p = self.X_ph[p]
+                y_p = self.y_ph[p]
+                # Проверяем что оба списка не пустые И имеют одинаковую длину
+                if X_p and y_p and len(X_p) == len(y_p):
+                    X_past.extend(X_p)
+                    y_past.extend(y_p)
+                elif len(X_p) != len(y_p):
+                    # Защита от рассинхронизации - логируем ошибку
+                    print(f"[WARNING] Phase {p} data mismatch: X={len(X_p)}, y={len(y_p)}")
         
         if not X_past:
             return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
