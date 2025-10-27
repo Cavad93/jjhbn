@@ -7083,12 +7083,60 @@ def main_loop():
 
 
     # кешы свечей/фич
+    # кешы свечей/фич
     kl_df: Optional[pd.DataFrame] = None
     cross_df_map: Dict[str, Optional[pd.DataFrame]] = {}
     stab_df_map: Dict[str, Optional[pd.DataFrame]] = {}
     feats: Optional[Dict[str, pd.Series]] = None
     cross_feats_map: Dict[str, Dict[str, pd.Series]] = {}
     stab_feats_map: Dict[str, Dict[str, pd.Series]] = {}
+
+    # ========== НОВОЕ: КЭШИРОВАНИЕ ИСТОРИЧЕСКИХ ДАННЫХ ==========
+    # Кэш последних успешных данных для фолбэка при RPC timeout
+    historical_data_cache = {
+        "kl_df": None,
+        "feats": None,
+        "cross_df_map": {},
+        "stab_df_map": {},
+        "cross_feats_map": {},
+        "stab_feats_map": {},
+        "last_update_time": None,
+        "cache_ttl_seconds": 300  # 5 минут - данные остаются актуальными
+    }
+
+    def update_historical_cache():
+        """Обновляет кэш исторических данных после успешной загрузки"""
+        historical_data_cache["kl_df"] = kl_df.copy() if kl_df is not None and not kl_df.empty else None
+        historical_data_cache["feats"] = feats.copy() if feats is not None else None
+        historical_data_cache["cross_df_map"] = {k: v.copy() if v is not None and not v.empty else None for k, v in cross_df_map.items()}
+        historical_data_cache["stab_df_map"] = {k: v.copy() if v is not None and not v.empty else None for k, v in stab_df_map.items()}
+        historical_data_cache["cross_feats_map"] = {k: v.copy() if v is not None else None for k, v in cross_feats_map.items()}
+        historical_data_cache["stab_feats_map"] = {k: v.copy() if v is not None else None for k, v in stab_feats_map.items()}
+        historical_data_cache["last_update_time"] = time.time()
+
+    def restore_from_historical_cache():
+        """Восстанавливает данные из кэша при RPC timeout"""
+        global kl_df, feats, cross_df_map, stab_df_map, cross_feats_map, stab_feats_map
+        
+        if historical_data_cache["kl_df"] is None:
+            return False
+        
+        # Проверяем актуальность кэша
+        cache_age = time.time() - historical_data_cache["last_update_time"] if historical_data_cache["last_update_time"] else float('inf')
+        if cache_age > historical_data_cache["cache_ttl_seconds"]:
+            print(f"[cache] Historical cache too old ({cache_age:.0f}s), skipping restore")
+            return False
+        
+        kl_df = historical_data_cache["kl_df"].copy() if historical_data_cache["kl_df"] is not None else None
+        feats = historical_data_cache["feats"].copy() if historical_data_cache["feats"] is not None else None
+        cross_df_map = {k: v.copy() if v is not None else None for k, v in historical_data_cache["cross_df_map"].items()}
+        stab_df_map = {k: v.copy() if v is not None else None for k, v in historical_data_cache["stab_df_map"].items()}
+        cross_feats_map = {k: v.copy() if v is not None else None for k, v in historical_data_cache["cross_feats_map"].items()}
+        stab_feats_map = {k: v.copy() if v is not None else None for k, v in historical_data_cache["stab_feats_map"].items()}
+        
+        print(f"[cache] Restored historical data from cache (age: {cache_age:.0f}s)")
+        return True
+    # ============================================================
 
     # фабрика расширенных признаков для экспертов
     ext_builder = ExtendedMLFeatures()
@@ -7255,12 +7303,48 @@ def main_loop():
                 if epoch <= 0:
                     continue
 
+# ========== УЛУЧШЕННАЯ ОБРАБОТКА RPC TIMEOUT С КЭШИРОВАНИЕМ ==========
+                rd = None
+                use_cached_data = False
+
                 try:
                     rd = get_round(w3, c, epoch)
                     if rd is None:
-                        print(f"[skip] epoch={epoch} (rpc timeout)")
-                        continue  # переходим к следующему циклу/ожиданию
-                    rpc_fail_streak = 0
+                        print(f"[rpc ] timeout on rounds({epoch}), attempting to use cached data")
+                        
+                        # Пытаемся восстановить данные из кэша
+                        if restore_from_historical_cache():
+                            use_cached_data = True
+                            # Создаем минимальный объект rd с дефолтными значениями для продолжения работы
+                            from collections import namedtuple
+                            RoundInfoFallback = namedtuple('RoundInfo', 
+                                ['epoch', 'start_ts', 'lock_ts', 'close_ts', 'lock_price', 'close_price',
+                                 'bull_amount', 'bear_amount', 'reward_base', 'reward_amt', 'oracle_called'])
+                            
+                            # Вычисляем примерные таймстемпы на основе текущего времени и интервала
+                            estimated_lock_ts = now + 60
+                            estimated_close_ts = estimated_lock_ts + 300
+                            
+                            rd = RoundInfoFallback(
+                                epoch=epoch,
+                                start_ts=now - 60,
+                                lock_ts=estimated_lock_ts,
+                                close_ts=estimated_close_ts,
+                                lock_price=0,
+                                close_price=0,
+                                bull_amount=0,
+                                bear_amount=0,
+                                reward_base=0,
+                                reward_amt=0,
+                                oracle_called=False
+                            )
+                            print(f"[fallback] Using cached data with estimated round info for epoch {epoch}")
+                        else:
+                            print(f"[skip] epoch={epoch} (rpc timeout, no cache available)")
+                            continue
+                    else:
+                        rpc_fail_streak = 0
+                        
                 except Exception as e:
                     print(f"[rpc ] get_round({epoch}) failed: {e}")
                     rpc_fail_streak += 1
@@ -7272,9 +7356,34 @@ def main_loop():
                             print("[rpc ] reconnected")
                         except Exception as ee:
                             print(f"[rpc ] reconnect failed: {ee}")
-                    continue
-
-                # ============= ЗАМЕНИТЬ БЛОК (строки ~975-995) =============
+                    
+                    # Пытаемся использовать кэшированные данные даже при исключении
+                    if restore_from_historical_cache():
+                        use_cached_data = True
+                        from collections import namedtuple
+                        RoundInfoFallback = namedtuple('RoundInfo', 
+                            ['epoch', 'start_ts', 'lock_ts', 'close_ts', 'lock_price', 'close_price',
+                             'bull_amount', 'bear_amount', 'reward_base', 'reward_amt', 'oracle_called'])
+                        
+                        estimated_lock_ts = now + 60
+                        estimated_close_ts = estimated_lock_ts + 300
+                        
+                        rd = RoundInfoFallback(
+                            epoch=epoch,
+                            start_ts=now - 60,
+                            lock_ts=estimated_lock_ts,
+                            close_ts=estimated_close_ts,
+                            lock_price=0,
+                            close_price=0,
+                            bull_amount=0,
+                            bear_amount=0,
+                            reward_base=0,
+                            reward_amt=0,
+                            oracle_called=False
+                        )
+                        print(f"[fallback] Exception recovery: using cached data for epoch {epoch}")
+                    else:
+                        continue
 
                 if epoch not in bets:
                     # === COOLING PERIOD: умная пауза после серии проигрышей ===
@@ -7282,7 +7391,7 @@ def main_loop():
                         try:
                             df_recent = _read_csv_df(CSV_PATH).sort_values("settled_ts")
                             if not df_recent.empty:
-                                # Смотрим на последние 5 сделок (вместо 3)
+                                # Смотрим на последние 5 сделок
                                 recent_trades = df_recent[df_recent["outcome"].isin(["win", "loss"])].tail(5)
                                 
                                 if len(recent_trades) >= 5:
@@ -7306,7 +7415,7 @@ def main_loop():
                                     cooling_needed = (losses >= 3) and (avg_loss_edge >= 0.03)
                                     
                                     if cooling_needed:
-                                        # ИСПРАВЛЕНО: проверяем timestamp ПЕРВОГО проигрыша в серии, а не последнего
+                                        # Проверяем timestamp ПЕРВОГО проигрыша в серии
                                         first_loss_ts = int(recent_trades[recent_trades["outcome"] == "loss"].iloc[0]["settled_ts"])
                                         hours_since = (now - first_loss_ts) / 3600.0
                                         COOLDOWN_HOURS = 1.0
@@ -7346,21 +7455,47 @@ def main_loop():
                         # --- Guard: ждём до окна последних 15 секунд перед lock
                         time_left = rd.lock_ts - now
                         if time_left > GUARD_SECONDS:
-                            # ещё рано принимать решение: накапливаем снапшоты пулов и продолжаем
-                            pool.observe(epoch, now, rd.bull_amount, rd.bear_amount)
+                            if not use_cached_data:
+                                pool.observe(epoch, now, rd.bull_amount, rd.bear_amount)
                             continue
-
-
-
 
                         # --- тики/фичи к lock-1s
                         t_lock = pd.to_datetime((rd.lock_ts - 1) * 1000, unit="ms", utc=True)
                         need_until_ms = int(t_lock.timestamp() * 1000)
 
-                        kl_df = ensure_klines_cover(kl_df, SYMBOL, BINANCE_INTERVAL, need_until_ms)
-                        if kl_df is None or kl_df.empty:
-                            continue
-                        feats = features_from_binance(kl_df)
+                        # ========== ЗАГРУЗКА ДАННЫХ С КЭШИРОВАНИЕМ ==========
+                        if not use_cached_data:
+                            # Обычный режим: загружаем свежие данные
+                            try:
+                                kl_df = ensure_klines_cover(kl_df, SYMBOL, BINANCE_INTERVAL, need_until_ms)
+                                if kl_df is None or kl_df.empty:
+                                    # Пытаемся использовать кэш при неудаче загрузки Binance
+                                    if restore_from_historical_cache():
+                                        print(f"[fallback] Binance data unavailable, using cached klines")
+                                    else:
+                                        print(f"[skip] epoch={epoch} (no Binance data, no cache)")
+                                        continue
+                                else:
+                                    feats = features_from_binance(kl_df)
+                                    
+                                    if USE_CROSS_ASSETS:
+                                        cross_df_map = ensure_klines_cover_map(cross_df_map, CROSS_SYMBOLS, BINANCE_INTERVAL, need_until_ms)
+                                        stab_df_map  = ensure_klines_cover_map(stab_df_map,  STABLE_SYMBOLS, BINANCE_INTERVAL, need_until_ms)
+                                        cross_feats_map = features_for_symbols(cross_df_map)
+                                        stab_feats_map  = features_for_symbols(stab_df_map)
+                                    
+                                    # Обновляем кэш после успешной загрузки
+                                    update_historical_cache()
+                                    
+                            except Exception as e:
+                                print(f"[error] Data loading failed: {e}, attempting cache restore")
+                                if not restore_from_historical_cache():
+                                    print(f"[skip] epoch={epoch} (data loading error, no cache)")
+                                    continue
+                        else:
+                            # Режим кэша: данные уже восстановлены, просто логируем
+                            print(f"[cache] Using cached features for predictions")
+                        # ===================================================
 
                         if USE_CROSS_ASSETS:
                             cross_df_map = ensure_klines_cover_map(cross_df_map, CROSS_SYMBOLS, BINANCE_INTERVAL, need_until_ms)
