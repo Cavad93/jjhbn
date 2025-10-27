@@ -7603,6 +7603,102 @@ def main_loop():
                         # --- КОНКАТЕНАЦИЯ ---
                         x_ml = np.concatenate([x_ml, x_addon], axis=0)
 
+                        # ========== НОВОЕ: РАСШИРЕННЫЕ ФИЧИ ДЛЯ ЭКСПЕРТОВ ==========
+                        # Добавляем критически важные фичи которых не хватало
+                        additional_features = []
+
+                        try:
+                            # 1. БАЗОВАЯ ВЕРОЯТНОСТЬ (КРИТИЧНО!)
+                            # Эксперты должны видеть прогноз базовой модели
+                            additional_features.append(float(P_up))
+                            
+                            # 2. ЛАГИРОВАННЫЕ ЗНАЧЕНИЯ RSI
+                            # Позволяет экспертам видеть динамику индикатора
+                            if len(kl_df) >= 5:
+                                from ta_utils import rsi
+                                rsi_series = rsi(kl_df["close"], 14).fillna(50.0)
+                                if len(rsi_series) >= 5:
+                                    additional_features.append(float(rsi_series.iloc[-2]))   # RSI[-1]
+                                    additional_features.append(float(rsi_series.iloc[-5]))   # RSI[-4]
+                                else:
+                                    additional_features.extend([50.0, 50.0])  # fallback
+                            else:
+                                additional_features.extend([50.0, 50.0])
+                            
+                            # 3. MOMENTUM НА РАЗНЫХ ТАЙМФРЕЙМАХ
+                            # Дополняет momentum_1h фичей из ExtendedMLFeatures
+                            if len(kl_df) >= 15:
+                                close_now = float(kl_df["close"].iloc[-1])
+                                close_5m = float(kl_df["close"].iloc[-5])
+                                close_15m = float(kl_df["close"].iloc[-15])
+                                additional_features.append((close_now - close_5m) / max(1e-12, close_5m))    # momentum_5m
+                                additional_features.append((close_now - close_15m) / max(1e-12, close_15m))  # momentum_15m
+                            else:
+                                additional_features.extend([0.0, 0.0])
+                            
+                            # 4. РАССТОЯНИЕ ДО ЛОКАЛЬНЫХ ЭКСТРЕМУМОВ
+                            # Показывает где цена относительно недавних максимумов/минимумов
+                            if len(kl_df) >= 20:
+                                recent_high = float(kl_df["high"].iloc[-20:].max())
+                                recent_low = float(kl_df["low"].iloc[-20:].min())
+                                current_price = float(kl_df["close"].iloc[-1])
+                                price_range = max(1e-12, recent_high - recent_low)
+                                normalized_position = (current_price - recent_low) / price_range
+                                additional_features.append(float(normalized_position))  # price_position_20bar
+                            else:
+                                additional_features.append(0.5)
+                            
+                            # 5. ВОЛАТИЛЬНОСТЬ RSI
+                            # Показывает насколько прыгает RSI (стабильность сигнала)
+                            if len(kl_df) >= 15:
+                                from ta_utils import rsi
+                                rsi_series = rsi(kl_df["close"], 14).fillna(50.0)
+                                if len(rsi_series) >= 15:
+                                    rsi_vol = float(rsi_series.iloc[-15:].std())
+                                    additional_features.append(rsi_vol / 50.0)  # normalized_rsi_volatility
+                                else:
+                                    additional_features.append(0.0)
+                            else:
+                                additional_features.append(0.0)
+                            
+                            # 6. ВОЛАТИЛЬНОСТЬ ЦЕНЫ (КОЭФФИЦИЕНТ ВАРИАЦИИ)
+                            # Дополняет ATR нормализованной волатильностью returns
+                            if len(kl_df) >= 20:
+                                returns = kl_df["close"].pct_change().iloc[-20:]
+                                returns_std = float(returns.std())
+                                returns_mean = float(abs(returns.mean()))
+                                cv = returns_std / max(1e-12, returns_mean) if returns_mean > 0 else 0.0
+                                additional_features.append(float(np.clip(cv, 0.0, 5.0)))  # price_cv_20bar
+                            else:
+                                additional_features.append(0.0)
+                            
+                            # 7. КОНТЕКСТНЫЕ ФИЧИ ИЗ MARKET_FEATURES
+                            # Гарантируем что все контекстные фичи попадают в x_ml
+                            # (некоторые могут дублироваться с x_addon но это не критично)
+                            additional_features.append(float(market_features.get("trend_sign", 0.0)))
+                            additional_features.append(float(market_features.get("trend_abs", 0.0)))
+                            additional_features.append(float(market_features.get("vol_ratio", 0.0)))
+                            
+                            # Конвертируем в numpy и применяем очистку
+                            x_additional = np.array(additional_features, dtype=np.float32)
+                            x_additional = np.nan_to_num(x_additional, nan=0.0, posinf=5.0, neginf=-5.0)
+                            x_additional = np.clip(x_additional, -5.0, 5.0)
+                            
+                            # Финальная конкатенация
+                            x_ml = np.concatenate([x_ml, x_additional], axis=0)
+                            
+                            # Логируем размерность для отладки (только периодически)
+                            if epoch % 50 == 0:
+                                print(f"[experts] x_ml dimension: {x_ml.shape[0]} features "
+                                    f"(base={ext_builder.dim}, addon={len(addon_names)}, additional={len(additional_features)})")
+
+                        except Exception as e:
+                            print(f"[ERROR] Failed to add additional features: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            # В случае ошибки просто используем старый x_ml без дополнительных фичей
+                        # ========== КОНЕЦ РАСШИРЕННЫХ ФИЧЕЙ ==========
+
                         # --- NEW: режим (ψ) для контекстного гейтинга
                         # --- ОБНОВЛЕНИЕ: подаем снимок рынка в калькулятор ---
                         try:
