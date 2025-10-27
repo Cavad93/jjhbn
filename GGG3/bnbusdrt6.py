@@ -2747,8 +2747,8 @@ class MLConfig:
     enter_wr: float = 0.58      # ✅ БЫЛО 3.0 (300%!) - теперь 58%
     exit_wr: float = 0.52       # ✅ БЫЛО 1.0 (100%) - теперь 52%
     retrain_every: int = 40
-    max_memory: int = 3000          # ИЗМЕНЕНО: было 5000
-    train_window: int = 3000        # ИЗМЕНЕНО: было 1500
+    max_memory: int = 10000          # ИЗМЕНЕНО: было 5000
+    train_window: int = 10000        # ИЗМЕНЕНО: было 1500
 
     # XGB
     xgb_model_path: str = "gb_model.json"
@@ -2819,7 +2819,7 @@ class MLConfig:
     use_two_window_drop: bool = False
     use_phase_memory: bool = True
     phase_count: int = 6
-    phase_memory_cap: int = 3000
+    phase_memory_cap: int = 50000
     phase_min_ready: int = 150
     phase_mix_global_share: float = 0.30
     phase_hysteresis_s: int = 300
