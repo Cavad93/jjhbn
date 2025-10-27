@@ -421,7 +421,14 @@ from market_features import MarketFeaturesCalculator, MarketSnapshot
 from collections import deque
 from calib.selector import CalibratorSelector  # <— наш селектор калибратора
 
-from meta_cem_mc import MetaCEMMC
+USE_NEURAL_META = os.getenv("USE_NEURAL_META", "1") == "1"  # Добавить после импортов
+
+if USE_NEURAL_META:
+    from meta_neural_cem import MetaNeuralCEM as MetaModel
+    print("[init] Using Neural META (5.2K params)")
+else:
+    from meta_cem_mc import MetaCEMMC as MetaModel
+    print("[init] Using Linear META (18 params)")
 
 # УБИРАЕМ ДУБЛИРУЮЩИЕ ИМПОРТЫ - они уже есть в начале!
 # import numpy as np        # ← УБРАТЬ
@@ -2823,26 +2830,32 @@ class MLConfig:
     phase_mix_global_share: float = 0.30   # если < phase_min_ready: доля глобального хвоста
     phase_hysteresis_s: int = 300     
     # META CEM+MC
+    # META CEM+MC / Neural
     meta_use_cma_es: bool = True
-    meta_enter_wr: float = 0.58    # ✅ НОВОЕ: порог активации META (58%)
-    meta_exit_wr: float = 0.52     # ✅ НОВОЕ: порог деактивации META (52%)
-    meta_min_ready: int = 80       # ✅ НОВОЕ: минимум примеров для активации
-    meta_weight_decay_days: float = 30.0  # период полураспада для экспоненциального забывания (в днях)
+    meta_enter_wr: float = 0.58
+    meta_exit_wr: float = 0.52
+    meta_min_ready: int = 80
+    meta_weight_decay_days: float = 30.0
     phase_state_path: str = "phase_state.json"
-
-    # для файлов калибраторов по фазе (будем апеллировать к существующим путям)
-    cv_enabled: bool = True
-    cv_n_splits: int = 3              # количество фолдов (ИЗМЕНЕНО: 5 → 3)
-    cv_embargo_pct: float = 0.02      # 2% gap между train/test
-    cv_purge_pct: float = 0.01        # 1% purge перед test
-    cv_min_train_size: int = 150      # минимум для обучения (ИЗМЕНЕНО: 200 → 150)
-    cv_bootstrap_n: int = 1000        # итераций bootstrap для CI
-    cv_confidence: float = 0.95       # уровень доверия (95%)
-    cv_min_improvement: float = 0.02  # минимум +2% для значимости
     
-    # Validation tracking
-    cv_oof_window: int = 500          # окно out-of-fold predictions
-    cv_check_every: int = 100         # проверка каждые N примеров (ИЗМЕНЕНО: 50 → 100)
+    # НОВОЕ: параметры для нейросетевой META
+    meta_mc_n_inference: int = 30         # MC Dropout проходов при предсказании
+    meta_mc_uncertainty_threshold: float = 0.15  # порог uncertainty для коррекции
+    meta_neural_dropout_rates: List[float] = None  # будет [0.20, 0.20, 0.15] по умолчанию
+    meta_state_path: str = "meta_neural_state.json"  # отдельный файл для нейросети
+    
+
+    # CV параметры (общие)
+    cv_enabled: bool = True
+    cv_n_splits: int = 3
+    cv_embargo_pct: float = 0.02
+    cv_purge_pct: float = 0.01
+    cv_min_train_size: int = 150
+    cv_bootstrap_n: int = 1000
+    cv_confidence: float = 0.95
+    cv_min_improvement: float = 0.02
+    cv_oof_window: int = 500
+    cv_check_every: int = 100
 
 
 # ===== Фильтр фазы с гистерезисом =====
@@ -6991,14 +7004,33 @@ def main_loop():
     nn_exp  = NNExpert(ml_cfg)
 
     # Если в этом файле уже есть переменные с токеном/чатом — подставляем их в cfg:
-    ml_cfg.meta_report_dir = "meta_reports"
-    ml_cfg.phase_min_ready = 50
-    ml_cfg.meta_retrain_every = 50
-    ml_cfg.tg_bot_token = TG_TOKEN
-    ml_cfg.tg_chat_id = str(TG_CHAT_ID)
-    meta = MetaCEMMC(ml_cfg)
-
-    meta.bind_experts(xgb_exp, rf_exp, arf_exp, nn_exp)
+# В конфигурации (добавить новые параметры)
+class MLConfig:
+    # META CEM+MC / Neural
+    meta_use_cma_es: bool = True
+    meta_enter_wr: float = 0.58
+    meta_exit_wr: float = 0.52
+    meta_min_ready: int = 80
+    meta_weight_decay_days: float = 30.0
+    phase_state_path: str = "phase_state.json"
+    
+    # НОВОЕ: параметры для нейросетевой META
+    meta_mc_n_inference: int = 30         # MC Dropout проходов при предсказании
+    meta_mc_uncertainty_threshold: float = 0.15  # порог uncertainty для коррекции
+    meta_neural_dropout_rates: List[float] = None  # будет [0.20, 0.20, 0.15] по умолчанию
+    meta_state_path: str = "meta_neural_state.json"  # отдельный файл для нейросети
+    
+    # CV параметры (общие)
+    cv_enabled: bool = True
+    cv_n_splits: int = 3
+    cv_embargo_pct: float = 0.02
+    cv_purge_pct: float = 0.01
+    cv_min_train_size: int = 150
+    cv_bootstrap_n: int = 1000
+    cv_confidence: float = 0.95
+    cv_min_improvement: float = 0.02
+    cv_oof_window: int = 500
+    cv_check_every: int = 100
 
     # --- калибровщики и вторая МЕТА + блендер ---
     from calib.manager import OnlineCalibManager
