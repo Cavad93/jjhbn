@@ -421,14 +421,11 @@ from market_features import MarketFeaturesCalculator, MarketSnapshot
 from collections import deque
 from calib.selector import CalibratorSelector  # <— наш селектор калибратора
 
-USE_NEURAL_META = os.getenv("USE_NEURAL_META", "1") == "1"  # Добавить после импортов
+from meta_cem_mc import MetaCEMMC
+from meta_neural_cem import MetaNeuralCEM
 
-if USE_NEURAL_META:
-    from meta_neural_cem import MetaNeuralCEM as MetaModel
-    print("[init] Using Neural META (5.2K params)")
-else:
-    from meta_cem_mc import MetaCEMMC as MetaModel
-    print("[init] Using Linear META (18 params)")
+# Флаг выбора META (управление через переменную окружения)
+USE_NEURAL_META = bool(int(os.getenv("USE_NEURAL_META", "0")))
 
 # УБИРАЕМ ДУБЛИРУЮЩИЕ ИМПОРТЫ - они уже есть в начале!
 # import numpy as np        # ← УБРАТЬ
@@ -2750,7 +2747,6 @@ class MLConfig:
     enter_wr: float = 0.58      # ✅ БЫЛО 3.0 (300%!) - теперь 58%
     exit_wr: float = 0.52       # ✅ БЫЛО 1.0 (100%) - теперь 52%
     retrain_every: int = 40
-    adwin_delta: float = 0.002
     max_memory: int = 3000          # ИЗМЕНЕНО: было 5000
     train_window: int = 3000        # ИЗМЕНЕНО: было 1500
 
@@ -2819,33 +2815,31 @@ class MLConfig:
     meta_exp4_eta: float = 0.10      # темп обновления весов EXP4
     meta_exp4_phases: int = 6        # число фаз (см. phase_from_ctx)
 
+
     use_two_window_drop: bool = False
-# =============================
-# ====== ФАЗОВАЯ ПАМЯТЬ / КАЛИБРОВКА ======
-# ====== ФАЗОВАЯ ПАМЯТЬ / КАЛИБРОВКА ======
     use_phase_memory: bool = True
     phase_count: int = 6
-    phase_memory_cap: int = 3000    # ИЗМЕНЕНО: было 10_000
+    phase_memory_cap: int = 3000
     phase_min_ready: int = 150
-    phase_mix_global_share: float = 0.30   # если < phase_min_ready: доля глобального хвоста
-    phase_hysteresis_s: int = 300     
-    # META CEM+MC
-    # META CEM+MC / Neural
+    phase_mix_global_share: float = 0.30
+    phase_hysteresis_s: int = 300
+    
+    # ===== META CEM+MC / Neural =====
     meta_use_cma_es: bool = True
     meta_enter_wr: float = 0.58
     meta_exit_wr: float = 0.52
     meta_min_ready: int = 80
+    meta_min_train: int = 150
     meta_weight_decay_days: float = 30.0
     phase_state_path: str = "phase_state.json"
     
     # НОВОЕ: параметры для нейросетевой META
-    meta_mc_n_inference: int = 30         # MC Dropout проходов при предсказании
-    meta_mc_uncertainty_threshold: float = 0.15  # порог uncertainty для коррекции
-    meta_neural_dropout_rates: List[float] = None  # будет [0.20, 0.20, 0.15] по умолчанию
-    meta_state_path: str = "meta_neural_state.json"  # отдельный файл для нейросети
+    meta_mc_n_inference: int = int(os.getenv("META_MC_N_INFERENCE", "30"))
+    meta_mc_uncertainty_threshold: float = float(os.getenv("META_MC_UNCERTAINTY_THRESHOLD", "0.15"))
+    meta_state_path: str = "meta_neural_state.json"
+    meta_exp4_phases: int = 6
     
-
-    # CV параметры (общие)
+    # CV параметры (общие для обеих META)
     cv_enabled: bool = True
     cv_n_splits: int = 3
     cv_embargo_pct: float = 0.02
@@ -2856,6 +2850,9 @@ class MLConfig:
     cv_min_improvement: float = 0.02
     cv_oof_window: int = 500
     cv_check_every: int = 100
+    
+    # ADWIN параметры
+    adwin_delta: float = 0.002
 
 
 # ===== Фильтр фазы с гистерезисом =====
@@ -7004,33 +7001,23 @@ def main_loop():
     nn_exp  = NNExpert(ml_cfg)
 
     # Если в этом файле уже есть переменные с токеном/чатом — подставляем их в cfg:
-# В конфигурации (добавить новые параметры)
-class MLConfig:
-    # META CEM+MC / Neural
-    meta_use_cma_es: bool = True
-    meta_enter_wr: float = 0.58
-    meta_exit_wr: float = 0.52
-    meta_min_ready: int = 80
-    meta_weight_decay_days: float = 30.0
-    phase_state_path: str = "phase_state.json"
-    
-    # НОВОЕ: параметры для нейросетевой META
-    meta_mc_n_inference: int = 30         # MC Dropout проходов при предсказании
-    meta_mc_uncertainty_threshold: float = 0.15  # порог uncertainty для коррекции
-    meta_neural_dropout_rates: List[float] = None  # будет [0.20, 0.20, 0.15] по умолчанию
-    meta_state_path: str = "meta_neural_state.json"  # отдельный файл для нейросети
-    
-    # CV параметры (общие)
-    cv_enabled: bool = True
-    cv_n_splits: int = 3
-    cv_embargo_pct: float = 0.02
-    cv_purge_pct: float = 0.01
-    cv_min_train_size: int = 150
-    cv_bootstrap_n: int = 1000
-    cv_confidence: float = 0.95
-    cv_min_improvement: float = 0.02
-    cv_oof_window: int = 500
-    cv_check_every: int = 100
+    ml_cfg.meta_report_dir = "meta_reports"
+    ml_cfg.phase_min_ready = 50
+    ml_cfg.meta_retrain_every = 50
+    ml_cfg.tg_bot_token = TG_TOKEN
+    ml_cfg.tg_chat_id = str(TG_CHAT_ID)
+
+    # Выбор META в зависимости от флага
+    if USE_NEURAL_META:
+        ml_cfg.meta_state_path = "meta_neural_state.json"
+        meta = MetaNeuralCEM(ml_cfg)
+        print(f"[init] 🧠 Neural META initialized: ~{meta.status()['params']} parameters")
+    else:
+        ml_cfg.meta_state_path = "meta_state.json"
+        meta = MetaCEMMC(ml_cfg)
+        print(f"[init] 📊 Linear META initialized: {meta.status()['features']}")
+
+    meta.bind_experts(xgb_exp, rf_exp, arf_exp, nn_exp)
 
     # --- калибровщики и вторая МЕТА + блендер ---
     from calib.manager import OnlineCalibManager
