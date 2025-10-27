@@ -653,13 +653,18 @@ TG_CHAT_ID = TELEGRAM_CHAT_ID
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
 # RPC
-# RPC
+# RPC - расширенный список с резервными узлами
 RPC_URLS = [
     "https://bsc-dataseed.bnbchain.org",
     "https://bsc-dataseed1.bnbchain.org",
     "https://bsc-dataseed2.bnbchain.org",
+    "https://bsc-dataseed3.bnbchain.org",
+    "https://bsc-dataseed4.bnbchain.org",
+    "https://bsc-rpc.publicnode.com",
+    "https://bsc.meowrpc.com",
+    "https://binance.llamarpc.com",
 ]
-RPC_REQUEST_KW = {"timeout": 8}  # короче, чем прежние 20s — меньше зависаний
+RPC_REQUEST_KW = {"timeout": 12}  # увеличен до 12 секунд для стабильности
 
 PREDICTION_ADDR = Web3.to_checksum_address("0x18B2A687610328590Bc8F2e5fEdDe3b582A49cdA")
 
