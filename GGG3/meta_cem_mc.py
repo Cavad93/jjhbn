@@ -1,1482 +1,9573 @@
 # -*- coding: utf-8 -*-
 """
-meta_cem_mc.py — META-стекинг на основе CEM/CMA-ES + Монте-Карло (bootstrap) + Cross-Validation
+Live paper-trading для PancakeSwap Prediction (BNB):
+- Реальные rounds/тайминги с контракта Prediction V2 (BSC mainnet)
+- Цены/объёмы: Binance Spot /api/v3/klines (без ключей)
+- Базовая модель: фичи (Momentum/VWAP/Keltner/Bollinger/ATR-chop + Vol Z) -> softmax + EMA/Super Smoother
+- NN-калибратор: онлайн логистическая регрессия (обучаем по факту исхода)
 
-=== ОСНОВНАЯ ИДЕЯ ===
-Этот модуль объединяет предсказания четырех экспертов (XGB, RF, ARF, NN) в единое финальное
-предсказание. Вместо традиционного градиентного обучения используется стохастическая оптимизация
-(CEM или CMA-ES) с оценкой качества через Монте-Карло (bootstrap выборки).
+- +++ ML-АНСАМБЛЬ:
+    Четыре «эксперта» выдают вероятность UP по расширенному вектору фич (см. ExtendedMLFeatures):
+      1) XGBoost (+ ADWIN-гейтинг).
+      2) RandomForest + CalibratedClassifierCV (sigmoid), батч-дообучение + ADWIN-гейтинг.
+      3) River Adaptive Random Forest (онлайн) + ADWIN-гейтинг.
+      4) NNExpert — компактная MLP (1 скрытый слой, tanh + sigmoid), батч-дообучение, калибровка температурой + ADWIN-гейтинг.
+    Над ними — МЕТА-оценщик: онлайн логистическая регрессия по логитам [p_xgb,p_rf,p_arf,p_nn,p_base] + доп. статистики.
 
-=== КЛЮЧЕВЫЕ ОСОБЕННОСТИ ===
-1. Фазовая память: отдельная модель для каждой из 6 фаз рынка
-2. Контекстный гейтинг: веса экспертов зависят от контекста
-3. Cross-Validation: честная оценка качества с purged walk-forward CV
-4. Bootstrap CI: статистические доверительные интервалы для метрик
-5. Режимы SHADOW/ACTIVE: переключение на основе валидированных метрик
+    Режимы:
+      * SHADOW: все учатся/мониторятся, но в ставках НЕ участвуют.
+      * ACTIVE: в ставках используется ТОЛЬКО p_final от мета-оценщика (без смешивания с базой).
+    Персист: модели/состояния/скейлеры/веса.
 
-=== АРХИТЕКТУРА ===
-- Вход: предсказания 4 экспертов + базовое предсказание + контекст (18 фичей)
-- Гейтинг: soft (softmax) или exp4 (EXP4 Hedge) режим
-- Выход: p_final = σ(w · φ), где φ — расширенный вектор фичей (логиты + мета + контекст)
-- Обучение: CEM/CMA-ES минимизирует log-loss на bootstrap выборках
-- Валидация: Walk-forward purged CV с embargo period
+- Менеджмент: старт 2 BNB, ставка:
+    * первые 500 сделок — фикс. 1% капитала;
+    * далее — 1/2 Kelly, но ограничено 0.5%..3% и кэп на раунд ≤3% капитала.
+- Газ/учёт/телега/EV-гейт: без изменений.
+- EV-порог p_thr:
+    * p_thr = 0.51, пока нет 500 закрытых сделок ИЛИ если нет ни одной закрытой сделки за последний час;
+    * иначе — классический EV-порог с учётом газа и payout.
 
-Файл состояния: cfg.meta_state_path (JSON)
+Примечание по зависимостям:
+- xgboost — опционально (эксперт XGB).
+- scikit-learn — для RandomForest + калибровка (эксперт RF) и StandardScaler.
+- river — для ADWIN и ARF (эксперт ARF и гейтинг).
+Если либы отсутствуют — соответствующий эксперт/гейтинг будет отключён, остальные работают.
 """
-from __future__ import annotations
 
 import os
-import json
-import time
-import math
-import random
 import csv
-import traceback
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-from collections import deque
-from error_logger import log_exception
-
-# meta_cem_mc.py (импорты)
+import math
+import time
+import json
+import pickle
 import numpy as np
-from collections import defaultdict
-
-
-# ========== ВНЕШНИЕ ЗАВИСИМОСТИ ==========
-
-# CMA-ES оптимизатор (опциональный, fallback на CEM если недоступен)
+import pandas as pd
+from web3 import Web3, HTTPProvider     # ← ПЕРЕМЕСТИЛИ СЮДА, В САМОЕ НАЧАЛО!
 try:
-    import cma  # type: ignore
-    HAVE_CMA = True
+    from web3.middleware import geth_poa_middleware  # для BSC/PoA
+    HAVE_POA = True
 except Exception:
-    cma = None
-    HAVE_CMA = False
+    HAVE_POA = False
 
-# Графики и Telegram уведомления
-try:
-    from meta_report import plot_cma_like, send_telegram_photo, send_telegram_text
-    from expert_report import plot_experts_reliability_panel
-    import matplotlib.pyplot as plt
-    HAVE_PLOTTING = True
-except Exception:
-    HAVE_PLOTTING = False
-    plot_cma_like = None
-    send_telegram_photo = None
-    send_telegram_text = None
-
-# Безопасное сохранение JSON с атомарной заменой
-try:
-    from state_safety import atomic_save_json
-except Exception:
-    def atomic_save_json(path: str, obj: dict):
-        """Fallback: простое сохранение через временный файл"""
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-
-# Извлечение фазы из контекста
-try:
-    from meta_ctx import phase_from_ctx
-except Exception:
-    def phase_from_ctx(ctx: Optional[dict]) -> int:
-        return int(ctx.get("phase", 0) if isinstance(ctx, dict) else 0)
-
-# ---- безопасные хелперы (общие) ----
-def _safe_prob(v, default=0.5) -> float:
+# --- numeric guards ---
+def _is_finite_num(x) -> bool:
     try:
-        v = float(v)
-        if not math.isfinite(v):
+        v = float(x)
+        return math.isfinite(v)
+    except Exception:
+        return False
+
+def _as_float(x, default=float("nan")):
+    """Безопасная конвертация в float с обработкой None, pd.NA, np.nan"""
+    try:
+        # Явная проверка на None и pd.NA
+        if x is None:
             return default
-        return float(min(max(v, 1e-6), 1.0 - 1e-6))
-    except Exception:
-        return float(default)
+        # Проверка на pandas NA (для совместимости с pandas < 2.0)
+        if hasattr(x, '__class__') and x.__class__.__name__ == 'NAType':
+            return default
+        
+        v = float(x)
+        return v if math.isfinite(v) else default
+    except (TypeError, ValueError):
+        return default
 
-def _safe_logit(p) -> float:
+
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict, Any
+from gating_no_r import compute_p_thr_no_r
+from delta_daily import DeltaDaily
+
+from proj_scenarios import try_send_projection
+
+from html import escape
+from requests import RequestException
+# вверху bnbusdrt6.py
+from prob_calibrators import make_calibrator, _BaseCal
+
+from performance_metrics import PerfMonitor
+
+# === НОВОЕ: контекстная калибровка p и r̂-таблица, EV-гейт по «марже к рынку» ===
+from rhat_quantile2d import RHat2D
+from ev_margin_gate import loss_margin_q, p_thr_from_ev
+
+from error_logger import setup_error_logging, log_exception, get_logger
+
+from dotenv import load_dotenv; load_dotenv()
+
+
+# === GAS PRICE FALLBACK: глобальные переменные ===
+gas_price_history = []  # история последних 20 успешных запросов газа
+MAX_GAS_HISTORY = 20    # размер скользящего окна для медианы
+
+# инициализируем отдельный error-лог (GGG/errors.log)
+setup_error_logging(log_dir="logs", filename="errors.log")
+
+
+
+def _proj_mark_once(path: str, day: str) -> bool:
+    import json, os
     try:
-        p = float(p)
+        st = {}
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                st = json.load(f)
+        if st.get("last_day") == day:
+            return False
+        st["last_day"] = day
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(st, f)
     except Exception:
-        return 0.0
-    p = max(min(p, 1.0 - 1e-6), 1e-6)
-    return math.log(p / (1.0 - p))
+        log_exception("daily_once_state: failed to read/write last_day")
+    return True
 
-def _safe_reg_ctx(ctx) -> dict:
-    return ctx if isinstance(ctx, dict) else {}
 
-def _safe_phase(ctx) -> int:
-    try:
-        return int(phase_from_ctx(_safe_reg_ctx(ctx)))
-    except Exception:
-        return 0
+from daily_report import try_send as try_send_daily
 
-def _entropy4(p_list):
-    vals = [float(p) for p in p_list if p is not None]
-    if not vals:
-        return 0.0
-    hist, _ = np.histogram(vals, bins=10, range=(0.0, 1.0), density=True)
-    hist = hist / (hist.sum() + 1e-12)
-    return float(-(hist * np.log(hist + 1e-12)).sum())
+# /report: лёгкий слушатель команд
+from report_cmd import start_report_listener
 
-# ---- helpers ----
-_EPS = 1e-8
+from datetime import datetime, timezone
+# --- NEW: addons ---
+from microstructure import MicrostructureClient
 
-# River ADWIN для drift detection
+
+# --- FIX: совместимый импорт ZoneInfo для Python 3.8/3.9+ ---
 try:
-    from river.drift import ADWIN
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    try:
+        from backports.zoneinfo import ZoneInfo  # для Python < 3.9
+    except Exception:
+        ZoneInfo = None  # fallback, если ни один импорт не удался
+
+def _get_proj_tz():
+    # стараемся вернуть Europe/Berlin; если нет базы часовых поясов — откатываемся на UTC
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo("Europe/Berlin")
+        except Exception:
+            log_exception("Failed to import ZoneInfo")
+    # предупреждение можно убрать, если не нужно
+    print("[proj] warning: tz database unavailable; using UTC")
+    return timezone.utc
+
+# часовой пояс для ежедневной проекции и файл-маркер "раз в день"
+PROJ_TZ = _get_proj_tz()
+PROJ_STATE_PATH = os.path.join(os.path.dirname(__file__), "proj_state.json")
+
+# === НОВОЕ: адрес кошелька для проверки баланса ===
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS", "").strip()
+PAPER_TRADING = not bool(WALLET_ADDRESS)  # автоопределение режима
+
+if PAPER_TRADING:
+    print("[init] 📄 PAPER TRADING mode (no WALLET_ADDRESS)")
+    WALLET_ADDRESS = None
+else:
+    WALLET_ADDRESS = Web3.to_checksum_address(WALLET_ADDRESS)
+    print(f"[init] 💰 REAL TRADING mode - Wallet: {WALLET_ADDRESS}")
+
+from futures_ctx import FuturesContext
+from pool_features import PoolFeaturesCtx
+from extra_features import realized_metrics, jump_flag_from_rv_bv_rq, amihud_illiq, kyle_lambda
+from extra_features import intraday_time_features, idio_features, GasHistory, pack_vector
+
+from r_hat_improved import (
+    estimate_r_hat_improved,
+    analyze_r_hat_accuracy,
+    adaptive_quantile
+)
+
+import requests
+
+
+def fmtf(x, nd=4, dash="—"):
+    """Безопасно форматирует число с nd знаками после точки или возвращает '—'."""
+    try:
+        if x is None:
+            return dash
+        xf = float(x)
+        if math.isnan(xf) or math.isinf(xf):
+            return dash
+        return f"{xf:.{nd}f}"
+    except Exception:
+        return dash
+
+def fmt_pct(x, nd=2, dash="—"):
+    """Проценты: 12.34% или '—'."""
+    s = fmtf(x, nd=nd, dash=dash)
+    return s if s == dash else f"{s}%"
+
+def update_capital_atomic(
+    capital_state, 
+    new_capital: float, 
+    ts: int, 
+    csv_row: dict, 
+    csv_path: str = None
+) -> float:
+    """
+    Атомарно обновляет капитал и сохраняет строку в CSV.
+    Гарантирует согласованность: сначала капитал, потом CSV.
+    Если что-то пойдет не так, возвращает последний сохраненный капитал.
+    
+    Args:
+        capital_state: Объект для управления состоянием капитала
+        new_capital: Новое значение капитала
+        ts: Timestamp операции
+        csv_row: Словарь с данными строки для CSV
+        csv_path: Путь к CSV файлу (если None, использует CSV_PATH)
+    
+    Returns:
+        Обновленное значение капитала
+    """
+    # Если csv_path не указан, используем глобальный CSV_PATH
+    target_csv = csv_path if csv_path is not None else CSV_PATH
+    
+    try:
+        # Сначала сохраняем капитал атомарно через временный файл
+        temp_path = capital_state.path + ".tmp"
+        with open(temp_path, 'w') as f:
+            json.dump({"capital": new_capital, "ts": ts}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, capital_state.path)
+        
+        # Только после успешного сохранения капитала пишем в CSV
+        try:
+            append_trade_row(target_csv, csv_row)
+        except Exception as e:
+            print(f"[csv ] write failed but capital saved (target={target_csv}): {e}")
+        
+        return new_capital
+    except Exception as e:
+        print(f"[capital] save failed: {e}")
+        # В случае ошибки возвращаем последнее корректное значение
+        return capital_state.load()
+
+def get_gas_price_with_fallback(w3: Web3) -> int:
+    global gas_price_history
+    try:
+        price = w3.eth.gas_price
+        gas_price_history.append(price)
+        if len(gas_price_history) > MAX_GAS_HISTORY:
+            gas_price_history.pop(0)
+        return price
+    except Exception:
+        if gas_price_history:
+            median_price = int(np.median(gas_price_history))
+            multiplier = 1.2
+            return int(median_price * multiplier)
+        return 5_000_000_000
+
+
+def fmt_prob(x):
+    """Вероятности p∈[0,1] до 4 знаков или '—'."""
+    return fmtf(x, nd=4)
+
+
+
+
+def _tail_df(path, n=300):
+    try:
+        df = _read_csv_df(path)  # у тебя уже есть этот ридер
+        df = df.dropna(subset=["outcome"])
+        return df.sort_values("settled_ts").tail(n).copy()
+    except Exception:
+        return None
+
+# bnbusdrt6.py
+def rolling_calib_error(path: str, n: int = 200) -> float:
+    """Средняя |y - p_side| по последним n сеттлам как прокси ECE/Brier."""
+    df = _tail_df(path, n)
+    if df is None or df.empty:
+        return 0.10
+    # безопасная типизация и фильтрация
+    side = df.get("side")
+    p_up = pd.to_numeric(df.get("p_up"), errors="coerce")
+    y = (df.get("outcome") == "win").astype(float)
+
+    mask = side.astype(str).str.upper().isin(["UP", "DOWN"]) & p_up.notna() & y.notna()
+    if not mask.any():
+        return 0.10
+
+    side_u = side[mask].astype(str).str.upper()
+    p_u = p_up[mask].astype(float).to_numpy()
+    y_u = y[mask].astype(float).to_numpy()
+
+    p_side = np.where(side_u == "UP", p_u, 1.0 - p_u)
+    p_side = np.clip(p_side, 1e-6, 1 - 1e-6)
+
+    err = np.abs(y_u - p_side)
+    m = float(np.mean(err)) if np.isfinite(err).all() else float(np.nanmean(err))
+    if not math.isfinite(m):
+        return 0.10
+    return m
+
+
+def adaptive_kelly_cap(edge, recent_wr, calib_error, vol_scale):
+    """
+    Адаптивный кап для Kelly fraction
+    
+    Args:
+        edge: текущий edge (p_side - 1/r_hat)
+        recent_wr: винрейт за последние 100 сделок
+        calib_error: ошибка калибровки
+        vol_scale: масштаб волатильности
+    """
+    # Базовый кап на основе edge
+    if edge > 0.10:
+        base_cap = 0.020  # 2.0% при очень высоком edge
+    elif edge > 0.08:
+        base_cap = 0.015  # 1.5%
+    elif edge > 0.05:
+        base_cap = 0.012  # 1.2%
+    elif edge > 0.03:
+        base_cap = 0.008  # 0.8%
+    else:
+        base_cap = 0.005  # 0.5%
+    
+    # Модификатор по винрейту
+    if recent_wr >= 0.58:
+        wr_mult = 1.3  # можем быть агрессивнее
+    elif recent_wr >= 0.56:
+        wr_mult = 1.15
+    elif recent_wr >= 0.54:
+        wr_mult = 1.0
+    else:
+        wr_mult = 0.85  # осторожнее при низком WR
+    
+    # Модификатор по калибровке
+    calib_mult = 1.1 if calib_error < 0.03 else (0.9 if calib_error > 0.07 else 1.0)
+    
+    # Применяем все масштабы
+    final_cap = base_cap * wr_mult * calib_mult * vol_scale
+    
+    return float(np.clip(final_cap, 0.003, 0.025))  # 0.3% - 2.5%
+
+
+def adaptive_delta_protect(recent_wr, calib_error, n_trades):
+    """
+    Динамическая δ на основе производительности
+    
+    Args:
+        recent_wr: винрейт за последние 100 сделок
+        calib_error: ошибка калибровки (ECE)
+        n_trades: количество сделок за последний час
+    """
+    base_delta = 0.03
+    
+    # Масштаб по винрейту (агрессивнее при хорошем WR)
+    if recent_wr >= 0.58:
+        wr_scale = 0.7  # снижаем защиту при отличном WR
+    elif recent_wr >= 0.56:
+        wr_scale = 0.85
+    elif recent_wr >= 0.54:
+        wr_scale = 1.0  # базовый
+    elif recent_wr >= 0.52:
+        wr_scale = 1.2
+    else:
+        wr_scale = 1.4  # повышаем при плохом WR
+    
+    # Масштаб по калибровке (хорошая калибровка → меньше защиты)
+    if calib_error < 0.03:
+        calib_scale = 0.9
+    elif calib_error < 0.05:
+        calib_scale = 1.0
+    else:
+        calib_scale = 1.15
+    
+    # Масштаб по активности (больше сделок → больше уверенность)
+    activity_scale = 1.0 if n_trades >= 20 else 1.1
+    
+    delta_eff = base_delta * wr_scale * calib_scale * activity_scale
+    return float(np.clip(delta_eff, 0.02, 0.08))
+
+
+def realized_sigma_g(path: str, n: int = 200) -> float:
+    """Стд.кв. лог-роста на сделку по последним n."""
+    df = _tail_df(path, n)
+    if df is None or df.empty: return 0.01
+    cb = pd.to_numeric(df["capital_before"], errors="coerce").to_numpy()
+    ca = pd.to_numeric(df["capital_after"],  errors="coerce").to_numpy()
+    mask = np.isfinite(cb) & np.isfinite(ca) & (cb>0) & (ca>0)
+    if not np.any(mask): return 0.01
+    g = np.log(ca[mask] / cb[mask])
+    return float(np.std(g, ddof=1))
+
+
+# --- end helpers ---
+
+
+
+# +++ ДОБАВЛЕНО для проверок целостности:
+from state_safety import (
+    atomic_save_json, safe_load_json, sane_vec, sane_prob,
+    file_sha256, atomic_write_bytes
+)
+
+
+_TG_FAILS = 0  # счётчик подряд неудачных отправок (чтобы не вешать бота)
+
+_TG_MUTED_UNTIL = 0.0    # unix-ts до которого молчим
+_TG_LAST_ERR = ""        # последняя причина
+
+from dataclasses import dataclass
+
+# NEW: контекст для меты
+from meta_ctx import build_regime_ctx, pack_ctx
+from market_features import MarketFeaturesCalculator, MarketSnapshot
+
+# --- добавили для финальной пост-калибровки мета-вероятности ---
+from collections import deque
+from calib.selector import CalibratorSelector  # <— наш селектор калибратора
+
+USE_NEURAL_META = os.getenv("USE_NEURAL_META", "1") == "1"  # Добавить после импортов
+
+if USE_NEURAL_META:
+    from meta_neural_cem import MetaNeuralCEM as MetaModel
+    print("[init] Using Neural META (5.2K params)")
+else:
+    from meta_cem_mc import MetaCEMMC as MetaModel
+    print("[init] Using Linear META (18 params)")
+
+# УБИРАЕМ ДУБЛИРУЮЩИЕ ИМПОРТЫ - они уже есть в начале!
+# import numpy as np        # ← УБРАТЬ
+# import pandas as pd       # ← УБРАТЬ
+# from web3 import Web3, HTTPProvider    # ← УБРАТЬ (дубликат)
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# --- Telegram config (globals) ---
+# --- Telegram config (globals) ---
+from typing import Final
+import threading  # ← добавили
+
+
+# --- буферы «сырых» p_meta и исходов для окна калибровки ---
+_CALIB_P_META = deque(maxlen=20000)  # p_meta_raw до калибровки
+_CALIB_Y_META = deque(maxlen=20000)  # outcome: 1=win, 0=loss
+
+TG_TOKEN: Final[str] = os.getenv("TG_TOKEN", "").strip()
+# Важно: для чатов/каналов ID может быть отрицательным (например, -100...).
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        raw = os.getenv(name, str(default)).strip()
+        return int(raw) if raw else default
+    except Exception:
+        return default
+
+TG_CHAT_ID: Final[int] = _env_int("TG_CHAT_ID", 0)
+TG_API: Final[str] = f"https://api.telegram.org/bot{TG_TOKEN}"
+
+_REPORT_THREAD = None  # поток слушателя /report; поднимаем максимум один
+
+
+# Сессия с ретраями (чтобы tg_send был устойчивее)
+SESSION = requests.Session()
+_adapter = HTTPAdapter(
+    max_retries=Retry(
+        total=3,                # 3 повторных
+        backoff_factor=0.3,     # 0.3s, 0.6s, 1.2s
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST"])
+    )
+)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
+
+# Вспомогательная проверка — «включён ли» Telegram
+# =============================
+# Telegram
+# =============================
+def tg_enabled() -> bool:
+    # включено + есть реальные реквизиты (из ENV или констант)
+    has_token = bool((TG_TOKEN if 'TG_TOKEN' in globals() else "") or
+                     (TELEGRAM_BOT_TOKEN if 'TELEGRAM_BOT_TOKEN' in globals() else ""))
+    has_chat  = bool((TG_CHAT_ID if 'TG_CHAT_ID' in globals() else 0) or
+                     (TELEGRAM_CHAT_ID if 'TELEGRAM_CHAT_ID' in globals() else ""))
+    return bool(TELEGRAM_ENABLED and has_token and has_chat)
+
+
+
+
+from wr_pnl_tracker import StatsTracker, RestState, RestConfig
+from reserve_fund import ReserveFund
+import math
+from requests.exceptions import Timeout as ReqTimeout, ReadTimeout, ConnectionError as ReqConnError
+from web3.exceptions import TimeExhausted
+
+
+# =============================
+# ML зависимости (опционально)
+# =============================
+HAVE_XGB = False
+HAVE_RIVER = False
+HAVE_SKLEARN = False
+try:
+    import xgboost as xgb  # бустинг + загрузка/сохранение
+    HAVE_XGB = True
+except Exception:
+    log_exception("Failed to import StatsTracker")
+
+try:
+    from river.drift import ADWIN  # детектор дрейфа
+    from river import forest as river_forest
     HAVE_RIVER = True
 except Exception:
     ADWIN = None
+    river_forest = None
     HAVE_RIVER = False
 
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.preprocessing import StandardScaler
+    HAVE_SKLEARN = True
+except Exception:
+    # sklearn может отсутствовать — даём безопасную "заглушку" StandardScaler
+    class StandardScaler:
+        def fit(self, X, y=None): return self
+        def transform(self, X):    return X
+        def fit_transform(self, X, y=None): return X
+    HAVE_SKLEARN = False
 
-# ========== КЛАСС META-СТЕКИНГА С CV ==========
+# -----------------------------
+# ПАРАМЕТРЫ
+# -----------------------------
+START_CAPITAL_BNB = 2.0
+BET_FRACTION = 0.01  # legacy
 
-class MetaCEMMC:
+SYMBOL = "BNBUSDT"
+BINANCE_INTERVAL = "1m"
+BINANCE_LIMIT = 1000
+
+CSV_PATH = "trades_prediction.csv"
+DELTA_STATE_PATH = "delta_state.json"   # ← новое
+CSV_SHADOW_PATH = "trades_shadow.csv"   # ← добавили здесь (нужно при init DeltaDaily)
+MIN_TRADES_FOR_DELTA = 50  # Минимум сделок для расчета delta
+
+# Анти-спам/таймаут ожидания oracleCalled
+MAX_WAIT_POLLS = 20
+WAIT_PRINT_EVERY = 5
+
+# «болото» ATR
+ATR_LEN = 14
+ATR_SMOOTH = 50
+USE_PCT_CHOP = True
+CHOP_PCT = 20.0
+CHOP_RATIO = 0.6
+
+# Фичи
+M1, M2, M3 = 1, 3, 5
+VWAP_LOOK = 10
+KC_LEN = 20
+KC_MULT = 2.0
+BB_LEN = 20
+BB_Z = 1.2
+VOL_LEN = 50
+VOL_BOOST = 0.15
+RB_LEN = 20
+USE_LORENTZ = True
+C_M, C_S, C_B, C_R = 2.5, 3.0, 2.0, 1.6
+
+# Сглаживание вероятностей
+SMOOTH_N = 8
+USE_SUPER_SMOOTHER = True
+SS_LEN = 8
+
+# --- OU ДОБАВКИ ---
+OU_SKEW_USE = True
+OU_SKEW_DT_UNIT = 60.0
+OU_SKEW_DECAY = 0.997
+OU_SKEW_THR = 0.15
+OU_SKEW_LAMBDA_MAX = 0.45
+OU_SKEW_Z_CLIP = 3.0
+
+LOGIT_OU_USE = True
+LOGIT_OU_HALF_LIFE_SEC = 120.0
+LOGIT_OU_MU_BETA = 0.985
+LOGIT_OU_Z_CLIP = 5.5
+# -------------------------------------
+
+# NN (логистическая регрессия калибратор)
+NN_USE = True
+ETA = 0.02
+L2 = 0.002
+BLEND_NN = 0.35
+W_CLIP = 10.0
+G_CLIP = 1.0
+
+# Walk-Forward веса
+WF_USE = True
+WF_ETA = 0.02
+WF_L2 = 0.003
+WF_G_CLIP = 1.0
+WF_W_CLIP = 7.0
+WF_WEIGHTS_PATH = "wf_weights.json"
+WF_INIT_W = [0.35, 0.20, 0.20, 0.25]
+
+# Triple Screen Элдера
+ELDER_HTF = "15min"
+ELDER_MID = "5min"
+ELDER_ALPHA = 0.60
+STOCH_LEN = 14
+STOCH_OS = 20.0
+STOCH_OB = 80.0
+
+# Газ
+GAS_USED_BET = 93_132
+GAS_USED_CLAIM = 86_500
+
+# Трежери-фии
+TREASURY_FEE = 0.03
+
+# --- Новое: тайминг и защитные параметры
+GUARD_SECONDS   = 30      # решаем судьбу ставки только в последние 15с до lock
+SEND_WIN_LOW    = 12      # «окно отправки»: нижняя граница (для реальной торговли; сейчас paper)
+SEND_WIN_HIGH   = 8       # верхняя граница (для реальной торговли; сейчас paper)
+DELTA_PROTECT   = 0.03    # δ — страховой зазор поверх EV-порога
+USE_STRESS_R15  = True    # использовать стресс по медианному притоку за 15с
+
+
+
+# Коррелированные активы
+USE_CROSS_ASSETS = True
+CROSS_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+STABLE_SYMBOLS = ["USDCUSDT", "FDUSDUSDT", "TUSDUSDT"]
+CROSS_SHIFT_BARS = 0
+CROSS_ALPHA = 0.50
+CROSS_W_MOM = 0.18
+CROSS_W_VWAP = 0.12
+STABLE_W_MOM = 0.06
+STABLE_W_VWAP = 0.04
+
+TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID   = os.getenv("TG_CHAT_ID", "").strip()
+
+TELEGRAM_ENABLED   = True
+
+TG_MUTE_AFTER      = 3       # после скольких фейлов уходим в mute
+TG_COOLDOWN_S      = 300     # базовый кулдаун (сек) до следующей пробы
+TG_PROBE_EVERY_S   = 30      # в mute: как часто «прощупывать» линию
+
+# мост к старым именам, которые использует tg_send()
+TG_TOKEN = TELEGRAM_BOT_TOKEN
+TG_CHAT_ID = TELEGRAM_CHAT_ID
+TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
+
+# RPC
+# RPC
+RPC_URLS = [
+    "https://bsc-dataseed.bnbchain.org",
+    "https://bsc-dataseed1.bnbchain.org",
+    "https://bsc-dataseed2.bnbchain.org",
+]
+RPC_REQUEST_KW = {"timeout": 8}  # короче, чем прежние 20s — меньше зависаний
+
+PREDICTION_ADDR = Web3.to_checksum_address("0x18B2A687610328590Bc8F2e5fEdDe3b582A49cdA")
+
+PREDICTION_ABI = json.loads(r"""
+[
+  {"inputs":[],"name":"currentEpoch","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+  {"inputs":[{"internalType":"uint256","name":"epoch","type":"uint256"}],"name":"rounds","outputs":[
+    {"internalType":"uint256","name":"epoch","type":"uint256"},
+    {"internalType":"uint256","name":"startTimestamp","type":"uint256"},
+    {"internalType":"uint256","name":"lockTimestamp","type":"uint256"},
+    {"internalType":"uint256","name":"closeTimestamp","type":"uint256"},
+    {"internalType":"int256","name":"lockPrice","type":"int256"},
+    {"internalType":"int256","name":"closePrice","type":"int256"},
+    {"internalType":"uint256","name":"lockOracleId","type":"uint256"},
+    {"internalType":"uint256","name":"closeOracleId","type":"uint256"},
+    {"internalType":"uint256","name":"totalAmount","type":"uint256"},
+    {"internalType":"uint256","name":"bullAmount","type":"uint256"},
+    {"internalType":"uint256","name":"bearAmount","type":"uint256"},
+    {"internalType":"uint256","name":"rewardBaseCalAmount","type":"uint256"},
+    {"internalType":"uint256","name":"rewardAmount","type":"uint256"},
+    {"internalType":"bool","name":"oracleCalled","type":"bool"}
+  ],"stateMutability":"view","type":"function"},
+  {"inputs":[],"name":"intervalSeconds","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+  {"inputs":[],"name":"bufferSeconds","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+  {"inputs":[],"name":"minBetAmount","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
+]
+""")
+
+# =============================
+# HTTP session с ретраями
+# =============================
+def make_requests_session():
+    s = requests.Session()
+    retry = Retry(
+        total=5, backoff_factor=0.4, status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://",  HTTPAdapter(max_retries=retry))
+    return s
+
+SESSION: requests.Session = make_requests_session()
+
+import atexit
+atexit.register(lambda: SESSION.close())
+
+
+# =============================
+# УТИЛИТЫ Web3 / Binance
+# =============================
+# =============================
+# … Web3 / Binance
+# =============================
+def connect_web3() -> Web3:
+    for url in RPC_URLS:
+        # короче таймаут и единая конфигурация
+        w3 = Web3(HTTPProvider(url, request_kwargs=RPC_REQUEST_KW))
+        try:
+            # для BSC (PoA) важно вставить middleware
+            if HAVE_POA:
+                try:
+                    w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+                except Exception:
+                    # если уже вставлен — игнорируем
+                    pass
+
+            ok = False
+            if hasattr(w3, "is_connected"):
+                ok = w3.is_connected()
+            elif hasattr(w3, "isConnected"):
+                ok = w3.isConnected()
+            if ok:
+                return w3
+        except Exception:
+            log_exception("Unhandled exception")
+    raise RuntimeError("не удалось подключиться к BSC RPC")
+
+
+
+def connect_web3_resilient(retries=9999):
+    delay = 1.0
+    for _ in range(retries):
+        try:
+            return connect_web3()
+        except Exception as e:
+            print(f"[init] RPC connect failed: {e}; retrying in {delay:.1f}s")
+            time.sleep(delay)
+            delay = min(delay * 1.7, 30)
+    raise RuntimeError("RPC connect: exhausted retries")
+
+def get_gas_price_wei(w3: Web3) -> int:
+    return w3.eth.gas_price
+
+def get_prediction_contract(w3: Web3):
+    return w3.eth.contract(address=PREDICTION_ADDR, abi=PREDICTION_ABI)
+
+def get_min_bet_bnb(c) -> float:
+    try:
+        wei = int(c.functions.minBetAmount().call())
+        return wei / 1e18
+    except Exception:
+        return 0.0
+
+def binance_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+    url = "https://api.binance.com/api/v3/klines"
+    params = dict(symbol=symbol, interval=interval, startTime=start_ms, endTime=end_ms, limit=BINANCE_LIMIT)
+    out = []
+    while True:
+        r = SESSION.get(url, params=params, timeout=20)
+        if r.status_code == 400:
+            return pd.DataFrame()
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            break
+        out += rows
+        last_open = rows[-1][0]
+        if last_open >= end_ms or len(rows) < BINANCE_LIMIT:
+            break
+        params["startTime"] = last_open + 1
+        time.sleep(0.2)
+    if not out:
+        return pd.DataFrame()
+    df = pd.DataFrame(out, columns=[
+        "open_time","open","high","low","close","volume","close_time",
+        "qav","trades","taker_base","taker_quote","ignore"
+    ])
+    df["open_time"]  = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    for col in ["open","high","low","close","volume"]:
+        df[col] = df[col].astype(float)
+    return df[["open_time","close_time","open","high","low","close","volume"]].set_index("close_time")
+
+def ensure_klines_cover(df: Optional[pd.DataFrame], symbol: str, interval: str, need_until_ms: int, back_hours: int = 8) -> pd.DataFrame:
+    if df is not None and not df.empty:
+        have_last_ms = int(df.index[-1].timestamp() * 1000)
+        if have_last_ms >= need_until_ms - 30_000:
+            return df
+    end_ms = need_until_ms
+    start_ms = end_ms - back_hours * 3600 * 1000
+    new_df = binance_klines(symbol, interval, start_ms, end_ms)
+    return new_df
+
+def ensure_klines_cover_map(df_map: Dict[str, Optional[pd.DataFrame]], symbols: List[str], interval: str, need_until_ms: int, back_hours: int = 8) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {}
+    for s in symbols:
+        try:
+            cur = df_map.get(s)
+            out[s] = ensure_klines_cover(cur, s, interval, need_until_ms, back_hours)
+        except Exception:
+            out[s] = pd.DataFrame()
+    return out
+
+def nearest_close_price_ms(symbol: str, ts_ms: int) -> Optional[float]:
+    df = binance_klines(symbol, "1m", ts_ms - 3*60_000, ts_ms + 2*60_000)
+    if df is None or df.empty:
+        return None
+    tgt = pd.to_datetime(ts_ms, unit="ms", utc=True)
+    i = df.index.get_indexer([tgt], method="pad")[0]
+    if i == -1:
+        return float(df["close"].iloc[0])
+    return float(df["close"].iloc[i])
+
+# =============================
+# ПРОВЕРКА БАЛАНСА КОШЕЛЬКА
+# =============================
+# =============================
+# ПРОВЕРКА БАЛАНСА (PAPER/REAL)
+# =============================
+def get_wallet_balance(w3: Web3, account_address: Optional[str], paper_capital: float) -> float:
     """
-    META-стекинг с CEM/CMA-ES оптимизацией + Cross-Validation
+    Получает баланс в зависимости от режима:
+    - PAPER mode (account_address=None): возвращает виртуальный капитал из paper_capital
+    - REAL mode: проверяет реальный баланс кошелька через Web3
     
-    Этот класс принимает предсказания от четырех экспертов и создает финальное
-    взвешенное предсказание. Обучение происходит через стохастическую оптимизацию,
-    а валидация через walk-forward cross-validation с bootstrap доверительными интервалами.
+    Args:
+        w3: Web3 instance
+        account_address: адрес кошелька (None для paper mode)
+        paper_capital: текущий виртуальный капитал (для paper mode)
     
-    Основные принципы работы:
-    - Каждая фаза рынка имеет свою независимую модель (6 фаз всего)
-    - Веса обучаются на минимизации log-loss с L2 регуляризацией
-    - Качество оценивается через bootstrap для получения доверительных интервалов
-    - Переключение SHADOW↔ACTIVE требует подтверждения через CV метрики
+    Returns:
+        float: баланс в BNB
     """
+    # PAPER TRADING: используем виртуальный капитал
+    if account_address is None:
+        return paper_capital
     
-    def __init__(self, cfg):
-        """
-        Инициализация META-стекинга
-        """
+    # REAL TRADING: проверяем реальный баланс
+    try:
+        balance_wei = w3.eth.get_balance(account_address)
+        return balance_wei / 1e18
+    except Exception as e:
+        print(f"[wallet] real balance check failed: {e}")
+        return 0.0  # безопасный fallback при ошибке RPC
+
+
+# =============================
+# Техиндикаторы/фичи
+# =============================
+def ema(series: pd.Series, n: int) -> pd.Series:
+    return series.ewm(span=n, adjust=False).mean()
+
+def sma(series: pd.Series, n: int) -> pd.Series:
+    return series.rolling(n, min_periods=1).mean()
+
+def stdev(series: pd.Series, n: int) -> pd.Series:
+    return series.rolling(n, min_periods=1).std(ddof=0)
+
+def true_range(df: pd.DataFrame) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr = pd.DataFrame({
+        "hl": df["high"] - df["low"],
+        "hc": (df["high"] - prev_close).abs(),
+        "lc": (df["low"] - prev_close).abs()
+    }).max(axis=1)
+    return tr
+
+def rma(x: pd.Series, n: int) -> pd.Series:
+    alpha = 1.0 / float(n)
+    r = x.copy()
+    if len(x) == 0:
+        return x
+    r.iloc[0] = x.iloc[:n].mean() if len(x) >= n else x.iloc[0]
+    for i in range(1, len(x)):
+        r.iloc[i] = alpha * x.iloc[i] + (1 - alpha) * r.iloc[i-1]
+    return r
+
+def atr_wilder(df: pd.DataFrame, n: int) -> pd.Series:
+    return rma(true_range(df), n)
+
+def atr(df: pd.DataFrame, n: int) -> pd.Series:
+    return ema(true_range(df), n)
+
+def lorentz(x: np.ndarray, c: float) -> np.ndarray:
+    return x / (1.0 + (x / c) ** 2)
+
+def _tanh(x: np.ndarray) -> np.ndarray:
+    return np.tanh(x)
+
+def norm_feat(x: np.ndarray, gain: float, c: float, use_lorentz: bool) -> np.ndarray:
+    return lorentz(x, c) if use_lorentz else _tanh(gain * x)
+
+def sigmoid(x: float) -> float:
+    x = max(min(x, 60.0), -60.0)
+    return 1.0 / (1.0 + math.exp(-x))
+
+def softmax2(z_up: float, z_dn: float) -> Tuple[float, float]:
+    """Обычный softmax (сохраняем для обратной совместимости)"""
+    m = max(z_up, z_dn)
+    e_up = math.exp(z_up - m)
+    e_dn = math.exp(z_dn - m)
+    s = e_up + e_dn
+    return e_up / s, e_dn / s
+
+def softmax2_with_temperature(z_up: float, z_dn: float, temperature: float = 1.0) -> Tuple[float, float]:
+    """
+    Softmax с температурным коэффициентом:
+    - T > 1: более «размытые» вероятности (консервативнее)
+    - T < 1: более «острые» вероятности (агрессивнее)
+    - T = 1: обычный softmax
+    """
+    z_up_scaled = z_up / max(1e-3, float(temperature))
+    z_dn_scaled = z_dn / max(1e-3, float(temperature))
+    
+    m = max(z_up_scaled, z_dn_scaled)
+    e_up = math.exp(z_up_scaled - m)
+    e_dn = math.exp(z_dn_scaled - m)
+    s = e_up + e_dn
+    
+    return e_up / s, e_dn / s
+
+def adaptive_temperature(volAmp: float, atr_norm: float) -> float:
+    """
+    Адаптивный выбор температуры на основе волатильности:
+    - Высокая волатильность → T > 1 (консервативнее)
+    - Низкая волатильность → T ≈ 1 (обычно)
+    - Очень низкая → T < 1 (агрессивнее)
+    """
+    # Защита от некорректных значений
+    volAmp = max(0.5, min(2.0, float(volAmp)))
+    atr_norm = max(0.3, min(3.0, float(atr_norm)))
+    
+    # Если волатильность высокая, увеличиваем T
+    if atr_norm > 1.5 or volAmp > 1.4:
+        return 1.2  # более размытые вероятности
+    elif atr_norm < 0.7 and volAmp < 1.0:
+        return 0.9  # более острые вероятности
+    else:
+        return 1.0  # дефолт
+
+def session_vwap(df: pd.DataFrame, src: pd.Series) -> pd.Series:
+    day = df.index.tz_convert("UTC").date
+    grp = pd.Series(day, index=df.index)
+    pv = (src * df["volume"]).groupby(grp).cumsum()
+    vv = (df["volume"]).groupby(grp).cumsum().replace(0.0, np.nan)
+    vwap = (pv / vv).ffill()
+    return vwap
+
+def rsi(series: pd.Series, n: int = 14) -> pd.Series:
+    delta = series.diff().fillna(0.0)
+    up = delta.clip(lower=0.0)
+    dn = (-delta).clip(lower=0.0)
+    rs = rma(up, n) / (rma(dn, n) + 1e-12)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def ema_pair_spread(series: pd.Series, fast: int, slow: int) -> pd.Series:
+    return ema(series, fast) - ema(series, slow)
+
+class EhlersSuperSmoother:
+    def __init__(self, period: int):
+        self.period = max(3, int(period))
+        a1 = math.exp(-math.sqrt(2.0) * math.pi / self.period)
+        self.c2 = 2.0 * a1 * math.cos(math.sqrt(2.0) * math.pi / self.period)
+        self.c3 = -a1 * a1
+        self.c1 = 1.0 - self.c2 - self.c3
+        self.y1 = None
+        self.y2 = None
+        self.x1 = None
+
+    def update(self, x: float) -> float:
+        if self.y1 is None:
+            self.y1 = x
+            self.y2 = x
+            self.x1 = x
+            return x
+        y = self.c1 * 0.5 * (x + (self.x1 if self.x1 is not None else x)) + self.c2 * self.y1 + self.c3 * self.y2
+        self.y2, self.y1 = self.y1, y
+        self.x1 = x
+        return float(y)
+
+# ========= OU HELPERS =========
+def _phi_a_from_ols(n: float, Sx: float, Sy: float, Sxx: float, Sxy: float) -> Tuple[Optional[float], Optional[float]]:
+    den = (n * Sxx - Sx * Sx)
+    if den <= 1e-12:
+        return None, None
+    phi = (n * Sxy - Sx * Sy) / den
+    a = (Sy - phi * Sx) / n
+    return phi, a
+
+class OUOnlineSkew:
+    def __init__(self, dt_unit: float = 60.0, decay: float = 0.997):
+        self.dt_unit = float(dt_unit)
+        self.decay = float(decay)
+        self.n = 0.0
+        self.Sx = 0.0
+        self.Sy = 0.0
+        self.Sxx = 0.0
+        self.Sxy = 0.0
+        self.Syy = 0.0
+        self.last_x = None
+
+    def update_pair(self, x_prev: float, x_now: float):
+        d = self.decay
+        self.n = d * self.n + 1.0
+        self.Sx = d * self.Sx + x_prev
+        self.Sy = d * self.Sy + x_now
+        self.Sxx = d * self.Sxx + x_prev * x_prev
+        self.Sxy = d * self.Sxy + x_prev * x_now
+        self.Syy = d * self.Syy + x_now * x_now
+        self.last_x = x_now
+
+    def _params(self) -> Optional[Tuple[float, float, float]]:
+        if self.n < 20:
+            return None
+        phi, a = _phi_a_from_ols(self.n, self.Sx, self.Sy, self.Sxx, self.Sxy)
+        if phi is None:
+            return None
+        phi = float(np.clip(phi, 1e-6, 0.999999))
+        a = float(a)
+        sse_over_n = (self.Syy
+                      - 2.0 * a * self.Sy
+                      - 2.0 * phi * self.Sxy
+                      + 2.0 * a * phi * self.Sx
+                      + (a * a) * self.n
+                      + (phi * phi) * self.Sxx) / max(1.0, self.n)
+        var_eps = max(1e-8, float(sse_over_n))
+        kappa = -math.log(phi) / self.dt_unit
+        if not math.isfinite(kappa) or kappa <= 0:
+            return None
+        mu = a / (1.0 - phi)
+        denom = (1.0 - math.exp(-2.0 * kappa * self.dt_unit))
+        sigma2 = max(1e-12, 2.0 * kappa * var_eps / max(1e-12, denom))
+        return kappa, mu, sigma2
+
+    def prob_above_zero(self, x_now: float, horizon_sec: float) -> Optional[Tuple[float, float]]:
+        pars = self._params()
+        if pars is None:
+            return None
+        kappa, mu, sigma2 = pars
+        dt = max(0.0, float(horizon_sec))
+        expk = math.exp(-kappa * dt)
+        m = mu + (x_now - mu) * expk
+        v = (sigma2 / (2.0 * kappa)) * (1.0 - math.exp(-2.0 * kappa * dt))
+        s = max(1e-12, math.sqrt(v))
+        z = (0.0 - m) / s
+        p = 0.5 * math.erfc(z / math.sqrt(2.0))
+        strength = 1.0 - expk
+        return float(np.clip(p, 1e-6, 1.0 - 1e-6)), float(np.clip(strength, 0.0, 1.0))
+
+class LogitOUSmoother:
+    def __init__(self, half_life_sec: float = 120.0, mu_beta: float = 0.985, z_clip: float = 5.5):
+        self.kappa = math.log(2.0) / max(1e-3, half_life_sec)
+        self.mu = 0.0
+        self.beta = float(np.clip(mu_beta, 0.0, 1.0))
+        self.z_clip = float(z_clip)
+
+    def update_mu(self, z_now: float):
+        self.mu = self.beta * self.mu + (1.0 - self.beta) * z_now
+
+    def predict_future(self, z_now: float, horizon_sec: float) -> float:
+        dt = max(0.0, float(horizon_sec))
+        expk = math.exp(-self.kappa * dt)
+        z_now = float(np.clip(z_now, -self.z_clip, self.z_clip))
+        z_pred = self.mu + (z_now - self.mu) * expk
+        return float(np.clip(z_pred, -self.z_clip, self.z_clip))
+
+# =============================
+
+@dataclass
+class RoundInfo:
+    epoch: int
+    start_ts: int
+    lock_ts: int
+    close_ts: int
+    lock_price: float
+    close_price: float
+    bull_amount: float
+    bear_amount: float
+    reward_base: float
+    reward_amt: float
+    oracle_called: bool
+
+    @property
+    def payout_ratio(self) -> Optional[float]:
+        if self.oracle_called and self.reward_base > 0:
+            return self.reward_amt / self.reward_base
+        return None
+
+
+# =============================
+# Мониторинг качества базовой модели
+# =============================
+def track_base_model_quality(P_up_base, outcome, csv_path="base_model_quality.csv"):
+    """Логирует качество базовой модели ДО всех улучшений"""
+    try:
+        hit = int((P_up_base >= 0.5) == (outcome == "UP"))
+        log_loss = -np.log(P_up_base if outcome == "UP" else (1 - P_up_base))
+        brier = (P_up_base - (1 if outcome == "UP" else 0)) ** 2
+        
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if f.tell() == 0:
+                writer.writerow(["timestamp", "p_up_base", "outcome", "hit", "log_loss", "brier"])
+            writer.writerow([int(time.time()), P_up_base, outcome, hit, log_loss, brier])
+    except Exception:
+        log_exception("track_base_model_quality failed")
+
+
+class OnlineLogReg:
+    def __init__(self, eta=ETA, l2=L2, w_clip=W_CLIP, g_clip=G_CLIP, state_path: str = "calib_logreg_state.json"):
+        self.w = np.zeros(5, dtype=float)  # 4 features + bias
+        self.eta = eta
+        self.l2 = l2
+        self.w_clip = w_clip
+        self.g_clip = g_clip
+        self.state_path = state_path
+        self._load()
+
+    # bnbusdrt6.py, класс OnlineLogReg._load()
+    def _load(self):
+        try:
+            with open(self.state_path, "r") as f:
+                obj = json.load(f)
+            w = obj.get("w", [])
+            if isinstance(w, list) and len(w) > 0:  # ✅ Загружаем любой непустой массив
+                self.w = np.array(w, dtype=float)
+        except Exception:
+            log_exception("Failed to load JSON")
+
+    def save(self):
+        try:
+            with open(self.state_path, "w") as f:
+                json.dump({"w": self.w.tolist()}, f)
+        except Exception:
+            log_exception("Failed to load JSON")
+
+    def predict(self, phi: np.ndarray) -> float:
+        z = float(np.dot(self.w, phi))
+        return sigmoid(z)
+
+    def update(self, phi: np.ndarray, y: float):
+        p = self.predict(phi)
+        g = p - y
+        g = max(min(g, self.g_clip), -self.g_clip)
+        grad = g * phi + self.l2 * self.w
+        self.w -= self.eta * grad
+        self.w = np.clip(self.w, -self.w_clip, self.w_clip)
+
+# bnbusdrt6.py — фрагмент класса WalkForwardWeighter
+class WalkForwardWeighter:
+    def __init__(self, eta=WF_ETA, l2=WF_L2, g_clip=WF_G_CLIP, w_clip=WF_W_CLIP, path=WF_WEIGHTS_PATH):
+        self.eta = eta
+        self.l2 = l2
+        self.g_clip = g_clip
+        self.w_clip = w_clip
+        self.path = path
+        self.w = np.array(WF_INIT_W, dtype=float)
+        self.load()
+
+    def load(self):
+        try:
+            dir_path = os.path.dirname(self.path) or "."
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path, exist_ok=True)
+
+            if not os.path.exists(self.path):
+                # файла ещё нет — создаём с дефолтными весами
+                with open(self.path, "w", encoding="utf-8") as f:
+                    json.dump({"w": self.w.tolist()}, f)
+                return
+
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                w = data.get("w")
+                if isinstance(w, list) and len(w) == 4:
+                    self.w = np.array(w, dtype=float)
+        except Exception:
+            log_exception("Failed to load JSON")
+
+    def save(self):
+        try:
+            dir_path = os.path.dirname(self.path) or "."
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path, exist_ok=True)
+
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({"w": self.w.tolist()}, f)
+        except Exception:
+            log_exception("Failed to save JSON")
+
+
+    def predict_prob(self, phi_diff: np.ndarray) -> float:
+        z = float(np.dot(self.w, phi_diff))
+        return sigmoid(z)
+
+    def update(self, phi_diff: np.ndarray, y_up: float):
+        p = self.predict_prob(phi_diff)
+        g = p - y_up
+        g = max(min(g, self.g_clip), -self.g_clip)
+        grad = g * phi_diff + self.l2 * self.w
+        self.w -= self.eta * grad
+        self.w = np.clip(self.w, -self.w_clip, self.w_clip)
+
+# --------- извлечение rounds ----------
+# --- BSC Prediction helpers ---
+def get_round(w3: Web3, c, epoch: int, retries: int = 2) -> Optional[RoundInfo]:
+    """
+    Надёжный вызов rounds(epoch) с короткими ретраями и backoff.
+    Возвращает RoundInfo или None (чтобы цикл мог пропустить раунд при RPC-проблемах).
+    """
+    for i in range(retries + 1):
+        try:
+            r = c.functions.rounds(epoch).call()
+            return RoundInfo(
+        epoch=int(r[0]),
+        start_ts=int(r[1]),
+        lock_ts=int(r[2]),
+        close_ts=int(r[3]),
+        lock_price=float(r[4]),
+        close_price=float(r[5]),
+        bull_amount=float(r[9]),
+        bear_amount=float(r[10]),
+        reward_base=float(r[11]),
+        reward_amt=float(r[12]),
+        oracle_called=bool(r[13])
+            )
+        except (ReqTimeout, ReadTimeout, ReqConnError, TimeExhausted) as e:
+            backoff = 0.5 * (2 ** i)
+            print(f"[rpc ] timeout on rounds({epoch}), retry in {backoff:.1f}s ({e.__class__.__name__})")
+            time.sleep(backoff)
+        except KeyboardInterrupt:
+            # немедленно пробрасываем — без лишних сетевых попыток
+            raise
+        except Exception as e:
+            print(f"[rpc ] error on rounds({epoch}): {e}")
+            break
+    return None  # сигнал наверх: пропускаем раунд
+
+def get_current_epoch(w3, c):
+    return c.functions.currentEpoch().call()
+
+# --------- фичи из свечей ----------
+def features_from_binance(df: pd.DataFrame) -> Dict[str, pd.Series]:
+    ln_hl = np.log(df["high"] / df["low"]).clip(lower=1e-12)
+    sigP = np.sqrt((1.0 / (4.0 * np.log(2.0))) * (ln_hl ** 2))
+    ln_co = np.log(df["close"] / df["open"]).fillna(0.0)
+    sigGK = np.sqrt(np.maximum(0.0, 0.5 * (ln_hl ** 2) - (2.0 * np.log(2.0) - 1.0) * (ln_co ** 2)))
+    ln_hc = np.log(df["high"] / df["close"]).clip(lower=1e-12)
+    ln_ho = np.log(df["high"] / df["open"]).clip(lower=1e-12)
+    ln_lc = np.log(df["low"] / df["close"]).clip(lower=1e-12)
+    ln_lo = np.log(df["low"] / df["open"]).clip(lower=1e-12)
+    rsVar = ln_hc * ln_ho + ln_lc * ln_lo
+    sigRS = np.sqrt(np.maximum(0.0, rsVar))
+    sigRB = pd.Series((sigP + sigGK + sigRS) / 3.0, index=df.index)
+    sigRB = ema(sigRB, RB_LEN)
+    normGain = 1.0 / np.maximum(sigRB.values, 1e-10)
+
+    atr_series = atr_wilder(df, ATR_LEN)
+    atr_sma = sma(atr_series, ATR_SMOOTH)
+
+    r1 = np.log(df["close"] / df["close"].shift(M1)).fillna(0.0)
+    r2 = np.log(df["close"] / df["close"].shift(M2)).fillna(0.0)
+    r3 = np.log(df["close"] / df["close"].shift(M3)).fillna(0.0)
+    Mraw = 0.6 * r1 + 0.3 * r2 + 0.1 * r3
+    M_up = norm_feat(Mraw.values * normGain, 2.5, C_M, USE_LORENTZ)
+    M_dn = norm_feat(-Mraw.values * normGain, 2.5, C_M, USE_LORENTZ)
+
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    vwap = session_vwap(df, tp)
+    vslp = ((vwap - vwap.shift(VWAP_LOOK)) / vwap.replace(0.0, np.nan)).fillna(0.0)
+    S_up = norm_feat(vslp.values * normGain, 3.0, C_S, USE_LORENTZ)
+    S_dn = norm_feat(-vslp.values * normGain, 3.0, C_S, USE_LORENTZ)
+
+    basisKC = ema(df["close"], KC_LEN)
+    rngKC = atr_wilder(df, KC_LEN)
+    upKC = basisKC + KC_MULT * rngKC
+    dnKC = basisKC - KC_MULT * rngKC
+    distUp = ((df["close"] - upKC) / (KC_MULT * rngKC.replace(0, np.nan))).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    distDn = ((dnKC - df["close"]) / (KC_MULT * rngKC.replace(0, np.nan))).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    B_up = norm_feat(distUp.values, 2.0, C_B, USE_LORENTZ)
+    B_dn = norm_feat(distDn.values, 2.0, C_B, USE_LORENTZ)
+
+    bb_basis = sma(df["close"], BB_LEN)
+    bb_dev = stdev(df["close"], BB_LEN).replace(0.0, np.nan)
+    Zs = ((df["close"] - bb_basis) / bb_dev).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    R_up = norm_feat(np.maximum(0.0, -Zs - BB_Z).values, 1.6, C_R, USE_LORENTZ)
+    R_dn = norm_feat(np.maximum(0.0,  Zs - BB_Z).values, 1.6, C_R, USE_LORENTZ)
+
+    vol_usd = df["volume"] * df["close"]
+    vMean = sma(vol_usd, VOL_LEN)
+    vStd = stdev(vol_usd, VOL_LEN).replace(0.0, np.nan)
+    volZ = ((vol_usd - vMean) / vStd).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    volAmp = np.clip(1.0 + VOL_BOOST * np.maximum(0.0, volZ.values), 0.8, 1.8)
+
+    return dict(
+        M_up=pd.Series(M_up, index=df.index),
+        M_dn=pd.Series(M_dn, index=df.index),
+        S_up=pd.Series(S_up, index=df.index),
+        S_dn=pd.Series(S_dn, index=df.index),
+        B_up=pd.Series(B_up, index=df.index),
+        B_dn=pd.Series(B_dn, index=df.index),
+        R_up=pd.Series(R_up, index=df.index),
+        R_dn=pd.Series(R_dn, index=df.index),
+        atr=pd.Series(atr_series, index=df.index),
+        atr_sma=pd.Series(atr_sma, index=df.index),
+        volAmp=pd.Series(volAmp, index=df.index),
+        close=df["close"],
+        open=df["open"],
+        high=df["high"],
+        low=df["low"],
+        Zs=Zs,
+    )
+
+def _index_pad(series: pd.Series, t: pd.Timestamp) -> Optional[int]:
+    idx = series.index.get_indexer([t], method="pad")
+    return None if idx[0] == -1 else int(idx[0])
+
+def _np_percentile_linear(arr: np.ndarray, q: float) -> float:
+    try:
+        return float(np.percentile(arr, q, method="linear"))
+    except TypeError:
+        return float(np.percentile(arr, q, interpolation="linear"))
+
+def is_chop_at_time(feats: Dict[str, pd.Series], tstamp: pd.Timestamp) -> bool:
+    end_loc = _index_pad(feats["atr"], tstamp)
+    if end_loc is None:
+        return True
+    start_loc = max(0, end_loc - ATR_SMOOTH + 1)
+    window_atr = feats["atr"].iloc[start_loc:end_loc + 1].dropna()
+    if window_atr.empty:
+        return True
+    atr_now = float(feats["atr"].iloc[end_loc])
+    if USE_PCT_CHOP:
+        pct = _np_percentile_linear(window_atr.values, CHOP_PCT)
+        return atr_now <= pct
+    else:
+        atr_sma_val = float(feats["atr_sma"].iloc[end_loc])
+        return atr_now < atr_sma_val * CHOP_RATIO
+
+# ============== Triple Screen / Elder ==============
+def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    agg = {"open": "first","high": "max","low": "min","close": "last","volume": "sum"}
+    out = df[["open", "high", "low", "close", "volume"]].resample(rule, label="right", closed="right").agg(agg)
+    return out.dropna(how="any")
+
+def macd_hist(close: pd.Series, fast=12, slow=26, sig=9) -> pd.Series:
+    macd = ema(close, fast) - ema(close, slow)
+    signal = ema(macd, sig)
+    return macd - signal
+
+def stoch_k(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    ll = df["low"].rolling(n, min_periods=1).min()
+    hh = df["high"].rolling(n, min_periods=1).max()
+    return 100.0 * (df["close"] - ll) / (hh - ll + 1e-12)
+
+def to_logit(p: float) -> float:
+    p = min(max(p, 1e-6), 1.0 - 1e-6)
+    return math.log(p / (1.0 - p))
+
+def from_logit(z: float) -> float:
+    z = max(min(z, 60.0), -60.0)
+    return 1.0 / (1.0 + math.exp(-z))
+
+def elder_logit_adjust(df_1m: pd.DataFrame, tstamp: pd.Timestamp, p_up_hat: float) -> float:
+    try:
+        htf = resample_ohlc(df_1m, ELDER_HTF)
+        if htf.empty:
+            return p_up_hat
+        i = htf.index.get_indexer([tstamp], method="pad")[0]
+        if i <= 0:
+            return p_up_hat
+        hist = macd_hist(htf["close"])
+        sgn = 1.0 if hist.iloc[i-1] > 0 else (-1.0 if hist.iloc[i-1] < 0 else 0.0)
+
+        mtf = resample_ohlc(df_1m, ELDER_MID)
+        if mtf.empty:
+            return p_up_hat
+        j = mtf.index.get_indexer([tstamp], method="pad")[0]
+        if j <= 0:
+            return p_up_hat
+        k = float(stoch_k(mtf, STOCH_LEN).iloc[j-1])
+        rng = max(1.0, (STOCH_OB - STOCH_OS))
+        t = float(np.clip((k - STOCH_OS)/rng, 0.0, 1.0))
+        pullback = 1.0 - 2.0 * t  # [-1..1]
+
+        z = to_logit(p_up_hat) + ELDER_ALPHA * (sgn * pullback)
+        return from_logit(z)
+    except Exception:
+        return p_up_hat
+
+# ====== Вероятности из фич (+ авто-веса WF) ======
+def prob_up_down_at_time(feats, tstamp, w_dyn=None, volAmp=None, atr_norm=None):
+    i = _index_pad(feats["M_up"], tstamp)
+    if i is None:
+        return 0.5, 0.5, {}
+    
+    M_up = float(feats["M_up"].iloc[i])
+    M_dn = float(feats["M_dn"].iloc[i])
+    S_up = float(feats["S_up"].iloc[i])
+    S_dn = float(feats["S_dn"].iloc[i])
+    B_up = float(feats["B_up"].iloc[i])
+    B_dn = float(feats["B_dn"].iloc[i])
+    R_up = float(feats["R_up"].iloc[i])
+    R_dn = float(feats["R_dn"].iloc[i])
+    
+    if volAmp is None:
+        volAmp = float(feats["volAmp"].iloc[i])
+    if atr_norm is None:
+        atr_norm = float(feats["atr"].iloc[i] / (feats["atr_sma"].iloc[i] + 1e-12))
+    
+    # НОВОЕ: Плавная нормализация весов
+    w_default = np.array([0.35, 0.20, 0.20, 0.25], dtype=float)
+    
+    if w_dyn is None or len(w_dyn) != 4:
+        w = w_default
+    else:
+        w = np.array(w_dyn, dtype=float)
+        w_norm = np.linalg.norm(w)
+        
+        # Плавная интерполяция при усушке
+        if w_norm < 0.15:
+            alpha_shrink = max(0.0, w_norm / 0.15)
+            w = alpha_shrink * w + (1 - alpha_shrink) * w_default
+            w_norm = np.linalg.norm(w)  # пересчитываем после интерполяции
+        
+        # ИСПРАВЛЕНО: L1-нормализация ТОЛЬКО если ||w|| сильно отличается от 1.0
+        # Это сохраняет масштаб логитов, но предотвращает экстремальные веса
+        w_sum = np.sum(np.abs(w))
+        if w_sum < 0.8 or w_sum > 1.5:  # если веса "сбились" — нормализуем
+            w = w / (w_sum + 1e-12)
+    
+    w_mom, w_vwp, w_brk, w_rev = w
+    
+    # Линейная комбинация
+    Z_up = (w_mom * M_up * volAmp) + (w_vwp * S_up) + (w_brk * B_up) + (w_rev * R_up)
+    Z_dn = (w_mom * M_dn * volAmp) + (w_vwp * S_dn) + (w_brk * B_dn) + (w_rev * R_dn)
+    
+    # НОВОЕ: Softmax с адаптивной температурой
+    T = adaptive_temperature(volAmp, atr_norm)
+    P_up, P_dn = softmax2_with_temperature(Z_up, Z_dn, temperature=T)
+    
+    # Контекст для Walk-Forward
+    phi_wf = np.array([
+        (M_up - M_dn) * volAmp,
+        (S_up - S_dn),
+        (B_up - B_dn),
+        (R_up - R_dn)
+    ], dtype=float)
+    
+    return P_up, P_dn, {
+        "phi_wf0": phi_wf[0], "phi_wf1": phi_wf[1],
+        "phi_wf2": phi_wf[2], "phi_wf3": phi_wf[3],
+        "temperature": T  # для отладки
+    }
+
+# ====== Кросс-активы ======
+def features_for_symbols(df_map: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, pd.Series]]:
+    out: Dict[str, Dict[str, pd.Series]] = {}
+    for sym, df in df_map.items():
+        if df is not None and not df.empty:
+            try:
+                out[sym] = features_from_binance(df)
+            except Exception:
+                log_exception("Error in features_for_symbols")
+    return out
+
+def _idx_with_shift(series: pd.Series, tstamp: pd.Timestamp, shift_bars: int = 0) -> Optional[int]:
+    i = _index_pad(series, tstamp)
+    if i is None:
+        return None
+    i = int(i) - int(shift_bars)
+    if i < 0 or i >= len(series):
+        return None
+    return i
+
+def cross_up_down_contrib(feats_map: Dict[str, Dict[str, pd.Series]],
+                          tstamp: pd.Timestamp,
+                          symbols: List[str],
+                          w_mom: float,
+                          w_vwap: float,
+                          shift_bars: int = 0) -> Tuple[float, float]:
+    z_up_sum, z_dn_sum = 0.0, 0.0
+    for sym in symbols:
+        f = feats_map.get(sym)
+        if not f:
+            continue
+        i = _idx_with_shift(f["M_up"], tstamp, shift_bars)
+        if i is None:
+            continue
+        vA = float(f["volAmp"].iloc[i])
+        M_up = float(f["M_up"].iloc[i]); M_dn = float(f["M_dn"].iloc[i])
+        S_up = float(f["S_up"].iloc[i]); S_dn = float(f["S_dn"].iloc[i])
+        z_up = (w_mom * M_up * vA) + (w_vwap * S_up)
+        z_dn = (w_mom * M_dn * vA) + (w_vwap * S_dn)
+        z_up_sum += z_up
+        z_dn_sum += z_dn
+    return z_up_sum, z_dn_sum
+
+# =============================
+# Расширенная фабрика признаков для экспертов
+# =============================
+class ExtendedMLFeatures:
+    """
+    Собирает расширенный x-вектор под экспертов (XGB/RF/ARF/NN) из минутных фич и «сырых» OHLC:
+      - базовые диффы (Mom/VWAP/Keltner/Bollinger)
+      - BB z-score, Keltner position/width
+      - ATR норм. / wick imbalance
+      - RSI, тренд RSI (slope)
+      - парные интеракции (умеренно)
+    """
+    def __init__(self, use_interactions: bool = True):
+        self.use_interactions = use_interactions
+        base_dim = 11
+        inter_dim = 3 if use_interactions else 0
+        self.dim = base_dim + inter_dim  # 14 при use_interactions=True
+
+    def _keltner(self, df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+        basis = ema(df["close"], KC_LEN)
+        rng = atr_wilder(df, KC_LEN)
+        return basis, rng
+
+    def build(self, df_1m: pd.DataFrame, feats: Dict[str, pd.Series], tstamp: pd.Timestamp) -> np.ndarray:
+        i = _index_pad(feats["M_up"], tstamp)
+        if i is None:
+            return np.zeros(self.dim, dtype=float)
+
+        m_diff = float(feats["M_up"].iloc[i] - feats["M_dn"].iloc[i])
+        s_diff = float(feats["S_up"].iloc[i] - feats["S_dn"].iloc[i])
+        b_diff = float(feats["B_up"].iloc[i] - feats["B_dn"].iloc[i])
+        r_diff = float(feats["R_up"].iloc[i] - feats["R_dn"].iloc[i])
+
+        z_bb = float(feats.get("Zs", pd.Series(index=df_1m.index, dtype=float)).iloc[i])
+
+        basisKC, rngKC = self._keltner(df_1m)
+        kc_pos = float(((df_1m["close"].iloc[i] - basisKC.iloc[i]) / (KC_MULT * rngKC.iloc[i] + 1e-12)))
+        kc_w = float((KC_MULT * rngKC.iloc[i]) / max(1e-9, df_1m["close"].iloc[i]))
+
+        atr_now = float(feats["atr"].iloc[i])
+        atr_sma_now = float(feats["atr_sma"].iloc[i])
+        atr_norm = float(atr_now / (atr_sma_now + 1e-12))
+
+        rsi_series = rsi(df_1m["close"], 14).fillna(50.0)
+        rsi_now = float(rsi_series.iloc[i])
+        rsi_norm = (rsi_now - 50.0) / 50.0
+        i_prev = max(0, i - 3)
+        trend_rsi = float((rsi_series.iloc[i] - rsi_series.iloc[i_prev]) / 100.0)
+
+        hi = float(df_1m["high"].iloc[i]); lo = float(df_1m["low"].iloc[i])
+        op = float(df_1m["open"].iloc[i]); cl = float(df_1m["close"].iloc[i])
+        rng = max(1e-12, hi - lo)
+        up_w = hi - max(op, cl)
+        dn_w = min(op, cl) - lo
+        wick_imb = float((up_w - dn_w) / rng)
+
+        feats_vec = [
+            m_diff, s_diff, b_diff, r_diff,
+            z_bb, kc_pos, atr_norm, rsi_norm,
+            wick_imb, trend_rsi, kc_w
+        ]
+        if self.use_interactions:
+            feats_vec += [
+                m_diff * s_diff,
+                m_diff * rsi_norm,
+                s_diff * kc_pos,
+            ]
+        x = np.array(feats_vec, dtype=float)
+        x = np.nan_to_num(x, nan=0.0, posinf=5.0, neginf=-5.0)
+        x = np.clip(x, -5.0, 5.0)
+        return x
+
+# =============================
+# CSV / KPI
+
+# =============================
+CSV_COLUMNS = [
+    "settled_ts","epoch","side","p_up",
+    "p_meta_raw","p_meta2_raw","p_blend","blend_w","calib_src",
+    "p_thr_used","p_thr_src","edge_at_entry",
+    "stake","gas_bet_bnb","gas_claim_bnb",
+    "gas_price_bet_gwei","gas_price_claim_gwei",
+    "outcome","pnl","capital_before","capital_after",
+    "lock_ts","close_ts","lock_price","close_price","payout_ratio","up_won",
+    "r_hat_used","r_hat_source","r_hat_error_pct"  # ← НОВОЕ
+]
+
+
+
+# 👇 Единая схема типов для наших CSV
+CSV_DTYPES = {
+    "settled_ts":           "Int64",
+    "epoch":                "Int64",
+    "side":                 "string",
+    "p_up":                 "float64",
+    "p_meta_raw":           "float64",
+    "p_meta2_raw":          "float64",   # ← NEW
+    "p_blend":              "float64",   # ← NEW
+    "blend_w":              "float64",   # ← NEW                       # ← ДОБАВИЛИ
+    "calib_src":            "string", 
+    "p_thr_used":           "float64",
+    "p_thr_src":            "string",
+    "edge_at_entry":        "float64",
+    "stake":                "float64",
+    "gas_bet_bnb":          "float64",
+    "gas_claim_bnb":        "float64",
+    "gas_price_bet_gwei":   "float64",
+    "gas_price_claim_gwei": "float64",
+    "outcome":              "string",    # ← важно: строка
+    "pnl":                  "float64",
+    "capital_before":       "float64",
+    "capital_after":        "float64",
+    "lock_ts":              "Int64",
+    "close_ts":             "Int64",
+    "lock_price":           "float64",
+    "close_price":          "float64",
+    "payout_ratio":         "float64",
+    "up_won":               "boolean",
+    "r_hat_used":           "float64",      # ← НОВОЕ
+    "r_hat_source":         "string",       # ← НОВОЕ
+    "r_hat_error_pct":      "float64",      # ← НОВОЕ   # ← важно: логический
+}
+
+# --- Порог для включения δ от тюнера ---
+MIN_TRADES_FOR_DELTA = 500  # до этого числа завершённых сделок δ принудительно 0.000
+
+
+
+def _coerce_csv_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Нормализуем типы столбцов согласно CSV_DTYPES (мягко, без падений)."""
+    
+    # ✅ Заменяем pd.NA на пустую строку для строковых колонок
+    obj_like = list(df.select_dtypes(include=["object", "string"]).columns)
+    if obj_like:
+        df[obj_like] = df[obj_like].fillna("")  # безопаснее чем .where()
+    
+    for col, dtype in CSV_DTYPES.items():
+        # bnbusdrt6.py  (функция _coerce_csv_dtypes)
+        if col not in df.columns:
+            # ✅ Используем np.nan вместо pd.NA
+            if dtype in ("float64", "Int64"):
+                df[col] = np.nan
+            elif dtype == "boolean":
+                # было: df[col] = pd.Series(dtype="boolean")  ← длина 0 → рассинхрон с индексом df
+                df[col] = pd.Series([pd.NA]*len(df), dtype="boolean")
+            else:
+                df[col] = ""
+            continue
+
+        
+        try:
+            if dtype in ("float64",):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+                df[col] = df[col].fillna(np.nan).astype(dtype)
+            elif dtype in ("Int64",):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+                # ✅ Int64 поддерживает pd.NA, но безопаснее через astype
+                df[col] = df[col].astype("Int64")
+            # bnbusdrt6.py  (функция _coerce_csv_dtypes)
+            elif dtype == "boolean":
+                # Надёжная нормализация булевых значений из старых CSV:
+                # поддерживает 'True'/'False', '1'/'0', 't'/'f', 'y'/'n', 'yes'/'no' (регистр/пробелы игнорируем)
+                s_str = df[col].astype("string").str.strip().str.lower()
+                _map = {
+                    "true": True, "false": False,
+                    "1": True, "0": False,
+                    "t": True, "f": False,
+                    "y": True, "n": False,
+                    "yes": True, "no": False,
+                }
+                df[col] = pd.Series(s_str.map(_map), dtype="boolean")
+            else:
+                df[col] = df[col].astype(dtype)
+        except Exception as e:
+            print(f"[warn] failed to coerce {col} to {dtype}: {e}")
+            pass
+    
+    return df
+
+def ensure_csv_header(path: str):
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(CSV_COLUMNS)
+
+def append_trade_row(path: str, row: Dict):
+    ensure_csv_header(path)
+    with open(path, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([row.get(col, "") for col in CSV_COLUMNS])
+
+
+# ========= SHADOW CSV (для off-policy δ) =========
+def ensure_shadow_header(path: str):
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(CSV_COLUMNS)
+
+def append_shadow_row(path: str, row: Dict):
+    ensure_shadow_header(path)
+    with open(path, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([row.get(col, "") for col in CSV_COLUMNS])
+        
+
+def try_settle_shadow_rows(path: str, w3: Web3, c, cur_epoch: int) -> None:
+    """Закрыть теневые строки (outcome пуст) для уже завершённых эпох (< cur_epoch)."""
+    if not os.path.exists(path):
+        return
+
+    df = _read_csv_df(path)
+    if df.empty:
+        return
+
+    # Открытые тени: outcome отсутствует/пуст и epoch < cur_epoch
+    outcome_series = df.get("outcome")
+    if outcome_series is None:
+        return
+
+    open_mask = (
+        outcome_series.isna() |
+        (outcome_series.astype(str).str.len() == 0)
+    ) & (pd.to_numeric(df["epoch"], errors="coerce") < int(cur_epoch))
+
+    if not bool(open_mask.any()):
+        return
+
+    changed_any = False
+
+    for idx, row in df.loc[open_mask].iterrows():
+        try:
+            # --- Безопасные геттеры чисел ---
+            def _sf(x, default=0.0):
+                """Безопасно конвертирует в float с обработкой pd.NA"""
+                try:
+                    # ✅ Явная проверка на pd.NA (для pandas < 2.0)
+                    if pd.isna(x):  # работает и для pd.NA, и для np.nan
+                        return default
+                    
+                    v = float(pd.to_numeric(x, errors="coerce"))
+                    return v if math.isfinite(v) else default
+                except (TypeError, ValueError):
+                    return default
+
+            epoch = int(pd.to_numeric(row.get("epoch"), errors="coerce"))
+            rd = get_round(w3, c, epoch)
+            if not rd or not getattr(rd, "oracle_called", False):
+                # Раунд ещё не закрыт — попробуем позже
+                continue
+
+            side = str(row.get("side", "UP")).upper()
+            stake = _sf(row.get("stake", 0.0), 0.0)
+
+            up_won   = (rd.close_price > rd.lock_price)
+            down_won = (rd.close_price < rd.lock_price)
+            draw     = (rd.close_price == rd.lock_price)
+
+            # Газ из зафиксированных в тени значений
+            gb = _sf(row.get("gas_bet_bnb", 0.0), 0.0)    # bet gas
+            gc = _sf(row.get("gas_claim_bnb", 0.0), 0.0)  # claim gas
+
+            # Коэффициент выплат; если пуст/некорректен — используем 1.9 как дефолт
+            ratio = _sf(getattr(rd, "payout_ratio", None), 1.9)
+            if not math.isfinite(ratio) or ratio <= 0:
+                ratio = 1.9
+
+            # --- PnL с учётом газа (off-policy) ---
+            if draw:
+                pnl = -(gb + gc)
+                outcome = "draw"
+            else:
+                win = (up_won and side == "UP") or (down_won and side == "DOWN")
+                if win:
+                    pnl = stake * (ratio - 1.0) - (gb + gc)
+                    outcome = "win"
+                else:
+                    pnl = -stake - gb
+                    outcome = "loss"
+
+            # --- пополняем окно калибратора мета-вероятностей ---
+            # --- пополняем окно калибратора мета-вероятностей ---
+            try:
+                if outcome in ("win", "loss"):
+                    p_logged_raw = float(row.get("p_meta_raw", row.get("p_up", float('nan'))))
+                    _CALIB_P_META.append(p_logged_raw)
+                    _CALIB_Y_META.append(1 if outcome == "win" else 0)
+                    # обновим онлайн-менеджер (если включен)
+                    if os.getenv("CALIB_ENABLE","1")=="1":
+                        settled_ts = int(time.time())
+                        globals()["_CALIB_MGR"].update(p_logged_raw, 1 if outcome=="win" else 0, settled_ts)
+            except Exception:
+                log_exception("Failed to update")
+
+
+            # --- Заполняем
+
+
+            # --- Заполняем поля в исходном df ---
+            df.at[idx, "outcome"]       = outcome
+            df.at[idx, "pnl"]           = pnl
+            df.at[idx, "settled_ts"]    = int(time.time())
+            df.at[idx, "lock_ts"]       = getattr(rd, "lock_ts", None)
+            df.at[idx, "close_ts"]      = getattr(rd, "close_ts", None)
+            df.at[idx, "lock_price"]    = getattr(rd, "lock_price", float("nan"))
+            df.at[idx, "close_price"]   = getattr(rd, "close_price", float("nan"))
+            df.at[idx, "payout_ratio"]  = ratio
+            df.at[idx, "up_won"]        = bool(up_won)
+
+            # Гипотетический capital_after для офф-полиси анализа
+            cap_before = _sf(row.get("capital_before", float("nan")), float("nan"))
+            if math.isfinite(cap_before):
+                df.at[idx, "capital_after"] = cap_before + pnl
+
+            changed_any = True
+
+        except Exception as e:
+            print(f"[shadow] settle error for epoch={row.get('epoch')} : {e}")
+
+    if changed_any:
+        df.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+
+def _read_csv_df(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        empty = pd.DataFrame({c: pd.Series(dtype=CSV_DTYPES.get(c, "object")) for c in CSV_COLUMNS})
+        return empty
+    
+    # ✅ Читаем БЕЗ dtype="string" и сразу заменяем pd.NA
+    df = pd.read_csv(path, keep_default_na=True, encoding="utf-8-sig")
+    
+    # ✅ КРИТИЧНО: заменить pd.NA на np.nan ДО любых операций
+    df = df.fillna(np.nan)  # более надёжно чем .replace()
+    
+    # Дополнительная зачистка
+    for col in df.select_dtypes(include=["object"]).columns:
+        df[col] = df[col].replace({"<NA>": np.nan, "NaN": np.nan, "nan": np.nan, "None": np.nan, "": np.nan})
+    
+    return _coerce_csv_dtypes(df)
+
+
+def upgrade_csv_schema_if_needed(path: str) -> None:
+    if not os.path.exists(path):
+        return
+    import pandas as pd
+    try:
+        df = pd.read_csv(path, encoding="utf-8-sig")
+    except Exception:
+        return
+    need_cols = {"p_thr_used","p_thr_src","edge_at_entry","p_meta_raw","p_meta2_raw","p_blend","blend_w","calib_src"}  # ← NEW
+    missing = [c for c in need_cols if c not in df.columns]
+    if not missing:
+        return
+    # добавим недостающие с пустыми значениями и перезапишем
+    for c in missing:
+        if c in ("p_thr_src","calib_src"):
+            df[c] = ""
+        else:
+            df[c] = float("nan")
+    # упорядочим по новой схеме
+    cols = [c for c in CSV_COLUMNS if c in df.columns] + [c for c in CSV_COLUMNS if c not in df.columns]
+    df = df.reindex(columns=cols)
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def _period_return_pct(df: pd.DataFrame, start_ts: int, now_ts: int) -> Optional[float]:
+    if df.empty:
+        return None
+    df = df.sort_values("settled_ts")
+    df_in = df[df["settled_ts"] >= start_ts]
+    if df_in.empty:
+        return None
+    before_df = df[df["settled_ts"] < start_ts]
+    if not before_df.empty:
+        base_cap = float(before_df.iloc[-1]["capital_after"])
+    else:
+        base_cap = float(df_in.iloc[0]["capital_before"])
+    end_cap = float(df.iloc[-1]["capital_after"])
+    if base_cap <= 0:
+        return None
+    return (end_cap - base_cap) / base_cap * 100.0
+
+def compute_extended_stats_from_csv(path: str) -> Dict[str, Any]:
+    """Расширенная статистика с риск-метриками и текущим состоянием"""
+    df = _read_csv_df(path)
+    if df.empty:
+        return dict(total=0, wins=0, losses=0, winrate=None, roi_24h=None, roi_7d=None, roi_30d=None,
+                   max_dd=None, profit_factor=None, current_streak=None, avg_edge=None,
+                   avg_win=None, avg_loss=None, win_loss_ratio=None, sharpe=None,
+                   last_trade_ago_min=None, skip_stats=None, gas_efficiency=None)
+    
+    df = df.dropna(subset=["outcome"])
+    df_tr = df[df["outcome"].isin(["win","loss"])]
+    
+    # Базовые метрики
+    wins = int((df_tr["outcome"] == "win").sum())
+    losses = int((df_tr["outcome"] == "loss").sum())
+    total = wins + losses
+    winrate = (wins / total * 100.0) if total > 0 else None
+    
+    now_ts = int(time.time())
+    roi_24 = _period_return_pct(df, now_ts - 24*3600, now_ts)
+    roi_7d = _period_return_pct(df, now_ts - 7*24*3600, now_ts)
+    roi_30 = _period_return_pct(df, now_ts - 30*24*3600, now_ts)
+    
+    # === НОВЫЕ МЕТРИКИ ===
+    
+    # 1. Max Drawdown
+    max_dd = None
+    dd_peak = None
+    dd_trough = None
+    try:
+        caps = pd.to_numeric(df_tr["capital_after"], errors="coerce").dropna()
+        if len(caps) > 0:
+            peak = caps.iloc[0]
+            max_drawdown = 0.0
+            peak_val = peak
+            trough_val = peak
+            for cap in caps:
+                if cap > peak:
+                    peak = cap
+                    peak_val = cap
+                dd = (cap - peak) / peak if peak > 0 else 0.0
+                if dd < max_drawdown:
+                    max_drawdown = dd
+                    trough_val = cap
+            max_dd = max_drawdown * 100.0
+            dd_peak = float(peak_val)
+            dd_trough = float(trough_val)
+    except Exception:
+        log_exception("metrics_dashboard: drawdown calc failed")
+    
+    # 2. Profit Factor
+    profit_factor = None
+    try:
+        pnls = pd.to_numeric(df_tr["pnl"], errors="coerce").dropna()
+        wins_sum = pnls[pnls > 0].sum()
+        losses_sum = abs(pnls[pnls < 0].sum())
+        if losses_sum > 0:
+            profit_factor = wins_sum / losses_sum
+    except Exception:
+        log_exception("metrics_dashboard: profit factor calc failed")
+    
+    # 3. Current Streak
+    current_streak = None
+    try:
+        outcomes = df_tr["outcome"].tail(20).tolist()
+        if outcomes:
+            last = outcomes[-1]
+            count = 1
+            for i in range(len(outcomes)-2, -1, -1):
+                if outcomes[i] == last:
+                    count += 1
+                else:
+                    break
+            current_streak = f"{count}{'W' if last == 'win' else 'L'}"
+    except Exception:
+        log_exception("Unhandled exception")
+    
+    # 4. Average Edge
+    avg_edge = None
+    edge_realized = None
+    try:
+        edges = pd.to_numeric(df_tr["edge_at_entry"], errors="coerce").dropna()
+        if len(edges) > 0:
+            avg_edge = float(edges.mean())
+            # Реализованный edge = фактический винрейт vs ожидаемый
+            if winrate is not None and len(edges) > 0:
+                expected_wr = (edges.mean() + 0.5) * 100  # грубая оценка
+                edge_realized = winrate - expected_wr
+    except Exception:
+        log_exception("Unhandled exception")
+    
+    # 5. Avg Win/Loss
+    avg_win = None
+    avg_loss = None
+    win_loss_ratio = None
+    try:
+        pnls = pd.to_numeric(df_tr["pnl"], errors="coerce").dropna()
+        wins_pnl = pnls[pnls > 0]
+        losses_pnl = pnls[pnls < 0]
+        if len(wins_pnl) > 0:
+            avg_win = float(wins_pnl.mean())
+        if len(losses_pnl) > 0:
+            avg_loss = float(losses_pnl.mean())
+        if avg_win and avg_loss and avg_loss != 0:
+            win_loss_ratio = avg_win / abs(avg_loss)
+    except Exception:
+        log_exception("Unhandled exception")
+    
+    # 6. Sharpe Ratio (24h, annualized)
+    sharpe = None
+    try:
+        df_24h = df_tr[pd.to_numeric(df_tr["settled_ts"], errors="coerce") >= (now_ts - 24*3600)]
+        if len(df_24h) >= 10:
+            pnls = pd.to_numeric(df_24h["pnl"], errors="coerce").dropna()
+            caps = pd.to_numeric(df_24h["capital_before"], errors="coerce").dropna()
+            if len(pnls) > 0 and len(caps) > 0:
+                returns = (pnls / caps).dropna()
+                if len(returns) >= 10 and returns.std() > 0:
+                    # Аннуализация: √(365*24*60/5) для 5-минутных раундов
+                    periods_per_year = 365 * 24 * 60 / 5
+                    sharpe = (returns.mean() / returns.std()) * np.sqrt(periods_per_year)
+    except Exception:
+        log_exception("Unhandled exception")
+    
+    # 7. Last Trade Time
+    last_trade_ago_min = None
+    try:
+        last_ts = pd.to_numeric(df_tr["settled_ts"], errors="coerce").dropna().iloc[-1]
+        last_trade_ago_min = (now_ts - last_ts) / 60.0
+    except Exception:
+        log_exception("Unhandled exception")
+    
+    # 8. Skip Statistics
+    skip_stats = None
+    try:
+        all_rows = df.copy()
+        skipped = all_rows[all_rows["outcome"].isin(["skipped"])]
+        total_epochs = len(all_rows)
+        skip_count = len(skipped)
+        if total_epochs > 0:
+            skip_rate = skip_count / total_epochs * 100
+            skip_stats = {
+                "total": skip_count,
+                "rate": skip_rate,
+                "reasons": {}
+            }
+            # Подсчёт по причинам (если есть колонка reason)
+            # Это требует модификации CSV, пока пропустим детали
+    except Exception:
+        log_exception("Unhandled exception")
+    
+    # 9. Gas Efficiency
+    gas_efficiency = None
+    try:
+        gas_bet = pd.to_numeric(df_tr["gas_bet_bnb"], errors="coerce").dropna()
+        gas_claim = pd.to_numeric(df_tr["gas_claim_bnb"], errors="coerce").dropna()
+        stakes = pd.to_numeric(df_tr["stake"], errors="coerce").dropna()
+        if len(gas_bet) > 0 and len(stakes) > 0:
+            total_gas = (gas_bet + gas_claim).mean()
+            avg_stake = stakes.mean()
+            if avg_stake > 0:
+                gas_efficiency = {
+                    "avg_gas": float(total_gas),
+                    "gas_stake_ratio": float(total_gas / avg_stake * 100)
+                }
+    except Exception:
+        log_exception("Unhandled exception")
+    
+    return dict(
+        total=total, wins=wins, losses=losses, winrate=winrate,
+        roi_24h=roi_24, roi_7d=roi_7d, roi_30d=roi_30,
+        max_dd=max_dd, dd_peak=dd_peak, dd_trough=dd_trough,
+        profit_factor=profit_factor,
+        current_streak=current_streak,
+        avg_edge=avg_edge, edge_realized=edge_realized,
+        avg_win=avg_win, avg_loss=avg_loss, win_loss_ratio=win_loss_ratio,
+        sharpe=sharpe,
+        last_trade_ago_min=last_trade_ago_min,
+        skip_stats=skip_stats,
+        gas_efficiency=gas_efficiency
+    )
+
+
+def compute_stats_from_csv(path: str) -> Dict[str, Optional[float]]:
+    df = _read_csv_df(path)
+    if df.empty:
+        return dict(total=0, wins=0, losses=0, winrate=None, roi_24h=None, roi_7d=None, roi_30d=None)
+    df = df.dropna(subset=["outcome"])
+    df_tr = df[df["outcome"].isin(["win","loss"])]
+    wins = int((df_tr["outcome"] == "win").sum())
+    losses = int((df_tr["outcome"] == "loss").sum())
+    total = wins + losses
+    winrate = (wins / total * 100.0) if total > 0 else None
+
+    now_ts = int(time.time())
+    roi_24 = _period_return_pct(df, now_ts - 24*3600, now_ts)
+    roi_7d = _period_return_pct(df, now_ts - 7*24*3600, now_ts)
+    roi_30 = _period_return_pct(df, now_ts - 30*24*3600, now_ts)
+
+    return dict(total=total, wins=wins, losses=losses, winrate=winrate, roi_24h=roi_24, roi_7d=roi_7d, roi_30d=roi_30)
+
+def print_stats(stats: Dict[str, Optional[float]]):
+    wr = "—" if stats["winrate"] is None else f"{stats['winrate']:.2f}%"
+    r24 = "—" if stats["roi_24h"] is None else f"{stats['roi_24h']:.2f}%"
+    r7  = "—" if stats["roi_7d"]  is None else f"{stats['roi_7d']:.2f}%"
+    r30 = "—" if stats["roi_30d"] is None else f"{stats['roi_30d']:.2f}%"
+    print(f"[stats] trades={stats['total']}  wins={stats['wins']}  losses={stats['losses']}  winrate={wr}  "
+          f"ROI: 24h={r24} | 7d={r7} | 30d={r30}")
+
+def last3_ev_estimates(path: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    df = _read_csv_df(path)
+    if df.empty:
+        return None, None, None
+    df = df.dropna(subset=["outcome"]).sort_values("settled_ts")
+    df = df[df["outcome"].isin(["win","loss","draw"])]
+    tail = df.tail(3)
+    r_vals = pd.to_numeric(tail.get("payout_ratio", pd.Series(dtype=float)), errors="coerce").dropna().values
+    gb_vals = pd.to_numeric(tail.get("gas_bet_bnb", pd.Series(dtype=float)), errors="coerce").dropna().values
+    gc_vals = pd.to_numeric(tail.get("gas_claim_bnb", pd.Series(dtype=float)), errors="coerce").dropna().values
+    r_med = float(np.median(r_vals)) if len(r_vals) else None
+    gb_med = float(np.median(gb_vals)) if len(gb_vals) else None
+    gc_med = float(np.median(gc_vals)) if len(gc_vals) else None
+    return r_med, gb_med, gc_med
+
+
+def r_ewma_by_side(path: str, side_up: bool, alpha: float = 0.25,
+                   max_epoch_exclusive: Optional[int] = None) -> Optional[float]:
+    """
+    Основная оценка r̂ без заглядывания: EWMA(λ=alpha) по payout_ratio прошлых сеттлов на нужной стороне.
+    """
+    df = _read_csv_df(path)
+    if df.empty:
+        return None
+    df = df.dropna(subset=["outcome"]).sort_values("settled_ts")
+    df = df[df["outcome"].isin(["win","loss","draw"])]
+    if max_epoch_exclusive is not None and "epoch" in df.columns:
+        try:
+            df = df[df["epoch"] < int(max_epoch_exclusive)]
+        except Exception:
+            log_exception("r_ewma_by_side: invalid max_epoch_exclusive")
+    if df.empty:
+        return None
+    side_series = df.get("side", pd.Series(dtype="string")).astype(str).str.upper()
+    df = df[side_series == ("UP" if side_up else "DOWN")]
+    if df.empty:
+        return None
+    r = pd.to_numeric(df.get("payout_ratio", pd.Series(dtype=float)), errors="coerce").dropna()
+    if r.empty:
+        return None
+    # EWMA с alpha=λ (adjust=False, чтобы не заглядывать назад «по-теоретически»)
+    ew = r.ewm(alpha=float(alpha), adjust=False).mean()
+    val = float(ew.iloc[-1])
+    if not np.isfinite(val) or val <= 1.0:
+        return None
+    return val
+
+
+def r_tod_percentile(path: str, side_up: bool, hour_utc: Optional[int] = None, q: float = 0.50,
+                     max_epoch_exclusive: Optional[int] = None) -> Optional[float]:
+    """
+    Бэкап-оценка r̂: перцентиль payout_ratio по текущему часу суток (UTC) на стороне.
+    Если выборка часа слишком мала, берём перцентиль по всей истории.
+    """
+    df = _read_csv_df(path)
+    if df.empty:
+        return None
+    df = df.dropna(subset=["outcome"]).sort_values("settled_ts")
+    df = df[df["outcome"].isin(["win","loss","draw"])]
+    if max_epoch_exclusive is not None and "epoch" in df.columns:
+        try:
+            df = df[df["epoch"] < int(max_epoch_exclusive)]
+        except Exception:
+            log_exception("Unhandled exception")
+    if df.empty:
+        return None
+    side_series = df.get("side", pd.Series(dtype="string")).astype(str).str.upper()
+    df = df[side_series == ("UP" if side_up else "DOWN")]
+    if df.empty:
+        return None
+
+    ts_col = None
+    for c in ["lock_ts", "open_ts", "settled_ts"]:
+        if c in df.columns:
+            ts_col = c
+            break
+    if ts_col is None:
+        return None
+
+    ts = pd.to_numeric(df[ts_col], errors="coerce")
+    df = df.assign(_ts=ts)
+    df = df[np.isfinite(df["_ts"])]
+    if df.empty:
+        return None
+
+    hours = pd.to_datetime(df["_ts"], unit="s", utc=True).dt.hour
+    df = df.assign(_hour=hours)
+
+    if hour_utc is None:
+        try:
+            hour_utc = int(pd.Timestamp.utcnow().hour)
+        except Exception:
+            hour_utc = 0
+
+    same_hour = df[df["_hour"] == int(hour_utc)]
+    r_ser = pd.to_numeric(same_hour.get("payout_ratio", pd.Series(dtype=float)), errors="coerce").dropna()
+    if r_ser.size < 5:
+        r_ser = pd.to_numeric(df.get("payout_ratio", pd.Series(dtype=float)), errors="coerce").dropna()
+    if r_ser.empty:
+        return None
+
+    q = float(min(max(q, 0.0), 1.0))
+    val = float(np.quantile(r_ser.to_numpy(), q))
+    if not np.isfinite(val) or val <= 1.0:
+        return None
+    return val
+
+
+def rolling_winrate_laplace(path: str, n: int = 50, max_epoch_exclusive: Optional[int] = None) -> Optional[float]:
+    """
+    Laplace-сглажённый винрейт по последним n закрытым сделкам ДО текущего раунда.
+    Возвращает значение в [0,1] или None, если выборка пуста.
+    """
+    df = _read_csv_df(path)
+    if df.empty:
+        return None
+    df = df.dropna(subset=["outcome"]).sort_values("settled_ts")
+    df = df[df["outcome"].isin(["win","loss"])]
+    if max_epoch_exclusive is not None and "epoch" in df.columns:
+        try:
+            df = df[df["epoch"] < int(max_epoch_exclusive)]
+        except Exception:
+            log_exception("Unhandled exception")
+    if df.empty:
+        return None
+    tail = df.tail(int(n))
+    wins = int((tail["outcome"] == "win").sum())
+    total = int(len(tail))
+    if total <= 0:
+        return None
+    # Laplace smoothing: (wins + 1) / (total + 2)
+    return (wins + 1.0) / (total + 2.0)
+
+# НОВОЕ: масштаб в просадке — f ← f * max(0.25, 1 - DD/0.30)
+def _dd_scale_factor(path: str) -> float:
+    try:
+        df = _read_csv_df(path)
+    except Exception:
+        return 1.0
+    if df.empty:
+        return 1.0
+    df = df.sort_values("settled_ts")
+    eq = pd.to_numeric(df.get("capital_after", pd.Series(dtype=float)), errors="coerce").dropna().to_numpy()
+    if eq.size == 0:
+        return 1.0
+    peak = float(np.nanmax(eq))
+    last = float(eq[-1])
+    if peak <= 0:
+        return 1.0
+    dd = max(0.0, (peak - last) / peak)
+    return float(max(0.25, 1.0 - dd / 0.30))
+
+
+def implied_payout_ratio(side_up: bool, rd: RoundInfo, fee: float = TREASURY_FEE) -> Optional[float]:
+    total = float(rd.bull_amount + rd.bear_amount)
+    side_amt = float(rd.bull_amount if side_up else rd.bear_amount)
+    if side_amt <= 0.0 or total <= 0.0:
+        return None
+    
+    ratio = (total / side_amt) * (1.0 - fee)
+    
+    # Валидация: разумный диапазон для payout ratio
+    # Нижний предел: 1.1 (минимальная выгода)
+    # Верхний предел: 5.0 (защита от аномалий при малых пулах)
+    return float(np.clip(ratio, 1.1, 5.0))
+
+
+# === KPI: число закрытых и «тишина» 1ч ===
+def settled_trades_count(path: str) -> int:
+    df = _read_csv_df(path)
+    if df.empty:
+        return 0
+    df = df.dropna(subset=["outcome"])
+    df = df[df["outcome"].isin(["win","loss","draw"])]
+    return int(len(df))
+
+def had_trade_in_last_hours(path: str, hours: float = 1.0) -> bool:
+    df = _read_csv_df(path)
+    if df.empty:
+        return False
+    df = df.dropna(subset=["outcome"])
+    df = df[df["outcome"].isin(["win","loss","draw"])]
+    if df.empty:
+        return False
+    now_ts = int(time.time())
+    cutoff = now_ts - int(hours * 3600)
+    ts = pd.to_numeric(df.get("settled_ts", pd.Series(dtype=float)), errors="coerce").dropna()
+    return bool((ts >= cutoff).any())
+
+def count_trades_last_hour(path: str, hours: float = 1.0) -> int:
+    """Возвращает количество завершённых сделок за последний час."""
+    df = _read_csv_df(path)
+    if df.empty:
+        return 0
+    df = df.dropna(subset=["outcome"])
+    df = df[df["outcome"].isin(["win","loss","draw"])]
+    if df.empty:
+        return 0
+    now_ts = int(time.time())
+    cutoff = now_ts - int(hours * 3600)
+    ts = pd.to_numeric(df.get("settled_ts", pd.Series(dtype=float)), errors="coerce").dropna()
+    return int((ts >= cutoff).sum())
+
+# =============================
+# ПЕРСИСТЕНТНОСТЬ КАПИТАЛА
+# =============================
+def _restore_capital_from_csv(path: str) -> Optional[float]:
+    """
+    Возвращает capital_after из последней завершённой строки CSV.
+    Если нет ни одной завершённой — пытается взять последнюю capital_before.
+    Если CSV отсутствует/пуст — возвращает None.
+    """
+    try:
+        df = _read_csv_df(path)
+        if df.empty:
+            return None
+        # Берём только строки с outcome и capital_after
+        df2 = df.dropna(subset=["outcome", "capital_after"])
+        df2 = df2[df2["outcome"].isin(["win","loss","draw"])]
+        if not df2.empty:
+            cap = float(df2.iloc[-1]["capital_after"])
+            if math.isfinite(cap) and cap > 0:
+                return cap
+        # Фолбэк — capital_before
+        df3 = df.dropna(subset=["capital_before"])
+        if not df3.empty:
+            cap = float(df3.iloc[-1]["capital_before"])
+            if math.isfinite(cap) and cap > 0:
+                return cap
+        return None
+    except Exception as e:
+        get_logger().warning("failed to restore capital from CSV", exc_info=True)
+        return None
+
+
+class CapitalState:
+    def __init__(self, path: str = "capital_state.json"):
+        self.path = path
+
+    def load(self, default: float) -> float:
+        try:
+            with open(self.path, "r") as f:
+                obj = json.load(f)
+            cap = float(obj.get("capital", default))
+            if not math.isfinite(cap) or cap <= 0:
+                return default
+            return cap
+        except Exception:
+            return default
+
+    def save(self, capital: float, ts: Optional[int] = None) -> None:
+        try:
+            obj = {"capital": float(capital), "ts": int(ts or time.time())}
+            with open(self.path, "w") as f:
+                json.dump(obj, f)
+        except Exception as e:
+            get_logger().error("failed to save capital_state", exc_info=True)
+
+
+
+# =============================
+# Telegram
+
+# --- Telegram helpers ---
+def _html_safe_allow_basic(text: str) -> str:
+    """
+    Экранируем всё, но разрешаем базовые теги, которые ты можешь оставить в шаблоне:
+    <b>, </b>, <i>, </i>, <code>, </code>, <pre>, </pre>.
+    ВАЖНО: динамические значения (числа, массивы) вставляй "сырыми" — эта функция их экранирует.
+    """
+    s = escape(text, quote=False)  # превращает &, <, > в сущности
+    # Разрешаем базовые теги обратно (если они были в шаблонной части строки)
+    allow = {
+        "&lt;b&gt;": "<b>", "&lt;/b&gt;": "</b>",
+        "&lt;i&gt;": "<i>", "&lt;/i&gt;": "</i>",
+        "&lt;code&gt;": "<code>", "&lt;/code&gt;": "</code>",
+        "&lt;pre&gt;": "<pre>", "&lt;/pre&gt;": "</pre>",
+    }
+    for k, v in allow.items():
+        s = s.replace(k, v)
+    return s
+
+def tg_send(text: str, html: bool = True, **kwargs) -> bool:
+    """
+    Отправляет сообщение в TG. По умолчанию HTML-режим с автоэкранированием.
+    Возвращает True/False, не бросает исключения (чтобы не ронять основной цикл).
+    """
+    global _TG_FAILS, _TG_MUTED_UNTIL, _TG_LAST_ERR
+    # --- мост: берём токен/чат либо из ENV (TG_*), либо из констант (TELEGRAM_*) ---
+    token = (TG_TOKEN.strip() if 'TG_TOKEN' in globals() and TG_TOKEN else
+             (TELEGRAM_BOT_TOKEN.strip() if 'TELEGRAM_BOT_TOKEN' in globals() and TELEGRAM_BOT_TOKEN else ""))
+    chat_id = (TG_CHAT_ID if 'TG_CHAT_ID' in globals() and TG_CHAT_ID else
+               (int(str(TELEGRAM_CHAT_ID).strip()) if 'TELEGRAM_CHAT_ID' in globals() and TELEGRAM_CHAT_ID else 0))
+
+    # ранний выход: Телега выключена или нет токена/чата
+    if not TELEGRAM_ENABLED or not token or not chat_id:
+        return False
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    now = time.time()
+
+    # cooldown/half-open вместо вечного mute
+    if _TG_FAILS >= TG_MUTE_AFTER:
+        if now < _TG_MUTED_UNTIL:
+            print(f"[tg ] muted; until {time.strftime('%H:%M:%S', time.localtime(_TG_MUTED_UNTIL))} ({_TG_LAST_ERR})")
+            return False
+        # half-open: разрешаем одну пробу
+
+    try:
+        if html:
+            payload = {
+                "chat_id": chat_id,  # ← используем вычисленный chat_id
+                "text": _html_safe_allow_basic(text),
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+        else:
+            payload = {
+                "chat_id": chat_id,  # ← и здесь тоже
+                "text": text,
+                "disable_web_page_preview": True,
+            }
+
+        r = SESSION.post(url, json=payload, timeout=(3.05, 5))
+        if r.status_code == 400 and html:
+            payload.pop("parse_mode", None)
+            payload["text"] = text
+            r = SESSION.post(url, json=payload, timeout=(3.05, 5))
+        if r.status_code >= 400:
+            try:
+                desc = r.json().get("description", r.text)
+            except Exception:
+                desc = r.text
+            raise RequestException(f"{r.status_code} {desc}")
+        _TG_FAILS = 0
+        _TG_MUTED_UNTIL = 0.0
+        _TG_LAST_ERR = ""
+        return True
+
+
+    except RequestException as e:
+        _TG_FAILS += 1
+        _TG_LAST_ERR = str(e)
+        if _TG_FAILS >= TG_MUTE_AFTER:
+            _TG_MUTED_UNTIL = time.time() + TG_COOLDOWN_S
+            print(f"[tg ] muted after {_TG_FAILS} fails for {TG_COOLDOWN_S}s ({_TG_LAST_ERR})")
+            return False
+        else:
+            print(f"[tg ] send failed ({_TG_FAILS}/{TG_MUTE_AFTER}): {_TG_LAST_ERR}")
+        return False
+
+
+
+# --- TG utils: HTML escape + чанкование для 4096-лимита
+def _tg_html_escape(s: str) -> str:
+    if s is None: return ""
+    # Минимум: &, <, >. Кавычки экранировать не обязательно для <pre><code>
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def tg_send_chunks(text: str, chat_id: str = TELEGRAM_CHAT_ID, parse_mode: str = "HTML"):
+    """
+    Дробит длинные сообщения < 4096 символов и шлёт по частям.
+    """
+    if not TELEGRAM_ENABLED:
+        return
+    MAX = 4000  # запас от 4096 из-за HTML-энтити
+    parts = [text[i:i+MAX] for i in range(0, len(text), MAX)] or [text]
+    for idx, part in enumerate(parts, 1):
+        suffix = f" ({idx}/{len(parts)})" if len(parts) > 1 else ""
+        try:
+            tg_send(part + suffix, html=(str(parse_mode).upper() == "HTML"))
+        except Exception as e:
+            # не валим основной цикл из-за телеги
+            print(f"[tg ] send failed: {e}")
+            continue
+
+def notify_ev_decision(title: str,
+                       epoch: int,
+                       side_txt: str,
+                       p_side: float,
+                       p_thr: float,
+                       p_thr_src: str,
+                       r_hat: float,
+                       gb_hat: float,
+                       gc_hat: float,
+                       stake: float,
+                       delta15: float = None,
+                       extra_lines: list = None,
+                       delta_eff: float | None = None):
+    """
+    Отправляет компактное уведомление с полным разбором порога.
+    """
+    try:
+        # Безопасная конвертация всех параметров
+        d = _as_float(DELTA_PROTECT if (delta_eff is None) else delta_eff, 0.0)
+        p_side = _as_float(p_side, 0.5)
+        p_thr = _as_float(p_thr, 0.5)
+        r_hat = _as_float(r_hat, 1.9)
+        gb_hat = _as_float(gb_hat, 0.0)
+        gc_hat = _as_float(gc_hat, 0.0)
+        stake = _as_float(stake, 0.0)
+
+        head = f"<b>{_tg_html_escape(str(title))}</b> — epoch <code>{int(epoch)}</code>\n"
+        lines = [
+            f"side:       {str(side_txt)}",
+            f"p_side:     {p_side:.4f}",
+            f"p_thr:      {p_thr:.4f}  [{str(p_thr_src)}]",
+            f"p_thr+δ:    {(p_thr + d):.4f}  (δ={d:.2f})",
+            f"edge:       {p_side - (p_thr + d):+.4f}",
+            f"r_hat:      {r_hat:.6f}",
+            f"gb_hat:     {gb_hat:.8f}  (BNB)",
+            f"gc_hat:     {gc_hat:.8f}  (BNB)",
+            f"S (stake):  {stake:.6f}    (BNB)",
+        ]
+        
+        if USE_STRESS_R15 and delta15 is not None:
+            _d = _as_float(delta15, 0.0)
+            if _d > 1e6:
+                _d /= 1e18
+            if math.isfinite(_d):
+                lines.append(f"Δ15_med:   {_d:.6f}  (BNB)")
+
+        if extra_lines:
+            for x in extra_lines:
+                if x:
+                    lines.append(str(x))
+
+        block = "<pre><code>" + _tg_html_escape("\n".join(lines)) + "</code></pre>"
+        tg_send_chunks(head + block, parse_mode="HTML")
+    except Exception as e:
+        print(f"[tg ] notify_ev_decision failed: {e}")
+
+
+def _fmt_pct(x: Optional[float]) -> str:
+    if x is None or not isinstance(x, (float, int)) or not math.isfinite(float(x)):
+        return "—"
+    return f"{x:.2f}%"
+
+def _period_winrate(df: pd.DataFrame, start_ts: int, end_ts: int) -> Optional[float]:
+    sub = df[(df["settled_ts"] >= start_ts) & (df["settled_ts"] < end_ts)]
+    sub = sub[sub["outcome"].isin(["win","loss"])]
+    n = len(sub)
+    if n == 0:
+        return None
+    wins = int((sub["outcome"] == "win").sum())
+    return wins / n * 100.0
+
+def winrate_explanation(path: str) -> str:
+    df = _read_csv_df(path)
+    if df.empty:
+        return "Объяснение: данных ещё нет."
+    now_ts = int(time.time())
+    last24 = _period_winrate(df, now_ts - 24*3600, now_ts)
+    prev24 = _period_winrate(df, now_ts - 48*3600, now_ts - 24*3600)
+    note_parts = []
+    if last24 is None:
+        return "Объяснение: за последние 24ч нет закрытых сделок."
+    if prev24 is None:
+        note_parts.append("База сравнения пустая — смотрим только текущие 24ч.")
+        prev24 = last24
+    diff = last24 - prev24
+    direction = "вырос" if diff > 0 else ("упал" if diff < 0 else "без изменений")
+    note_parts.append(f"Винрейт {direction} на {abs(diff):.2f} п.п. (текущие 24ч: {last24:.2f}%, предыдущие 24ч: {prev24:.2f}%).")
+    def _avg(series):
+        s = pd.to_numeric(series, errors="coerce").dropna()
+        return float(s.mean()) if len(s) else None
+    cur_df = df[(df["settled_ts"] >= now_ts - 24*3600) & (df["outcome"].isin(["win","loss"]))]
+    prv_df = df[(df["settled_ts"] >= now_ts - 48*3600) & (df["settled_ts"] < now_ts - 24*3600) & (df["outcome"].isin(["win","loss"]))]
+    avg_p_cur = _avg(cur_df.get("p_up", pd.Series(dtype=float)))
+    avg_p_prv = _avg(prv_df.get("p_up", pd.Series(dtype=float)))
+    med_r_cur = pd.to_numeric(cur_df.get("payout_ratio", pd.Series(dtype=float)), errors="coerce").dropna()
+    med_r_cur = float(np.median(med_r_cur)) if len(med_r_cur) else None
+    med_r_prv = pd.to_numeric(prv_df.get("payout_ratio", pd.Series(dtype=float)), errors="coerce").dropna()
+    med_r_prv = float(np.median(med_r_prv)) if len(med_r_prv) else None
+    n_cur = len(cur_df)
+    if avg_p_cur is not None and avg_p_prv is not None and abs(avg_p_cur - avg_p_prv) >= 0.01:
+        note_parts.append(f"Средняя p_up изменилась на {avg_p_cur-avg_p_prv:+.3f} (было {avg_p_prv:.3f} → стало {avg_p_cur:.3f}).")
+    if med_r_cur is not None and med_r_prv is not None and abs(med_r_cur - med_r_prv) >= 0.02:
+        note_parts.append(f"Медианный payout изменился на {med_r_cur-med_r_prv:+.2f} (было {med_r_prv:.2f} → стало {med_r_cur:.2f}).")
+    if n_cur < 10:
+        note_parts.append(f"Выборка за 24ч мала (n={n_cur}), возможен шум.")
+    return " ".join(note_parts)
+
+def build_stats_message(stats: Dict[str, Optional[float]]) -> str:
+    wr = "—" if stats["winrate"] is None else f"{stats['winrate']:.2f}%"
+    r24 = "—" if stats["roi_24h"] is None else f"{stats['roi_24h']:.2f}%"
+    r7  = "—" if stats["roi_7d"]  is None else f"{stats['roi_7d']:.2f}%"
+    r30 = "—" if stats["roi_30d"] is None else f"{stats['roi_30d']:.2f}%"
+    wins = stats.get("wins", 0)
+    losses = stats.get("losses", 0)
+    total = stats.get("total", 0)
+
+    # Reserve balance
+    try:
+        from reserve_fund import ReserveFund
+        _reserve_path = os.path.join(os.path.dirname(__file__), "reserve_state.json")
+        _rf = ReserveFund(path=_reserve_path)
+        reserve_line = f"Reserve: <b>{_rf.balance:.6f} BNB</b>\n"
+    except Exception:
+        reserve_line = ""
+    
+    # r̂ accuracy
+    r_hat_line = ""
+    try:
+        from r_hat_improved import analyze_r_hat_accuracy
+        acc = analyze_r_hat_accuracy(CSV_PATH, n=200)
+        if acc and acc.get("n_samples", 0) >= 20:
+            mae = acc["mae_pct"]
+            bias = acc["bias_pct"]
+            n = acc["n_samples"]
+            r_hat_line = f"r̂ accuracy: MAE={mae:.1f}%, bias={bias:+.1f}% (n={n})\n"
+    except Exception:
+        log_exception("Failed to import analyze_r_hat_accuracy")
+    
+    # === НОВЫЕ МЕТРИКИ ===
+    
+    # Max Drawdown
+    dd_line = ""
+    if stats.get("max_dd") is not None:
+        dd = stats["max_dd"]
+        peak = stats.get("dd_peak", 0)
+        trough = stats.get("dd_trough", 0)
+        dd_line = f"Max DD: <b>{dd:+.2f}%</b> (peak: {peak:.3f} → trough: {trough:.3f})\n"
+    
+    # Profit Factor & Win/Loss
+    pf_line = ""
+    if stats.get("profit_factor"):
+        pf = stats["profit_factor"]
+        pf_line = f"Profit Factor: <b>{pf:.2f}</b>"
+        if stats.get("avg_win") and stats.get("avg_loss"):
+            avg_w = stats["avg_win"]
+            avg_l = stats["avg_loss"]
+            wl_ratio = stats.get("win_loss_ratio", 0)
+            pf_line += f" | Avg W/L: {avg_w:+.4f} / {avg_l:+.4f} ({wl_ratio:.2f}x)\n"
+        else:
+            pf_line += "\n"
+    
+    # Current Streak & Last Trade
+    streak_line = ""
+    if stats.get("current_streak"):
+        streak = stats["current_streak"]
+        streak_line = f"Streak: <b>{streak}</b>"
+        if stats.get("last_trade_ago_min") is not None:
+            ago = stats["last_trade_ago_min"]
+            if ago < 60:
+                streak_line += f" | Last: {ago:.0f}m ago"
+            else:
+                streak_line += f" | Last: {ago/60:.1f}h ago"
+        streak_line += "\n"
+    
+    # Average Edge
+    edge_line = ""
+    if stats.get("avg_edge") is not None:
+        edge = stats["avg_edge"]
+        edge_line = f"Avg Edge: <b>{edge:+.4f}</b>"
+        if stats.get("edge_realized") is not None:
+            realized = stats["edge_realized"]
+            edge_line += f" (реализация: {realized:+.1f} п.п.)"
+        edge_line += "\n"
+    
+    # Sharpe Ratio
+    sharpe_line = ""
+    if stats.get("sharpe") is not None:
+        sharpe = stats["sharpe"]
+        sharpe_line = f"Sharpe (24h): <b>{sharpe:.2f}</b>\n"
+    
+    # Gas Efficiency
+    gas_line = ""
+    if stats.get("gas_efficiency"):
+        ge = stats["gas_efficiency"]
+        gas_line = f"Gas: {ge['avg_gas']:.6f} BNB/trade ({ge['gas_stake_ratio']:.2f}% of stake)\n"
+    
+    msg = (f"<b>Статистика</b>\n"
+           f"Trades: {total} | Wins: {wins} | Losses: {losses}\n"
+           f"Winrate: <b>{wr}</b>\n"
+           f"ROI: 24h={r24} | 7d={r7} | 30d={r30}\n"
+           f"{reserve_line}"
+           f"{dd_line}"
+           f"{pf_line}"
+           f"{streak_line}"
+           f"{edge_line}"
+           f"{sharpe_line}"
+           f"{gas_line}"
+           f"{r_hat_line}")
+    return msg
+
+
+def send_round_snapshot(prefix: str, extra_lines: List[str]):
+    stats_dict = compute_extended_stats_from_csv(CSV_PATH)
+    stats_msg = build_stats_message(stats_dict)
+    explain = winrate_explanation(CSV_PATH)
+    text = f"{prefix}\n" + "\n".join(extra_lines) + "\n\n" + stats_msg + f"<i>{explain}</i>"
+    tg_send(text)
+
+
+def validate_and_clean_features(x_raw: np.ndarray, feature_name: str = "unknown") -> Optional[np.ndarray]:
+    """
+    Валидирует и очищает фичи от NaN/Inf значений.
+    
+    Args:
+        x_raw: массив фичей
+        feature_name: имя эксперта для логирования
+        
+    Returns:
+        Очищенный массив или None если данные невалидны
+    """
+    if x_raw is None:
+        return None
+    
+    try:
+        x = np.asarray(x_raw, dtype=np.float32)
+        
+        # Проверка на NaN
+        if np.any(np.isnan(x)):
+            nan_count = np.sum(np.isnan(x))
+            print(f"⚠️  [{feature_name}] Found {nan_count} NaN values, replacing with 0")
+            x = np.nan_to_num(x, nan=0.0)
+        
+        # Проверка на Inf
+        if np.any(np.isinf(x)):
+            inf_count = np.sum(np.isinf(x))
+            print(f"⚠️  [{feature_name}] Found {inf_count} Inf values, clipping to ±1e10")
+            x = np.clip(x, -1e10, 1e10)
+        
+        # Проверка на экстремальные значения
+        if np.any(np.abs(x) > 1e15):
+            print(f"⚠️  [{feature_name}] Found extreme values (>1e15), clipping")
+            x = np.clip(x, -1e15, 1e15)
+        
+        return x
+    
+    except Exception as e:
+        print(f"❌ [{feature_name}] Feature validation failed: {e}")
+        return None
+
+
+# =============================
+# ML: КОНФИГИ
+# =============================
+@dataclass
+class MLConfig:
+    # общие пороги гейтинга (как было)
+    min_ready: int = 80
+    enter_wr: float = 0.58      # ✅ БЫЛО 3.0 (300%!) - теперь 58%
+    exit_wr: float = 0.52       # ✅ БЫЛО 1.0 (100%) - теперь 52%
+    retrain_every: int = 40
+    adwin_delta: float = 0.002
+    max_memory: int = 3000          # ИЗМЕНЕНО: было 5000
+    train_window: int = 3000        # ИЗМЕНЕНО: было 1500
+
+    # XGB
+    xgb_model_path: str = "gb_model.json"
+    xgb_scaler_path: str = "gb_scaler.pkl"
+    xgb_state_path: str = "gb_state.json"
+    xgb_cal_path: str = "gb_cal.pkl"                 # 👈 НОВОЕ
+    xgb_calibration_method: str = "platt"   
+    xgb_max_depth: int = 4
+    xgb_eta: float = 0.08
+    xgb_subsample: float = 0.9
+    xgb_colsample_bytree: float = 0.9
+    xgb_min_child_weight: int = 2
+    xgb_rounds_cold: int = 60
+    xgb_rounds_warm: int = 30
+
+    # RF
+    # bnbusdrt6.py, класс MLConfig, строка ~1155
+    # RF
+    rf_model_path: str = "rf_calibrated.pkl"
+    rf_state_path: str = "rf_state.json"
+    rf_cal_path: str = "rf_cal.pkl"  # ✅ ДОБАВИЛИ путь для калибратора RF
+    rf_n_estimators: int = 300
+    rf_max_depth: Optional[int] = None
+    rf_min_samples_leaf: int = 2
+    rf_calibration_method: str = "sigmoid"  # 'sigmoid' или 'isotonic'
+
+    # ARF (River)
+    arf_state_path: str = "arf_state.json"
+    arf_model_path: str = "arf_model.pkl"
+    arf_cal_path: str = "arf_cal.pkl"                # 👈 НОВОЕ
+    arf_calibration_method: str = "platt"
+    arf_n_models: int = 25
+    arf_max_depth: Optional[int] = None
+
+    # NN Expert (MLP)
+    nn_state_path: str = "nn_state.json"
+    nn_model_path: str = "nn_model.pkl"
+    nn_scaler_path: str = "nn_scaler.pkl"
+    nn_hidden: int = 32
+    nn_eta: float = 0.01
+    nn_l2: float = 0.0005
+    nn_epochs: int = 1
+    nn_batch_size: int = 128 
+    nn_retrain_every: int = 100
+    nn_calib_every: int = 200
+    nn_cal_path: str = "nn_cal.pkl"  # Путь для калибратора
+    nn_calibration_method: str = "temperature"  # Метод калибровки (temperature хорош для NN)
+
+    # META
+    meta_state_path: str = "meta_state.json"
+    meta_eta: float = 0.05
+    meta_l2: float = 0.001
+    meta_w_clip: float = 8.0
+    meta_g_clip: float = 1.0
+
+    # NEW: контекстный гейтинг
+    meta_gating_mode: str = "soft"   # "soft" | "exp4"
+    meta_alpha_mix: float = 1.0      # вес смеси логитов экспертов
+    meta_gate_eta: float = 0.02      # шаг для Wg (soft)
+    meta_gate_l2: float = 0.0005     # L2 для Wg
+    meta_gate_clip: float = 5.0      # клип градиента Wg
+
+    # EXP4 вариант (по фазам)
+    meta_exp4_eta: float = 0.10      # темп обновления весов EXP4
+    meta_exp4_phases: int = 6        # число фаз (см. phase_from_ctx)
+
+    use_two_window_drop: bool = False
+# =============================
+# ====== ФАЗОВАЯ ПАМЯТЬ / КАЛИБРОВКА ======
+# ====== ФАЗОВАЯ ПАМЯТЬ / КАЛИБРОВКА ======
+    use_phase_memory: bool = True
+    phase_count: int = 6
+    phase_memory_cap: int = 3000    # ИЗМЕНЕНО: было 10_000
+    phase_min_ready: int = 150
+    phase_mix_global_share: float = 0.30   # если < phase_min_ready: доля глобального хвоста
+    phase_hysteresis_s: int = 300     
+    # META CEM+MC
+    # META CEM+MC / Neural
+    meta_use_cma_es: bool = True
+    meta_enter_wr: float = 0.58
+    meta_exit_wr: float = 0.52
+    meta_min_ready: int = 80
+    meta_weight_decay_days: float = 30.0
+    phase_state_path: str = "phase_state.json"
+    
+    # НОВОЕ: параметры для нейросетевой META
+    meta_mc_n_inference: int = 30         # MC Dropout проходов при предсказании
+    meta_mc_uncertainty_threshold: float = 0.15  # порог uncertainty для коррекции
+    meta_neural_dropout_rates: List[float] = None  # будет [0.20, 0.20, 0.15] по умолчанию
+    meta_state_path: str = "meta_neural_state.json"  # отдельный файл для нейросети
+    
+
+    # CV параметры (общие)
+    cv_enabled: bool = True
+    cv_n_splits: int = 3
+    cv_embargo_pct: float = 0.02
+    cv_purge_pct: float = 0.01
+    cv_min_train_size: int = 150
+    cv_bootstrap_n: int = 1000
+    cv_confidence: float = 0.95
+    cv_min_improvement: float = 0.02
+    cv_oof_window: int = 500
+    cv_check_every: int = 100
+
+
+# ===== Фильтр фазы с гистерезисом =====
+class PhaseFilter:
+    def __init__(self, hysteresis_s: int = 300):
+        self.hysteresis_s = int(max(0, hysteresis_s))
+        self.last_phase: Optional[int] = None
+        self.last_change_ts: Optional[int] = None
+
+    def update(self, phase_raw: int, now_ts: int) -> int:
+        # первый раз — принять как есть
+        if self.last_phase is None:
+            self.last_phase, self.last_change_ts = int(phase_raw), int(now_ts)
+            return self.last_phase
+        # если новая фаза = старая — просто обновим время
+        if int(phase_raw) == int(self.last_phase):
+            self.last_change_ts = int(now_ts)
+            return self.last_phase
+        # если прошло мало времени — «залипаем»
+        if self.last_change_ts is not None and (now_ts - self.last_change_ts) < self.hysteresis_s:
+            return self.last_phase
+        # иначе позволим смениться
+        self.last_phase = int(phase_raw)
+        self.last_change_ts = int(now_ts)
+        return self.last_phase
+
+
+# Базовый интерфейс экспертов
+# =============================
+class _BaseExpert:
+    def proba_up(self, x_raw: np.ndarray, reg_ctx: Optional[dict] = None) -> tuple[Optional[float], str]:
+        raise NotImplementedError
+    def record_result(self, x_raw: np.ndarray, y_up: int, used_in_live: bool, p_pred: Optional[float] = None, reg_ctx: Optional[dict] = None) -> None:
+        raise NotImplementedError
+    def maybe_train(self, ph: Optional[int] = None, reg_ctx: Optional[dict] = None) -> None:
+        pass
+    def status(self) -> Dict[str, str]:
+        return {"mode":"DISABLED", "wr":"—", "n":"0", "enabled":"False"}
+# =============================
+
+# ---------- XGB ----------
+class XGBExpert(_BaseExpert):
+    def __init__(self, cfg: MLConfig):
         self.cfg = cfg
-        self.state_path = getattr(cfg, "meta_state_path", "meta_state.json")
-        self.enabled = True
-        self.mode = "SHADOW"  # Начинаем в shadow режиме для накопления данных
-        self._last_phase = 0  # безопасная инициализация для статусов/логов
+        self.enabled = HAVE_XGB
+        self.mode = "SHADOW"
 
-        # ADWIN для детекции дрейфа концепции
+        # модель XGBoost
+        self.booster = None
+        # скейлер
+        self.scaler: Optional[StandardScaler] = None
+        # детектор дрейфа
         self.adwin = ADWIN(delta=self.cfg.adwin_delta) if HAVE_RIVER else None
 
-        # ===== ФАЗОВАЯ АРХИТЕКТУРА =====
-        self.P = int(getattr(cfg, "meta_exp4_phases", 6))
-        
-        # ИЗМЕНЕНО: Размерность вектора фичей увеличена с 8 до 18
-        self.D = 18
-        
-        # Веса для расширенного вектора фичей (на фазу)
-        self.w_meta_ph = np.zeros((self.P, self.D), dtype=float)
-        
-        # Гиперпараметры оптимизации
-        self.eta = float(getattr(cfg, "meta_eta", 0.05))
-        self.l2 = float(getattr(cfg, "meta_l2", 0.001))
-        self.w_clip = float(getattr(cfg, "meta_w_clip", 8.0))
-        self.g_clip = float(getattr(cfg, "meta_g_clip", 1.0))
+        # ===== глобальная память (хвост) =====
+        self.X: List[List[float]] = []
+        self.y: List[int] = []
+        self.new_since_train = 0
 
-        # ===== КОНТЕКСТНЫЙ ГЕЙТИНГ =====
-        self.gating_mode = getattr(cfg, "meta_gating_mode", "soft")  # "soft" или "exp4"
-        self.alpha_mix = float(getattr(cfg, "meta_alpha_mix", 1.0))
-        self.Wg = None
-        self.g_eta = float(getattr(cfg, "meta_gate_eta", 0.02))
-        self.g_l2 = float(getattr(cfg, "meta_gate_l2", 0.0005))
-        self.gate_clip = float(getattr(cfg, "meta_gate_clip", 5.0))
+        # ===== фазовая память =====
+        self.P = int(self.cfg.phase_count)  # 6 фаз
+        self.X_ph: Dict[int, List[List[float]]] = {p: [] for p in range(self.P)}
+        self.y_ph: Dict[int, List[int]] = {p: [] for p in range(self.P)}
+        self.new_since_train_ph: Dict[int, int] = {p: 0 for p in range(self.P)}
+        self._last_seen_phase: int = 0
 
-        # Для EXP4
-        self.exp4_eta = float(getattr(cfg, "meta_exp4_eta", 0.10))
-        self.exp4_w = None  # np.ndarray (P × K)
+        # ===== фазовые калибраторы =====
+        self.cal_ph: Dict[int, Optional[_BaseCal]] = {p: None for p in range(self.P)}
+        self.cal_global: Optional[_BaseCal] = None  # для обратной совместимости
 
-        # ===== ТРЕКИНГ МЕТРИК ДЛЯ РЕЖИМОВ =====
+        # хиты/диагностика
         self.shadow_hits: List[int] = []
         self.active_hits: List[int] = []
 
-        # ===== БУФЕРЫ ДАННЫХ ПО ФАЗАМ =====
-        self.buf_ph: Dict[int, List[Tuple]] = {p: [] for p in range(self.P)}
-        self.seen_ph: Dict[int, int] = {p: 0 for p in range(self.P)}
-        
-        # Пути к CSV файлам с накопленными данными фаз
-        self._phase_csv_paths: Dict[int, str] = {}
-        base_path = getattr(cfg, "meta_state_path", "meta_state.json")
-        base_dir = os.path.dirname(base_path) or "."
-        base_name = os.path.splitext(os.path.basename(base_path))[0]
-        
-        for p in range(self.P):
-            self._phase_csv_paths[p] = os.path.join(base_dir, f"{base_name}_ph{p}_data.csv")
-
-        # ===== НОВОЕ: CROSS-VALIDATION СТРУКТУРЫ =====
-        cv_window = int(getattr(cfg, "cv_oof_window", 500))
-        self.cv_oof_preds: Dict[int, deque] = {p: deque(maxlen=cv_window) for p in range(self.P)}
-        self.cv_oof_labels: Dict[int, deque] = {p: deque(maxlen=cv_window) for p in range(self.P)}
+        # Cross-validation tracking (per phase)
+        self.cv_oof_preds: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
+        self.cv_oof_labels: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
         self.cv_metrics: Dict[int, Dict] = {p: {} for p in range(self.P)}
         self.cv_last_check: Dict[int, int] = {p: 0 for p in range(self.P)}
+        
+        # Validation mode tracking
         self.validation_passed: Dict[int, bool] = {p: False for p in range(self.P)}
 
-        # ===== ТРЕКИНГ ДЛЯ СОХРАНЕНИЯ =====
-        self._unsaved = 0
-        self._last_save_ts = time.time()
-        
-        # Ссылки на экспертов (опционально)
-        self._experts: List = []
+        self.n_feats: Optional[int] = None
 
-        # ===== ЗАГРУЗКА СОСТОЯНИЯ =====
-        # ===== ЗАГРУЗКА СОСТОЯНИЯ =====
-        self._load()
-
-        # Доп. страховка: нормализация seen_ph даже если в save был старый формат
-        if isinstance(self.seen_ph, list):
-            self.seen_ph = {p: int(self.seen_ph[p] if p < len(self.seen_ph) else 0) for p in range(self.P)}
-        elif isinstance(self.seen_ph, dict):
-            self.seen_ph = {int(k): int(v) for k, v in self.seen_ph.items()}
-            for p in range(self.P):
-                self.seen_ph.setdefault(p, 0)
-
-
-    # ========== СВЯЗЫВАНИЕ С ЭКСПЕРТАМИ ==========
-    def settle(self, *args, **kwargs):
-        """
-        Алиас для record_result() (обратная совместимость с legacy кодом).
-        """
+        # загрузка калибратора (глобального) и стейтов
         try:
-            return self.record_result(*args, **kwargs)
-        except Exception as e:
-            print(f"[ens ] meta.settle error: {e.__class__.__name__}: {e}\n{traceback.format_exc()}")
+            self.cal_global = _BaseCal.load(self.cfg.xgb_cal_path)
+        except Exception:
+            self.cal_global = None
 
-    def bind_experts(self, *experts):
-        """
-        Сохраняет ссылки на экспертов для логирования и диагностики
-        """
-        self._experts = list(experts)
-        return self
+        self._load_all()
 
-    # ========== ПРЕДСКАЗАНИЕ ==========
-    def predict(
-        self,
-        p_xgb: Optional[float],
-        p_rf: Optional[float],
-        p_arf: Optional[float],
-        p_nn: Optional[float],
-        p_base: Optional[float],
-        reg_ctx: Optional[dict] = None
-    ) -> Optional[float]:
-        ph = phase_from_ctx(reg_ctx)
-        
-        x = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
-        if x is None:
-            return None
-        
-        # Проверяем, обучена ли модель для этой фазы
-        w = self.w_meta_ph[ph]
-        if np.allclose(w, 0.0):
-            # ИСПРАВЛЕНО: в shadow режиме используем простое среднее экспертов
-            # вместо возврата None (что приводило к использованию p_base)
-            preds = [p for p in [p_xgb, p_rf, p_arf, p_nn] if p is not None]
-            if len(preds) == 0:
-                return None
-            p_mean = float(np.mean(preds))
-            return float(np.clip(p_mean, 0.0, 1.0))
+        # вспомогалка для путей фазовых калибраторов
+        import os as _os
+        self._cal_path = lambda base, ph: f"{_os.path.splitext(base)[0]}_ph{ph}{_os.path.splitext(base)[1]}"
 
-        return self._safe_p_from_x(ph, x)
+        # попытка подгрузить фазовые калибраторы
+        for p in range(self.P):
+            try:
+                self.cal_ph[p] = _BaseCal.load(self._cal_path(self.cfg.xgb_cal_path, p))
+            except Exception:
+                self.cal_ph[p] = None
 
-    def _phi(
-        self,
-        p_xgb: Optional[float],
-        p_rf: Optional[float],
-        p_arf: Optional[float],
-        p_nn: Optional[float],
-        p_base: Optional[float],
-        reg_ctx: Optional[dict] = None
-    ) -> Optional[np.ndarray]:
-        """
-        Строит расширенный вектор фичей для мета-модели (18D)
-        """
-        preds = []
-        for p in [p_xgb, p_rf, p_arf, p_nn]:
-            if p is not None:
-                preds.append(float(p))
-        if len(preds) == 0:
-            return None  # Нет предсказаний от экспертов
 
-        def safe_logit(p: float) -> float:
-            p = np.clip(p, 1e-6, 1 - 1e-6)
-            return float(np.log(p / (1 - p)))
-
-        lz_xgb  = safe_logit(p_xgb)  if p_xgb  is not None else 0.0
-        lz_rf   = safe_logit(p_rf)   if p_rf   is not None else 0.0
-        lz_arf  = safe_logit(p_arf)  if p_arf  is not None else 0.0
-        lz_nn   = safe_logit(p_nn)   if p_nn   is not None else 0.0
-        lz_base = safe_logit(p_base) if p_base is not None else 0.0
-
-        disagree = float(np.std(preds)) if len(preds) > 1 else 0.0
-
-        p_mean = float(np.mean(preds))
-        p_mean = np.clip(p_mean, 1e-6, 1 - 1e-6)
-        entropy = float(-(p_mean * np.log(p_mean) + (1 - p_mean) * np.log(1 - p_mean)))
-
-        if reg_ctx is not None and isinstance(reg_ctx, dict):
-            trend_sign  = float(reg_ctx.get("trend_sign", 0.0))
-            trend_abs   = float(reg_ctx.get("trend_abs", 0.0))
-            vol_ratio   = float(reg_ctx.get("vol_ratio", 1.0))
-            jump_flag   = float(reg_ctx.get("jump_flag", 0.0))
-            ofi_sign    = float(reg_ctx.get("ofi_sign", 0.0))
-            book_imb    = float(reg_ctx.get("book_imb", 0.0))
-            basis_sign  = float(reg_ctx.get("basis_sign", 0.0))
-            funding_sign= float(reg_ctx.get("funding_sign", 0.0))
-        else:
-            trend_sign = trend_abs = vol_ratio = jump_flag = 0.0
-            ofi_sign = book_imb = basis_sign = funding_sign = 0.0
-
-        disagree_vol  = disagree * vol_ratio
-        entropy_trend = entropy * abs(trend_abs)
-
-        x = np.array([
-            lz_xgb, lz_rf, lz_arf, lz_nn, lz_base,       # 0-4
-            disagree, entropy,                            # 5-6
-            trend_sign, trend_abs, vol_ratio, jump_flag,  # 7-10
-            ofi_sign, book_imb, basis_sign, funding_sign, # 11-14
-            disagree_vol, entropy_trend,                  # 15-16
-            1.0                                           # 17 (bias)
-        ], dtype=float)
-
-        return x
-
-    def _phi_forced(self, p_xgb: float, p_rf: float, p_arf: float, p_nn: float, p_base: float, reg_ctx: Optional[dict] = None) -> np.ndarray:
-        """
-        Версия _phi, которая ВСЕГДА возвращает вектор фичей (заполняет и паддингует до D)
-        """
-        x = np.array([p_xgb, p_rf, p_arf, p_nn, p_base], dtype=np.float32)
-        if self.D > 5:
-            x = np.append(x, [
-                p_xgb * p_rf,
-                p_xgb * p_arf, 
-                p_xgb * p_nn,
-                p_rf  * p_arf,
-                p_rf  * p_nn,
-                p_arf * p_nn
-            ])
-        if len(x) < self.D:
-            x = np.pad(x, (0, self.D - len(x)), mode='constant', constant_values=0.5)
-        elif len(x) > self.D:
-            x = x[:self.D]
-        return x
-
-    def _safe_p_from_x(self, ph: int, x: np.ndarray) -> Optional[float]:
-        """
-        Вычисляет вероятность из вектора фичей для конкретной фазы
-        """
-        w = self.w_meta_ph[ph]
-        if np.allclose(w, 0.0):
-            return None
-
-        z = float(np.dot(w, x))
-        z = np.clip(z, -60.0, 60.0)
-        p = 1.0 / (1.0 + math.exp(-z))
-        return float(np.clip(p, 0.0, 1.0))
-
-    # ========== ЗАПИСЬ РЕЗУЛЬТАТА И ОБУЧЕНИЕ ==========
-    def record_result(
-        self,
-        p_xgb: Optional[float],
-        p_rf: Optional[float],
-        p_arf: Optional[float],
-        p_nn: Optional[float],
-        p_base: Optional[float],
-        y_up: int,
-        used_in_live: bool,
-        p_final_used: Optional[float] = None,
-        reg_ctx: Optional[dict] = None
-    ) -> None:
-        """
-        Записывает результат предсказания и триггерит обучение при необходимости.
-        
-        КРИТИЧЕСКИ ВАЖНО: Всегда сохраняет примеры для накопления опыта,
-        даже если некоторые эксперты не дали предсказаний.
-        """
+    def _load_all(self):
         try:
-            # ===== ШАГ 1: ИЗВЛЕЧЕНИЕ ФАЗЫ И ПОСТРОЕНИЕ ФИЧЕЙ =====
-            ph = phase_from_ctx(reg_ctx)
-            self._last_phase = ph
-            
-            # ОТЛАДКА: проверяем входные данные
-            # ОТЛАДКА: проверяем входные данные
-            if len(self.shadow_hits) % 20 == 0:
-                available_preds = sum([
-                    1 for p in [p_xgb, p_rf, p_arf, p_nn] 
-                    if p is not None
-                ])
-                p_base_str = f"{p_base:.4f}" if p_base is not None else "None"
-                
-                # Улучшенное логирование с предупреждением
-                if available_preds == 0:
-                    print(f"[MetaCEMMC] ⚠️ CRITICAL: {available_preds}/4 experts available, "
-                        f"p_base={p_base_str}, phase={ph}")
-                    print(f"[MetaCEMMC] ⚠️ This may indicate RPC/Binance data issues. "
-                        f"Using fallback mode with forced phi.")
-                else:
-                    print(f"[MetaCEMMC] Input check: {available_preds}/4 experts available, "
-                        f"p_base={p_base_str}, phase={ph}")
+            if os.path.exists(self.cfg.xgb_state_path):
+                with open(self.cfg.xgb_state_path, "r") as f:
+                    st = json.load(f)
 
-            # Пытаемся построить фичи обычным способом
-            x_orig = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
-            
-            # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Всегда создаем фичи, даже если _phi вернул None
-            if x_orig is not None:
-                x = x_orig
-                has_expert_predictions = True
-            else:
-                # Используем безопасные значения для гарантированного накопления опыта
-                p_xgb_safe  = p_xgb  if p_xgb  is not None else (p_base if p_base is not None else 0.5)
-                p_rf_safe   = p_rf   if p_rf   is not None else (p_base if p_base is not None else 0.5)
-                p_arf_safe  = p_arf  if p_arf  is not None else (p_base if p_base is not None else 0.5)
-                p_nn_safe   = p_nn   if p_nn   is not None else (p_base if p_base is not None else 0.5)
-                p_base_safe = p_base if p_base is not None else 0.5
-                
-                x = self._phi_forced(p_xgb_safe, p_rf_safe, p_arf_safe, p_nn_safe, p_base_safe, reg_ctx)
-                has_expert_predictions = False
-                
-                # ОТЛАДКА: логируем использование forced mode
-                if self.seen_ph.get(ph, 0) % 10 == 0:
-                    print(f"[MetaCEMMC] ⚠️ Using forced phi mode for phase {ph} "
-                        f"(no expert predictions)")
+                # базовые поля
+                self.mode = st.get("mode", "SHADOW")
+                self.shadow_hits = st.get("shadow_hits", [])[-1000:]
+                self.active_hits = st.get("active_hits", [])[-1000:]
+                self.n_feats = st.get("n_feats", None)
 
-            # ===== ШАГ 2: ВСЕГДА СОХРАНЯЕМ ПРИМЕР =====
-            buf = self._append_example(ph, x, int(y_up))
-            self.seen_ph[ph] = int(self.seen_ph.get(ph, 0)) + 1
-            
-            # ОТЛАДКА: проверяем накопление данных
-            if self.seen_ph[ph] == 1:
-                print(f"[MetaCEMMC] ✅ First sample saved for phase {ph}")
-            elif self.seen_ph[ph] % 50 == 0:
-                print(f"[MetaCEMMC] 📊 Phase {ph}: {self.seen_ph[ph]} samples accumulated")
+                # 👇 восстановление памяти
+                self.X = st.get("X", [])
+                self.y = st.get("y", [])
 
-            # ===== ШАГ 3: ОБНОВЛЕНИЕ МЕТРИК =====
-            if has_expert_predictions:
-                p_for_gate = p_final_used if (p_final_used is not None) else self._safe_p_from_x(ph, x)
-                if p_for_gate is None:
-                    p_for_gate = p_base if p_base is not None else 0.5
-            else:
-                p_for_gate = p_base if p_base is not None else 0.5
+                X_ph = st.get("X_ph", {})
+                y_ph = st.get("y_ph", {})
+                if isinstance(X_ph, dict) and isinstance(y_ph, dict):
+                    self.X_ph = {int(k): v for k, v in X_ph.items()}
+                    self.y_ph = {int(k): v for k, v in y_ph.items()}
 
-            hit = int((p_for_gate >= 0.5) == bool(y_up))
-
-            if self.mode == "ACTIVE" and used_in_live:
-                self.active_hits.append(hit)
-                if self.adwin is not None:
-                    in_drift = self.adwin.update(1 - hit)
-                    if in_drift:
-                        self.mode = "SHADOW"
-                        self.active_hits = []
-                        print(f"[MetaCEMMC] 🔄 ACTIVE→SHADOW: drift detected")
-            else:
-                self.shadow_hits.append(hit)
-
-            # Ограничиваем размер массивов
-            self.active_hits = self.active_hits[-2000:]
-            self.shadow_hits = self.shadow_hits[-2000:]
-
-            self._unsaved += 1
-            self._save_throttled()
-
-            # ===== ШАГ 4: OOF ДЛЯ CV =====
-            if getattr(self.cfg, "cv_enabled", True) and p_for_gate is not None:
-                self.cv_oof_preds[ph].append(float(p_for_gate))
-                self.cv_oof_labels[ph].append(int(y_up))
-
-            # ===== ШАГ 5: ПЕРИОДИЧЕСКАЯ CV =====
-            cv_check_every = int(getattr(self.cfg, "cv_check_every", 50))
-            self.cv_last_check[ph] = int(self.cv_last_check.get(ph, 0)) + 1
-
-            if getattr(self.cfg, "cv_enabled", True) and self.cv_last_check[ph] >= cv_check_every:
-                self.cv_last_check[ph] = 0
-                try:
-                    cv_results = self._run_cv_validation(ph)
-                    self.cv_metrics[ph] = cv_results
-                    if cv_results.get("status") == "ok":
-                        self.validation_passed[ph] = True
-                        print(
-                            f"[MetaCEMMC] ✅ CV ph={ph}: "
-                            f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
-                            f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
-                            f"folds={cv_results['n_folds']}"
-                        )
-                except Exception as e:
-                    print(f"[MetaCEMMC] ❌ CV failed for phase {ph}: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-            # ===== ШАГ 6: ЛЕНИВОЕ ОБУЧЕНИЕ =====
-            if self._phase_ready(ph):
-                try:
-                    print(f"[MetaCEMMC] 🎯 Starting training for phase {ph} "
-                        f"({self.seen_ph[ph]} samples)")
-                    self._train_phase(ph)
-                    self._trim_phase_storage(ph)
-                    self.buf_ph[ph] = []
-                    self._save()
-                    print(f"[MetaCEMMC] ✅ Training completed for phase {ph}")
-                except Exception as e:
-                    print(f"[MetaCEMMC] ❌ Training failed for phase {ph}: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-            # ===== ШАГ 7: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ =====
-            try:
-                self._maybe_flip_modes()
-            except Exception as e:
-                print(f"[MetaCEMMC] flip-modes error: {e}")
-
-            # ===== ШАГ 8: МОНИТОРИНГ ПРОГРЕССА =====
-            try:
-                if len(self.shadow_hits) % 100 == 0 and len(self.shadow_hits) > 0:
-                    wr = 100 * sum(self.shadow_hits) / len(self.shadow_hits)
-                    last_100_wr = 100 * sum(self.shadow_hits[-100:]) / 100 if len(self.shadow_hits) >= 100 else wr
-                    
-                    print(f"\n{'='*60}")
-                    print(f"📊 META ПРОГРЕСС (каждые 100 примеров)")
-                    print(f"{'='*60}")
-                    print(f"   Всего примеров: {len(self.shadow_hits)}")
-                    print(f"   Общий WR: {wr:.2f}%")
-                    print(f"   Последние 100: {last_100_wr:.2f}%")
-                    print(f"   До активации: {58.0 - wr:.2f}% points")
-                    print(f"   Фаза: {self._last_phase}")
-                    print(f"   Режим: {self.mode}")
-                    print(f"   Накоплено по фазам: {dict(self.seen_ph)}")
-                    print(f"{'='*60}\n")
-                    
-                    # Уведомление в Telegram при приближении к активации
-                    if wr >= 55.0 and getattr(self.cfg, 'tg_bot_token', None):
+                # счётчики тренировки по фазам
+                self.new_since_train_ph = {p: 0 for p in range(self.P)}
+                if isinstance(st.get("new_since_train_ph"), dict):
+                    for k, v in st["new_since_train_ph"].items():
                         try:
-                            from meta_report import send_telegram_text
-                            token = getattr(self.cfg, 'tg_bot_token', '')
-                            chat_id = getattr(self.cfg, 'tg_chat_id', '')
-                            if token and chat_id:
-                                msg = (f"🎯 <b>META близка к активации!</b>\n"
-                                    f"WR: {wr:.2f}% (цель: 58%)\n"
-                                    f"Примеров: {len(self.shadow_hits)}\n"
-                                    f"Последние 100: {last_100_wr:.2f}%")
-                                send_telegram_text(token, chat_id, msg)
+                            self.new_since_train_ph[int(k)] = int(v)
                         except Exception:
-                            pass
-            except Exception as e:
-                print(f"[MetaCEMMC] monitoring error: {e}")
+                            log_exception("Unhandled exception")
 
-            # ===== ШАГ 9: ИНТЕГРАЦИЯ С TRAINING VISUALIZER =====
+                self._last_seen_phase = int(st.get("_last_seen_phase", 0))
+
+                # безопасные обрезки
+                mm = getattr(self.cfg, "max_memory", None)
+                if isinstance(mm, int) and mm > 0 and len(self.X) > mm:
+                    self.X = self.X[-mm:]
+                    self.y = self.y[-mm:]
+
+                cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
+                for p in range(self.P):
+                    if len(self.X_ph.get(p, [])) > cap:
+                        self.X_ph[p] = self.X_ph[p][-cap:]
+                        self.y_ph[p] = self.y_ph[p][-cap:]
+        except Exception:
+            log_exception("Unhandled exception")
+
+        # scaler/booster — без изменений
+        try:
+            if os.path.exists(self.cfg.xgb_scaler_path):
+                with open(self.cfg.xgb_scaler_path, "rb") as f:
+                    self.scaler = pickle.load(f)
+        except Exception:
+            self.scaler = None
+        try:
+            if HAVE_XGB and os.path.exists(self.cfg.xgb_model_path):
+                bst = xgb.Booster()
+                bst.load_model(self.cfg.xgb_model_path)
+                self.booster = bst
+        except Exception:
+            self.booster = None
+
+
+    def _save_all(self):
+        # --- state (режим, хиты, память) ---
+        try:
+            # обрезка глобального хвоста
+            X_tail, y_tail = self.X, self.y
+            mm = getattr(self.cfg, "max_memory", None)
+            if isinstance(mm, int) and mm > 0:
+                X_tail = self.X[-mm:]
+                y_tail = self.y[-mm:]
+
+            # обрезка фазовых буферов
+            cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
+            X_ph_tail = {p: self.X_ph.get(p, [])[-cap:] for p in range(self.P)}
+            y_ph_tail = {p: self.y_ph.get(p, [])[-cap:] for p in range(self.P)}
+
+            st = {
+                "mode": self.mode,
+                "shadow_hits": self.shadow_hits[-1000:],
+                "active_hits": self.active_hits[-1000:],
+                "n_feats": self.n_feats,
+
+                # 👇 память
+                "X": X_tail, "y": y_tail,
+                "X_ph": X_ph_tail, "y_ph": y_ph_tail,
+                "new_since_train_ph": {int(p): int(self.new_since_train_ph.get(p, 0)) for p in range(self.P)},
+                "_last_seen_phase": int(self._last_seen_phase),
+                "P": int(self.P),
+            }
+            with open(self.cfg.xgb_state_path, "w") as f:
+                json.dump(st, f)
+        except Exception as e:
+            print(f"[xgb ] _save_all state error: {e}")
+
+        # --- scaler / booster ---
+        try:
+            if self.scaler is not None:
+                with open(self.cfg.xgb_scaler_path, "wb") as f:
+                    pickle.dump(self.scaler, f)
+        except Exception:
+            log_exception(f"xgb: failed to save scaler to {self.cfg.xgb_scaler_path}")
+        try:
+            if HAVE_XGB and self.booster is not None:
+                self.booster.save_model(self.cfg.xgb_model_path)
+        except Exception:
+            log_exception(f"xgb: failed to save booster to {self.cfg.xgb_model_path}")
+
+
+
+    # ---------- утилиты ----------
+    def _ensure_dim(self, x_raw: np.ndarray):
+        d = int(x_raw.reshape(1, -1).shape[1])
+        if self.n_feats is None or self.n_feats != d:
+            # смена размерности — чистим всё
+            self.n_feats = d
+            self.X, self.y = [], []
+            self.X_ph = {p: [] for p in range(self.P)}
+            self.y_ph = {p: [] for p in range(self.P)}
+            self.new_since_train = 0
+            self.new_since_train_ph = {p: 0 for p in range(self.P)}
+            self._last_seen_phase = 0
+            self.booster = None
+            self.scaler = None
+
+    def _transform_one(self, x_raw: np.ndarray) -> np.ndarray:
+        self._ensure_dim(x_raw)
+        xr = x_raw.astype(np.float32).reshape(1, -1)
+        if self.scaler is None:
+            return xr
+        return self.scaler.transform(xr).astype(np.float32)
+
+    def _transform_many(self, X_raw: np.ndarray) -> np.ndarray:
+        X_raw = X_raw.astype(np.float32).reshape(-1, self.n_feats or X_raw.shape[1])
+        if self.scaler is None:
+            return X_raw
+        return self.scaler.transform(X_raw).astype(np.float32)
+
+    def _predict_raw(self, x_raw: np.ndarray) -> Optional[float]:
+        if not self.enabled or self.booster is None:
+            return None
+        Xt = self._transform_one(x_raw)
+        d = xgb.DMatrix(Xt)
+        p = float(self.booster.predict(d)[0])
+        return float(min(max(p, 1e-6), 1.0 - 1e-6))
+
+    def _get_global_tail(self, n: int) -> Tuple[np.ndarray, np.ndarray]:
+        if n <= 0 or not self.X:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        Xg = np.array(self.X[-n:], dtype=np.float32)
+        yg = np.array(self.y[-n:], dtype=np.int32)
+        return Xg, yg
+
+    def _get_past_phases_tail(self, ph: int, n: int) -> Tuple[np.ndarray, np.ndarray]:
+        # Берет последние n записей только из фаз 0..ph-1 (исключая текущую)
+        # Исключает данные из будущих фаз → нет утечки
+        if n <= 0:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        
+        # Собираем все данные из прошлых фаз (0..ph-1)
+        X_past = []
+        y_past = []
+        for p in range(ph):  # ✅ ИСПРАВЛЕНО: было range(min(ph + 1, self.P))
+            if self.X_ph.get(p):
+                X_past.extend(self.X_ph[p])
+                y_past.extend(self.y_ph[p])
+        
+        if not X_past:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        
+        # Берем последние n записей
+        X_past = X_past[-n:]
+        y_past = y_past[-n:]
+        
+        return np.array(X_past, dtype=np.float32), np.array(y_past, dtype=np.int32)
+
+
+    def _get_phase_train(self, ph: int) -> Tuple[np.ndarray, np.ndarray]:
+        # X_phase
+        Xp = np.array(self.X_ph[ph], dtype=np.float32) if self.X_ph[ph] else np.empty((0, self.n_feats or 0), dtype=np.float32)
+        yp = np.array(self.y_ph[ph], dtype=np.int32)   if self.y_ph[ph]  else np.empty((0,), dtype=np.int32)
+
+        if len(Xp) >= int(self.cfg.phase_min_ready):
+            return Xp, yp
+
+        # иначе смешиваем X_phase ∪ X_past_phases_tail (70/30 по умолчанию)
+        # ИСПРАВЛЕНИЕ: используем только прошлые фазы (0..ph), а не весь глобальный хвост
+        share = float(self.cfg.phase_mix_global_share)  # 0.30
+        need_g = int(round(len(Xp) * share / max(1e-9, (1.0 - share))))
+        need_g = max(need_g, int(self.cfg.phase_min_ready) - len(Xp))   # не менее, чтобы достичь порога
+        
+        # Считаем сколько доступно в фазах 0..ph
+        available_past = sum(len(self.X_ph.get(p, [])) for p in range(ph))  # ✅ ИСПРАВЛЕНО
+        need_g = min(need_g, available_past)  # не больше, чем доступно в прошлых фазах
+        
+        Xg, yg = self._get_past_phases_tail(ph, need_g)
+        if len(Xg) == 0:
+            return Xp, yp
+
+        X = np.concatenate([Xp, Xg], axis=0)
+        y = np.concatenate([yp, yg], axis=0)
+        return X, y
+
+    def _maybe_train_phase(self, ph: int):
+        """
+        Обучает XGBoost модель для конкретной фазы.
+        
+        Включает:
+        - Проверку накопленных данных
+        - Валидацию фичей
+        - Периодический анализ корреляции
+        - Обучение с warm start
+        - Интеграцию с TrainingVisualizer
+        """
+        
+        # ========== БЛОК 1: БАЗОВЫЕ ПРОВЕРКИ ==========
+        if not self.enabled or self.n_feats is None:
+            return
+        
+        if self.new_since_train_ph.get(ph, 0) < int(self.cfg.retrain_every):
+            return
+        
+        # ========== БЛОК 2: ПОЛУЧЕНИЕ ДАННЫХ ==========
+        X_all, y_all = self._get_phase_train(ph)
+        
+        if len(X_all) < int(self.cfg.phase_min_ready):
+            return
+        
+        # Ограничиваем окно обучения
+        if len(X_all) > int(self.cfg.train_window):
+            X_all = X_all[-int(self.cfg.train_window):]
+            y_all = y_all[-int(self.cfg.train_window):]
+        
+        # ========== БЛОК 3: ВАЛИДАЦИЯ ДАННЫХ ==========
+        # Проверяем на NaN/Inf перед обучением
+        if np.any(np.isnan(X_all)) or np.any(np.isinf(X_all)):
+            print(f"[XGB] ⚠️  Warning: NaN/Inf detected in training data for phase {ph}, cleaning...")
+            X_all = np.nan_to_num(X_all, nan=0.0, posinf=1e10, neginf=-1e10)
+
+        # ========== БЛОК 4: ПЕРИОДИЧЕСКИЙ АНАЛИЗ ФИЧЕЙ ==========
+        # Проверяем каждые 1000 примеров (или при первом достижении 500)
+        should_validate = (
+            (len(X_all) == 500) or  # Первый раз при 500
+            (len(X_all) % 1000 == 0 and len(X_all) >= 1000)  # Потом каждые 1000
+        )
+
+        if should_validate:
             try:
-                from training_visualizer import get_visualizer
-                viz = get_visualizer()
+                from feature_validator import analyze_feature_correlation, check_data_leakage
                 
-                # Собираем метрики для визуализатора
-                all_hits = self.active_hits + self.shadow_hits
-                wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
+                print(f"\n[XGB] 📊 Запуск валидации фичей для фазы {ph}...")
+                print(f"[XGB] Примеров: {len(X_all)}, Фичей: {X_all.shape[1]}")
                 
-                cv_metrics = self.cv_metrics.get(ph, {})
-                cv_accuracy = cv_metrics.get("oof_accuracy")
-                cv_ci_lower = cv_metrics.get("ci_lower")
-                cv_ci_upper = cv_metrics.get("ci_upper")
-                
-                # Отправляем метрики META в визуализатор
-                viz.record_expert_metrics(
-                    expert_name="META",
-                    accuracy=wr_all,
-                    n_samples=len(all_hits),
-                    cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
-                    cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
-                    cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
-                    mode=self.mode
+                # Анализ корреляции с сохранением отчета
+                results = analyze_feature_correlation(
+                    X_all, 
+                    y_all,
+                    feature_names=[f"f{i}" for i in range(X_all.shape[1])],
+                    top_n=20,
+                    save_report=True,
+                    report_path=f"feature_analysis_xgb_ph{ph}_n{len(X_all)}.txt"
                 )
                 
-                # Отладка отправки метрик
-                if len(all_hits) == 1:
-                    print(f"[MetaCEMMC] ✅ First META metrics sent to viz: "
-                        f"WR={wr_all:.2%}, n={len(all_hits)}")
-                elif len(all_hits) % 50 == 0:
-                    print(f"[MetaCEMMC] 📈 META metrics update: WR={wr_all:.2%}, "
-                        f"n={len(all_hits)}, mode={self.mode}, "
-                        f"CV={cv_accuracy:.1f}%" if cv_accuracy else "")
+                # Проверка на утечку данных (ИСПРАВЛЕНО: добавлен y_all)
+                suspicious = check_data_leakage(
+                    X_all,
+                    y_all,  # ✅ ДОБАВЛЕНО
+                    feature_names=[f"f{i}" for i in range(X_all.shape[1])]
+                )
+                
+                # ========== ДЕЙСТВИЯ НА ОСНОВЕ РЕЗУЛЬТАТОВ ==========
+                
+                # 1. Подсчет проблемных фичей
+                excellent = sum(1 for r in results if r.status == "отлично")
+                useless = sum(1 for r in results if r.status in ["бесполезно", "константа"])
+                
+                print(f"\n[XGB] 📈 Итоги валидации:")
+                print(f"[XGB]    Отличных фичей: {excellent}/{len(results)}")
+                print(f"[XGB]    Бесполезных фичей: {useless}/{len(results)}")
+                print(f"[XGB]    Подозрительных фичей: {len(suspicious)}")
+                
+                # 2. Критическая проблема: более 50% фичей бесполезны
+                if useless > len(results) * 0.5:
+                    print(f"\n[XGB] ❌ КРИТИЧЕСКАЯ ПРОБЛЕМА: {useless}/{len(results)} фичей бесполезны!")
+                    print(f"[XGB] Рекомендуется пересмотреть feature engineering")
                     
-                    # Дополнительная информация о состоянии весов
-                    non_zero_phases = sum(1 for p in range(self.P) 
-                                        if not np.allclose(self.w_meta_ph[p], 0.0))
-                    print(f"[MetaCEMMC] Trained phases: {non_zero_phases}/{self.P}")
+                    # Отправляем уведомление в Telegram
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"⚠️ <b>XGB: Проблема с фичами!</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Примеров: {len(X_all)}\n"
+                                f"Бесполезных фичей: {useless}/{len(results)} ({100*useless/len(results):.1f}%)\n\n"
+                                f"Требуется проверка feature engineering!")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 3. Обнаружен data leakage
+                if suspicious:
+                    print(f"\n[XGB] ⚠️  ВНИМАНИЕ: Data leakage обнаружен!")
+                    print(f"[XGB] Подозрительные фичи ({len(suspicious)}):")
+                    for feat in suspicious[:5]:  # Показываем первые 5
+                        print(f"[XGB]    - {feat}")
+                    if len(suspicious) > 5:
+                        print(f"[XGB]    ... и еще {len(suspicious) - 5}")
                     
+                    # Уведомление в Telegram
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"🚨 <b>XGB: Data Leakage!</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Обнаружено {len(suspicious)} подозрительных фичей\n\n"
+                                f"Срочно требуется проверка!")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 4. Все хорошо
+                if useless < len(results) * 0.3 and not suspicious:
+                    print(f"\n[XGB] ✅ Качество фичей в норме!")
+                
+                print(f"[XGB] 📄 Отчет сохранен: feature_analysis_xgb_ph{ph}_n{len(X_all)}.txt\n")
+                
             except ImportError:
-                pass  # TrainingVisualizer не установлен
+                pass  # feature_validator не установлен
             except Exception as e:
-                print(f"[MetaCEMMC] ERROR: Failed to send metrics to visualizer: {e}")
-                import traceback
-                traceback.print_exc()
-
+                print(f"[XGB] ⚠️  Ошибка валидации фичей: {e}")
+                # Логируем ошибку, но не останавливаем обучение
+                try:
+                    from error_logger import log_exception
+                    log_exception(f"Feature validation failed for XGB ph={ph}")
+                except ImportError:
+                    pass
+        
+        # ========== БЛОК 5: ОБУЧЕНИЕ МОДЕЛИ ==========
+        try:
+            # Масштабирование данных
+            self.scaler = StandardScaler().fit(X_all)
+            Xt = self.scaler.transform(X_all)
+            
+            # Создание DMatrix
+            dtrain = xgb.DMatrix(Xt, label=y_all)
+            
+            # Параметры модели
+            params = dict(
+                objective="binary:logistic",
+                eval_metric="logloss",
+                eta=getattr(self.cfg, "xgb_eta", 0.08),
+                max_depth=getattr(self.cfg, "xgb_max_depth", 4),
+                subsample=getattr(self.cfg, "xgb_subsample", 0.9),
+                colsample_bytree=getattr(self.cfg, "xgb_colsample_bytree", 0.9),
+                min_child_weight=getattr(self.cfg, "xgb_min_child_weight", 2),
+                tree_method="auto",
+            )
+            
+            # Warm start: используем существующую модель если есть
+            num_round = int(
+                self.cfg.xgb_rounds_cold if (self.booster is None) 
+                else self.cfg.xgb_rounds_warm
+            )
+            
+            # Обучение
+            self.booster = xgb.train(
+                params, 
+                dtrain, 
+                num_boost_round=num_round, 
+                xgb_model=self.booster
+            )
+            
+            # Сброс счетчика новых примеров
+            self.new_since_train_ph[ph] = 0
+            
+            # Сохранение состояния
+            self._save_all()
+            
+            print(f"[XGB] ✅ Trained on phase {ph}: {len(X_all)} samples, {num_round} rounds")
+            
         except Exception as e:
-            print(f"[ens ] meta.record_result error: {e.__class__.__name__}: {e}")
+            print(f"[XGB] ❌ Training error (ph={ph}): {e}")
             import traceback
             traceback.print_exc()
-            # НЕ прерываем работу - продолжаем накапливать данные
+            return
+        
+        # ========== БЛОК 6: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            
+            # Вычисляем общий winrate
+            all_hits = self.active_hits + self.shadow_hits
+            wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
+            
+            # Получаем CV метрики текущей фазы
+            cv_metrics = self.cv_metrics.get(ph, {})
+            cv_accuracy = cv_metrics.get("oof_accuracy")
+            cv_ci_lower = cv_metrics.get("ci_lower")
+            cv_ci_upper = cv_metrics.get("ci_upper")
+            
+            # Отправляем метрики в visualizer
+            viz.record_expert_metrics(
+                expert_name="XGB",
+                accuracy=wr_all,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
+                mode=self.mode
+            )
+            
+        except ImportError:
+            pass  # TrainingVisualizer не установлен
+        except Exception as e:
+            print(f"[XGB] Warning: Failed to send metrics to visualizer: {e}")
 
-    # ========== НОВОЕ: CROSS-VALIDATION ФУНКЦИИ ==========
     def _run_cv_validation(self, ph: int) -> Dict:
         """
-        Запускает walk-forward purged cross-validation для фазы
+        Walk-forward purged cross-validation для фазы ph.
+        Возвращает метрики: accuracy, CI bounds, fold scores.
         """
-        X_list, y_list, sample_weights = self._load_phase_buffer_from_disk(ph)
+        X_all, y_all = self._get_phase_train(ph)
         
-        # ДОБАВЛЕНО: проверка на пустые данные
-        if len(X_list) == 0 or len(y_list) == 0:
-            return {"status": "no_data", "oof_accuracy": 0.0, "n_samples": 0}
-        
-        # ДОБАВЛЕНО: проверка на разнообразие классов
-        unique_classes = len(set(y_list))
-        if unique_classes < 2:
-            return {
-                "status": "single_class", 
-                "oof_accuracy": 0.0, 
-                "n_samples": len(X_list),
-                "message": f"Only {unique_classes} class present in data"
-            }
-        
-        if len(X_list) < int(getattr(self.cfg, "cv_min_train_size", 200)):
-            return {"status": "insufficient_data", "oof_accuracy": 0.0, "n_samples": len(X_list)}
-
-        X_all = np.array(X_list, dtype=float)
-        y_all = np.array(y_list, dtype=int)
+        if len(X_all) < self.cfg.cv_min_train_size:
+            return {"status": "insufficient_data", "oof_accuracy": 0.0}
         
         n_samples = len(X_all)
-        n_splits = min(
-            int(getattr(self.cfg, "cv_n_splits", 5)),
-            n_samples // int(getattr(self.cfg, "cv_min_train_size", 200))
-        )
+        n_splits = min(self.cfg.cv_n_splits, n_samples // self.cfg.cv_min_train_size)
         
         if n_splits < 2:
-            return {"status": "insufficient_splits", "oof_accuracy": 0.0, "n_samples": n_samples}
-
-        embargo_pct = float(getattr(self.cfg, "cv_embargo_pct", 0.02))
-        purge_pct   = float(getattr(self.cfg, "cv_purge_pct", 0.01))
+            return {"status": "insufficient_splits", "oof_accuracy": 0.0}
         
-        embargo_size = max(1, int(n_samples * embargo_pct))
-        purge_size   = max(1, int(n_samples * purge_pct))
+        # Walk-forward splits с purge и embargo
+        embargo_size = max(1, int(n_samples * self.cfg.cv_embargo_pct))
+        purge_size = max(1, int(n_samples * self.cfg.cv_purge_pct))
         
         fold_size = n_samples // n_splits
-        
         oof_preds = np.zeros(n_samples)
-        oof_mask  = np.zeros(n_samples, dtype=bool)
+        oof_mask = np.zeros(n_samples, dtype=bool)
         fold_scores = []
-
+        
         for fold_idx in range(n_splits):
+            # Test fold
             test_start = fold_idx * fold_size
-            test_end   = min(test_start + fold_size, n_samples)
-            train_end  = max(0, test_start - purge_size)
-            if train_end < int(getattr(self.cfg, "cv_min_train_size", 200)):
-                continue
-
-            X_train, y_train = X_all[:train_end], y_all[:train_end]
-            X_test,  y_test  = X_all[test_start:test_end], y_all[test_start:test_end]
+            test_end = min(test_start + fold_size, n_samples)
             
-            temp_weights = self._train_fold_model(X_train, y_train, ph)
-            if temp_weights is None:
+            # Train: всё до (test_start - purge_size)
+            train_end = max(0, test_start - purge_size)
+            
+            if train_end < self.cfg.cv_min_train_size:
                 continue
             
-            preds = self._predict_fold(temp_weights, X_test)
+            X_train = X_all[:train_end]
+            y_train = y_all[:train_end]
+            X_test = X_all[test_start:test_end]
+            y_test = y_all[test_start:test_end]
+            
+            # Обучаем временную модель на train fold
+            temp_model = self._train_fold_model(X_train, y_train, ph)
+            
+            # Предсказания на test fold
+            preds = self._predict_fold(temp_model, X_test, ph)
+            
+            # Сохраняем OOF predictions
             oof_preds[test_start:test_end] = preds
-            oof_mask[test_start:test_end]  = True
+            oof_mask[test_start:test_end] = True
             
-            fold_acc = 100.0 * np.mean((preds >= 0.5) == y_test)
+            # Метрики фолда
+            fold_acc = np.mean((preds >= 0.5) == y_test)
             fold_scores.append(fold_acc)
-
-        oof_valid = int(oof_mask.sum())
-        if oof_valid < int(getattr(self.cfg, "cv_min_train_size", 200)):
-            return {"status": "insufficient_oof", "oof_accuracy": 0.0, "oof_samples": oof_valid}
+        
+        # Итоговые OOF метрики
+        oof_valid = oof_mask.sum()
+        if oof_valid < self.cfg.cv_min_train_size:
+            return {"status": "insufficient_oof", "oof_accuracy": 0.0}
         
         oof_accuracy = 100.0 * np.mean((oof_preds[oof_mask] >= 0.5) == y_all[oof_mask])
         
+        # Bootstrap confidence intervals
         ci_lower, ci_upper = self._bootstrap_ci(
-            oof_preds[oof_mask],
+            oof_preds[oof_mask], 
             y_all[oof_mask],
-            n_bootstrap=int(getattr(self.cfg, "cv_bootstrap_n", 1000)),
-            confidence=float(getattr(self.cfg, "cv_confidence", 0.95))
+            n_bootstrap=self.cfg.cv_bootstrap_n,
+            confidence=self.cfg.cv_confidence
         )
         
         return {
             "status": "ok",
-            "oof_accuracy": float(oof_accuracy),
-            "ci_lower": float(ci_lower),
-            "ci_upper": float(ci_upper),
+            "oof_accuracy": oof_accuracy,
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
             "fold_scores": fold_scores,
             "n_folds": len(fold_scores),
-            "oof_samples": oof_valid
+            "oof_samples": int(oof_valid)
         }
 
-    def _bootstrap_ci(self, preds: np.ndarray, labels: np.ndarray, n_bootstrap: int, confidence: float) -> Tuple[float, float]:
-        """Вычисляет bootstrap доверительные интервалы для accuracy"""
-        # FIX: проверка пустых данных
-        if len(preds) == 0 or len(labels) == 0:
-            return 0.0, 0.0
-        
+    def _bootstrap_ci(self, preds: np.ndarray, labels: np.ndarray, 
+                    n_bootstrap: int, confidence: float) -> tuple:
+        """
+        Bootstrap confidence intervals для accuracy.
+        """
         accuracies = []
         n = len(preds)
+        
         for _ in range(n_bootstrap):
+            # Resample с возвратом
             idx = np.random.choice(n, size=n, replace=True)
-            boot_acc = 100.0 * np.mean((preds[idx] >= 0.5) == labels[idx])
+            boot_preds = preds[idx]
+            boot_labels = labels[idx]
+            boot_acc = 100.0 * np.mean((boot_preds >= 0.5) == boot_labels)
             accuracies.append(boot_acc)
         
         accuracies = np.array(accuracies)
         alpha = 1.0 - confidence
         ci_lower = np.percentile(accuracies, 100 * alpha / 2)
         ci_upper = np.percentile(accuracies, 100 * (1 - alpha / 2))
-        return float(ci_lower), float(ci_upper)
+        
+        return ci_lower, ci_upper
 
-    def _train_fold_model(
-        self,
-        X: np.ndarray,
-        y: np.ndarray,
-        ph: int
-    ) -> Optional[np.ndarray]:
+    def _train_fold_model(self, X: np.ndarray, y: np.ndarray, ph: int):
         """
-        Обучает временную модель для CV fold (упрощённый CEM)
+        Обучает временную модель для CV fold.
+        Реализация зависит от типа эксперта (XGB/RF/ARF/NN).
         """
-        if len(X) < 50:
+        # Пример для XGB
+        if not HAVE_XGB:
             return None
+        
+        scaler = StandardScaler().fit(X) if HAVE_SKLEARN else None
+        X_scaled = scaler.transform(X) if scaler else X
+        
+        dtrain = xgb.DMatrix(X_scaled, label=y)
+        model = xgb.train(
+            params={
+                "objective": "binary:logistic",
+                "max_depth": self.cfg.xgb_max_depth,
+                "eta": self.cfg.xgb_eta,
+                "subsample": self.cfg.xgb_subsample,
+                "colsample_bytree": self.cfg.xgb_colsample_bytree,
+                "min_child_weight": self.cfg.xgb_min_child_weight,
+                "eval_metric": "logloss",
+            },
+            dtrain=dtrain,
+            num_boost_round=self.cfg.xgb_rounds_warm,
+            verbose_eval=False
+        )
+        
+        return {"model": model, "scaler": scaler}
+
+    def _predict_fold(self, fold_model, X: np.ndarray, ph: int) -> np.ndarray:
+        """
+        Предсказания временной модели CV fold.
+        """
+        if fold_model is None:
+            return np.full(len(X), 0.5)
+        
+        scaler = fold_model.get("scaler")
+        model = fold_model.get("model")
+        
+        X_scaled = scaler.transform(X) if scaler else X
+        dtest = xgb.DMatrix(X_scaled)
+        preds = model.predict(dtest)
+        
+        return preds
+
+
+    # ---------- инференс / запись ----------
+    def proba_up(self, x_raw: np.ndarray, reg_ctx: Optional[dict] = None) -> Tuple[Optional[float], str]:
+        if not self.enabled:
+            return (None, "DISABLED")
+        if self.booster is None:
+            try:
+                self._ensure_dim(x_raw)
+            except Exception:
+                log_exception("Failed to predict")
+            return (None, self.mode)
+
         try:
-            weights = self._train_cem(
-                X, y,
-                n_iter=20,
-                pop_size=50,
-                elite_frac=0.2
-            )
-            return weights
+            self._ensure_dim(x_raw)
+
+            # сырой прогноз
+            Xt = self._transform_one(x_raw)
+            d = xgb.DMatrix(Xt)
+            p = float(self.booster.predict(d)[0])
+            p = float(min(max(p, 1e-6), 1.0 - 1e-6))
+
+            # фазовый калибратор
+            ph = int(reg_ctx.get("phase")) if isinstance(reg_ctx, dict) and "phase" in reg_ctx else 0
+            self._last_seen_phase = ph
+            cal = self.cal_ph.get(ph) or self.cal_global
+            if cal is not None and getattr(cal, "ready", False):
+                try:
+                    p = float(cal.transform(p))
+                except Exception:
+                    log_exception("Failed to predict")
+
+            p = float(min(max(p, 1e-6), 1.0 - 1e-6))
+            return (p, self.mode)
         except Exception:
-            return None
+            return (None, self.mode)
 
-    def _predict_fold(
-        self,
-        weights: np.ndarray,
-        X: np.ndarray
-    ) -> np.ndarray:
+    def record_result(self, x_raw: np.ndarray, y_up: int, used_in_live: bool,
+                    p_pred: Optional[float] = None, reg_ctx: Optional[dict] = None) -> None:
         """
-        Предсказания временной модели на fold
-        """
-        z = X @ weights
-        z = np.clip(z, -60.0, 60.0)
-        probs = 1.0 / (1.0 + np.exp(-z))
-        return probs
-
-    # ========== ОБУЧЕНИЕ CEM/CMA-ES ==========
-    def _phase_ready(self, ph: int) -> bool:
-        """
-        Проверяет, готова ли фаза к обучению (читает из CSV)
-        """
-        X_list, y_list, _ = self._load_phase_buffer_from_disk(ph)
+        Записывает результат предсказания и обновляет модель.
         
-        min_samples = int(getattr(self.cfg, "meta_min_train", 100))
-        if len(X_list) < min_samples:
-            return False
+        Теперь включает:
+        - Валидацию и очистку фичей от NaN/Inf
+        - Сохранение в глобальную и фазовую память
+        - Трекинг хитов для оценки качества
+        - Out-of-fold predictions для cross-validation
+        - Периодическую CV проверку для валидации модели
+        - Обучение модели при накоплении данных
+        - Переключение режимов SHADOW/ACTIVE на основе метрик
+        - Интеграцию с TrainingVisualizer для мониторинга
+        """
         
-        if len(set(y_list)) < 2:
-            return False
-        
-        return True
-
-    def _train_phase(self, ph: int) -> None:
-        """Обучает модель для конкретной фазы через CEM или CMA-ES"""
-        X_list, y_list, sample_weights = self._load_phase_buffer_from_disk(ph)
-        if len(X_list) < int(getattr(self.cfg, "meta_min_train", 100)):
+        # ========== БЛОК 0: ПРОВЕРКА АКТИВНОСТИ ЭКСПЕРТА ==========
+        if not self.enabled:
             return
         
-        X = np.array(X_list, dtype=float)
-        y = np.array(y_list, dtype=float)
-        sample_weights = np.array(sample_weights, dtype=float)
+        # ========== БЛОК 0.5: ВАЛИДАЦИЯ И ОЧИСТКА ФИЧЕЙ ==========
+        x_raw = validate_and_clean_features(x_raw, self.__class__.__name__)
+        if x_raw is None:
+            return
         
-        # ИСПРАВЛЕНО: правильная проверка на ненулевую сумму весов
-        weights_sum = sample_weights.sum()
-        if weights_sum > 0:
-            # Нормализуем веса так, чтобы их сумма равнялась количеству примеров
-            sample_weights = sample_weights * len(sample_weights) / weights_sum
-        else:
-            # Если все веса нулевые - используем равные веса
-            sample_weights = np.ones_like(sample_weights)
+        # ========== БЛОК 1: ИНИЦИАЛИЗАЦИЯ И ПРОВЕРКА РАЗМЕРНОСТИ ==========
+        self._ensure_dim(x_raw)
 
-    def _train_cem(
-        self,
-        X: np.ndarray,
-        y: np.ndarray,
-        n_iter: int = 50,
-        pop_size: int = 100,
-        elite_frac: float = 0.2,
-        sample_weights: Optional[np.ndarray] = None
-    ) -> np.ndarray:
-        """Cross-Entropy Method оптимизация с полной визуализацией"""
-        D = X.shape[1]
-        n_elite = max(1, int(pop_size * elite_frac))
+        # ========== БЛОК 2: СОХРАНЕНИЕ В ГЛОБАЛЬНУЮ ПАМЯТЬ ==========
+        self.X.append(x_raw.astype(np.float32).ravel().tolist())
+        self.y.append(int(y_up))
         
-        # ДОБАВЛЕНО: валидация и приведение типов
-        if sample_weights is not None:
-            sample_weights = np.asarray(sample_weights, dtype=float)
-            # Проверка на NaN/Inf в весах
-            if np.any(~np.isfinite(sample_weights)):
-                print(f"[MetaCEMMC] WARNING: Non-finite sample_weights detected, replacing with ones")
-                sample_weights = np.ones(len(y), dtype=float)
-        else:
-            sample_weights = np.ones(len(y), dtype=float)
+        if len(self.X) > int(getattr(self.cfg, "max_memory", 10_000)):
+            self.X = self.X[-self.cfg.max_memory:]
+            self.y = self.y[-self.cfg.max_memory:]
         
-        mu = np.zeros(D)
-        sigma = np.ones(D) * 2.0
+        self.new_since_train += 1
+
+        # ========== БЛОК 3: ОПРЕДЕЛЕНИЕ ФАЗЫ ==========
+        ph = 0
+        if isinstance(reg_ctx, dict):
+            ph = int(reg_ctx.get("phase", 0))
+        self._last_seen_phase = ph
+
+        # ========== БЛОК 4: СОХРАНЕНИЕ В ФАЗОВУЮ ПАМЯТЬ ==========
+        self.X_ph[ph].append(x_raw.astype(np.float32).ravel().tolist())
+        self.y_ph[ph].append(int(y_up))
         
-        clip_val = float(getattr(self.cfg, "meta_w_clip", 8.0))
-        best_loss = float('inf')
-        best_w = mu.copy()
+        cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
+        if len(self.X_ph[ph]) > cap:
+            self.X_ph[ph] = self.X_ph[ph][-cap:]
+            self.y_ph[ph] = self.y_ph[ph][-cap:]
         
-        # Получаем текущую фазу
-        ph = getattr(self, "_last_phase", 0)
-        
-        # КРИТИЧЕСКОЕ: Инициализация визуализатора ДО начала обучения
-        viz_enabled = False
-        viz = None
-        try:
-            from training_visualizer import get_visualizer
-            viz = get_visualizer()
-            viz_enabled = True
-            print(f"[MetaCEMMC] ✅ Visualizer connected for CEM training (phase={ph})")
-        except ImportError:
-            print(f"[MetaCEMMC] ⚠️ TrainingVisualizer not available")
-        except Exception as e:
-            print(f"[MetaCEMMC] ❌ Visualizer init failed: {e}")
-        
-        # НОВОЕ: Отправляем начало обучения
-        if viz_enabled and viz is not None:
+        self.new_since_train_ph[ph] = self.new_since_train_ph.get(ph, 0) + 1
+
+        # ========== БЛОК 5: ТРЕКИНГ ХИТОВ И DRIFT DETECTION ==========
+        if p_pred is not None:
             try:
-                viz.record_meta_training_step(
-                    phase=ph,
-                    iteration=0,
-                    best_loss=float('inf'),
-                    median_loss=float('inf'),
-                    sigma=float(np.mean(sigma))
-                )
-                print(f"[MetaCEMMC] 📊 Training START sent to viz: phase={ph}, n_iter={n_iter}, "
-                    f"pop_size={pop_size}, n_samples={len(X)}")
-            except Exception as e:
-                print(f"[MetaCEMMC] ERROR: Failed to send start signal: {e}")
-                viz_enabled = False
-
-        # Трекинг для конвергенции
-        loss_history = []
-        sigma_history = []
-        improvement_count = 0
-        
-        for iteration in range(n_iter):
-            # Генерация популяции
-            population = []
-            for _ in range(pop_size):
-                w = mu + sigma * np.random.randn(D)
-                w = np.clip(w, -clip_val, clip_val)
-                population.append(w)
-            
-            # Оценка популяции
-            scores = []
-            for w in population:
-                loss = self._mc_eval(w, X, y, n_bootstrap=10, sample_weights=sample_weights)
-                scores.append(loss)
-            
-            # Отбор элиты
-            elite_idx = np.argsort(scores)[:n_elite]
-            elite = [population[i] for i in elite_idx]
-            
-            # Обновление лучшего решения
-            if scores[elite_idx[0]] < best_loss:
-                improvement_count += 1
-                best_loss = scores[elite_idx[0]]
-                best_w = population[elite_idx[0]].copy()
+                hit = int((float(p_pred) >= 0.5) == bool(y_up))
                 
-                # ОТЛАДКА: логируем улучшения
-                if iteration > 0:
-                    print(f"[MetaCEMMC] 🎯 Improvement #{improvement_count} at iter {iteration}: "
-                        f"loss={best_loss:.6f}")
-            
-            # Обновление параметров распределения
-            elite_arr = np.array(elite)
-            mu = elite_arr.mean(axis=0)
-            current_sigma = elite_arr.std(axis=0) + 1e-6
-            sigma = current_sigma * 0.9 + sigma * 0.1  # Сглаживание для стабильности
-            
-            # Метрики для визуализации
-            median_loss = float(np.median(scores))
-            avg_sigma = float(np.mean(sigma))
-            diversity = float(np.std([np.linalg.norm(w) for w in elite]))
-            
-            loss_history.append(best_loss)
-            sigma_history.append(avg_sigma)
-            
-            # КРИТИЧЕСКОЕ: Отправка метрик в визуализатор
-            # Часто в начале (каждую итерацию для первых 10), потом реже
-            should_send = (iteration < 10) or (iteration % 5 == 0) or (iteration == n_iter - 1)
-            
-            if viz_enabled and viz is not None and should_send:
-                try:
-                    viz.record_meta_training_step(
-                        phase=ph,
-                        iteration=iteration + 1,  # +1 чтобы начиналось с 1, не 0
-                        best_loss=float(best_loss),
-                        median_loss=median_loss,
-                        sigma=avg_sigma
-                    )
+                if self.mode == "ACTIVE" and used_in_live:
+                    self.active_hits.append(hit)
                     
-                    # Детальная отладка для первых итераций и ключевых моментов
-                    if iteration < 3 or iteration % 10 == 0 or iteration == n_iter - 1:
-                        print(f"[MetaCEMMC] 📈 CEM iter {iteration+1}/{n_iter}: "
-                            f"best_loss={best_loss:.6f}, median={median_loss:.6f}, "
-                            f"sigma={avg_sigma:.4f}, diversity={diversity:.4f}")
-                        
-                        if iteration == 0:
-                            print(f"[MetaCEMMC] ✅ First META training metrics sent to visualizer")
-                            
-                except Exception as e:
-                    print(f"[MetaCEMMC] ERROR at iter {iteration}: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    viz_enabled = False  # Отключаем если ошибка
+                    if self.adwin is not None:
+                        in_drift = self.adwin.update(1 - hit)
+                        if in_drift:
+                            self.mode = "SHADOW"
+                            self.active_hits = []
+                else:
+                    self.shadow_hits.append(hit)
+                
+                # КРИТИЧЕСКОЕ ДОПОЛНЕНИЕ: ограничиваем размер массивов хитов
+                self.active_hits = self.active_hits[-2000:]
+                self.shadow_hits = self.shadow_hits[-2000:]
+                
+            except Exception:
+                log_exception("Failed to update hits")
+
+        # ========== БЛОК 6: СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
+        if self.cfg.cv_enabled and p_pred is not None:
+            self.cv_oof_preds[ph].append(float(p_pred))
+            self.cv_oof_labels[ph].append(int(y_up))
+
+        # ========== БЛОК 7: ФАЗОВАЯ КАЛИБРОВКА ==========
+        try:
+            p_raw = self._predict_raw(x_raw)
+            if p_raw is not None:
+                if self.cal_ph[ph] is None:
+                    from prob_calibrators import make_calibrator
+                    method = getattr(self.cfg, "xgb_calibration_method", "logistic")
+                    self.cal_ph[ph] = make_calibrator(method)
+                if self.cal_ph[ph] is not None:
+                    self.cal_ph[ph].observe(float(p_raw), int(y_up))
+                    if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
+                        cal_path = self._cal_path(self.cfg.xgb_cal_path, ph)
+                        self.cal_ph[ph].save(cal_path)
+        except Exception as e:
+            import logging
+            logging.getLogger("errors").error("[xgb] calibrator failed ph=%s: %s", ph, e, exc_info=True)
+
+        # ========== БЛОК 8: ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
+        self.cv_last_check[ph] = self.cv_last_check.get(ph, 0) + 1
+        
+        if self.cfg.cv_enabled and self.cv_last_check[ph] >= self.cfg.cv_check_every:
+            self.cv_last_check[ph] = 0
             
-            # Ранняя остановка при конвергенции
-            if iteration > 20 and len(loss_history) > 10:
-                recent_improvement = abs(loss_history[-1] - loss_history[-10])
-                if recent_improvement < 1e-6 and avg_sigma < 0.1:
-                    print(f"[MetaCEMMC] 🏁 Early stopping at iter {iteration}: converged")
-                    break
-        
-        # НОВОЕ: Финальная отправка результатов
-        if viz_enabled and viz is not None:
-            try:
-                # Отправляем финальное состояние
-                viz.record_meta_training_step(
-                    phase=ph,
-                    iteration=n_iter,
-                    best_loss=float(best_loss),
-                    median_loss=float(best_loss),  # В конце median = best
-                    sigma=0.0  # Сигнал завершения
-                )
-                
-                # Итоговая статистика
-                convergence_rate = (loss_history[0] - best_loss) / max(loss_history[0], 1e-6) if loss_history else 0
-                print(f"\n[MetaCEMMC] 🎉 CEM Training Complete:")
-                print(f"  Phase: {ph}")
-                print(f"  Final loss: {best_loss:.6f}")
-                print(f"  Improvements: {improvement_count}/{n_iter}")
-                print(f"  Convergence: {convergence_rate:.2%}")
-                print(f"  Final sigma: {np.mean(sigma):.4f}")
-                print(f"  ✅ All metrics sent to visualizer")
-                
-            except Exception as e:
-                print(f"[MetaCEMMC] ERROR sending final metrics: {e}")
-        
-        # Проверка что визуализатор получил данные
-        if viz_enabled and improvement_count > 0:
-            print(f"[MetaCEMMC] 📊 Check training_data.json - should have {min(n_iter, 10 + (n_iter-10)//5)} META points")
-        elif not viz_enabled:
-            print(f"[MetaCEMMC] ⚠️ Training completed without visualization")
-        
-        return best_w
+            cv_results = self._run_cv_validation(ph)
+            self.cv_metrics[ph] = cv_results
+            
+            if cv_results.get("status") == "ok":
+                self.validation_passed[ph] = True
+                print(f"[{self.__class__.__name__}] CV ph={ph}: "
+                    f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
+                    f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
+                    f"folds={cv_results['n_folds']}")
 
-    def _train_cma_es(self, X: np.ndarray, y: np.ndarray, ph: int, sample_weights: Optional[np.ndarray] = None) -> np.ndarray:
-        """
-        CMA-ES оптимизация (более продвинутая версия) с визуализацией
-        """
-        if not HAVE_CMA:
-            return self._train_cem(X, y, sample_weights=sample_weights)
+        # ========== БЛОК 9: ОБУЧЕНИЕ МОДЕЛИ ПО ФАЗЕ ==========
+        self._maybe_train_phase(ph)
 
-        D = X.shape[1]
-        sigma0 = 2.0
-        clip_val = float(getattr(self.cfg, "meta_w_clip", 8.0))
+        # ========== БЛОК 10: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ==========
+        self._maybe_flip_modes()
         
-        es = cma.CMAEvolutionStrategy(
-            x0=np.zeros(D),
-            sigma0=sigma0,
-            inopts={
-                'bounds': [-clip_val, clip_val],
-                'popsize': 50,
-                'maxiter': 100,
-                'verbose': -1
-            }
-        )
+        # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
+        self._save_all()
 
-        iters, best_hist, med_hist, sigma_hist = [], [], [], []
-
+        # ========== БЛОК 12: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
         try:
             from training_visualizer import get_visualizer
             viz = get_visualizer()
-            viz_enabled = True
-        except Exception:
-            viz_enabled = False
-
-        while not es.stop():
-            solutions = es.ask()
-            fitness = []
-            for w in solutions:
-                w_clipped = np.clip(w, -clip_val, clip_val)
-                loss = self._mc_eval(w_clipped, X, y, n_bootstrap=20, sample_weights=sample_weights)
-                fitness.append(loss)
-            es.tell(solutions, fitness)
             
-            it = len(best_hist) + 1
-            iters.append(it)
-            best_hist.append(float(np.min(fitness)))
-            med_hist.append(float(np.median(fitness)))
-            sigma_hist.append(float(getattr(es, "sigma", sigma0)))
+            # Теперь массивы гарантированно содержат актуальные данные
+            all_hits = self.active_hits + self.shadow_hits
+            wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
             
-            if viz_enabled and it % 5 == 0:
-                try:
-                    viz.record_meta_training_step(
-                        phase=ph,
-                        iteration=it,
-                        best_loss=float(best_hist[-1]),
-                        median_loss=float(med_hist[-1]),
-                        sigma=float(sigma_hist[-1])
-                    )
-                except Exception:
-                    from error_logger import log_exception
-                    log_exception("Unhandled exception")
-
-        w_best = np.array(es.result.xbest, dtype=float)
-        w_best = np.clip(w_best, -clip_val, clip_val)
-
-        if HAVE_PLOTTING:
-            try:
-                self._emit_report(
-                    ph=ph,
-                    algo="CMA-ES",
-                    iters=iters,
-                    best=best_hist,
-                    median=med_hist,
-                    sigma=sigma_hist
-                )
-            except Exception:
-                from error_logger import log_exception
-                log_exception("Unhandled exception")
-
-        return w_best
-
-    def _mc_eval(self, w: np.ndarray, X: np.ndarray, y: np.ndarray, n_bootstrap: int = 20, sample_weights: Optional[np.ndarray] = None) -> float:
-        """Монте-Карло оценка качества весов через взвешенный bootstrap"""
-        n = len(X)
-        if n == 0:  # FIX: ранний выход
-            return float('inf')
-        
-        if sample_weights is None:
-            sample_weights = np.ones(n)
-        
-        # FIX: защита от нулевой суммы
-        weights_sum = sample_weights.sum()
-        probs = (sample_weights / weights_sum) if weights_sum > 1e-12 else (np.ones(n) / n)
-        
-        losses = []
-        l2_reg = float(getattr(self.cfg, "meta_l2", 0.001))
-        
-        for _ in range(n_bootstrap):
-            idx = np.random.choice(n, size=n, replace=True, p=probs)
-            Xb, yb, weights_b = X[idx], y[idx], sample_weights[idx]
+            cv_metrics = self.cv_metrics.get(ph, {})
+            cv_accuracy = cv_metrics.get("oof_accuracy")
+            cv_ci_lower = cv_metrics.get("ci_lower")
+            cv_ci_upper = cv_metrics.get("ci_upper")
             
-            z = np.clip(Xb @ w, -60, 60)
-            p = np.clip(1.0 / (1.0 + np.exp(-z)), 1e-6, 1 - 1e-6)
+            # Отправляем реальные метрики в визуализатор
+            viz.record_expert_metrics(
+                expert_name="XGB",
+                accuracy=wr_all,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
+                mode=self.mode
+            )
             
-            sample_losses = -(yb * np.log(p) + (1 - yb) * np.log(1 - p))
-            
-            # FIX: безопасное взвешивание
-            wb_sum = weights_b.sum()
-            weighted_loss = (np.sum(sample_losses * weights_b) / wb_sum) if wb_sum > 1e-12 else np.mean(sample_losses)
-            
-            losses.append(weighted_loss + l2_reg * np.sum(w**2))
-        
-        return float(np.mean(losses))
+            # Дополнительная отладка для первых примеров
+            if len(all_hits) > 0 and len(all_hits) % 10 == 0:
+                print(f"[XGB] Metrics sent to viz: WR={wr_all:.2%}, n={len(all_hits)}, mode={self.mode}")
+                
+        except ImportError:
+            pass  # TrainingVisualizer не установлен
+        except Exception as e:
+            print(f"[XGB] Warning: Failed to send metrics to visualizer: {e}")
 
-    # ========== ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ С УЧЕТОМ CV ==========
+    # ---------- режимы ----------
     def _maybe_flip_modes(self):
-        """Переключение режимов SHADOW ↔ ACTIVE с учетом CV метрик"""
-        def wr(arr: List[int], n: int) -> Optional[float]:
-            if len(arr) < n:
-                return None
-            return 100.0 * sum(arr[-n:]) / n
+        """
+        Улучшенное переключение режимов с учётом:
+        1. Cross-validation метрик
+        2. Статистической значимости (bootstrap CI)
+        3. Out-of-fold predictions
+        """
+        if not self.cfg.cv_enabled:
+            # fallback к старой логике
+            self._maybe_flip_modes_simple()
+            return
         
-        try:
-            enter_wr = float(getattr(self.cfg, "meta_enter_wr", 58.0))
-            exit_wr = float(getattr(self.cfg, "meta_exit_wr", 52.0))
-            min_ready = int(getattr(self.cfg, "meta_min_ready", 80))  # ✅ БЫЛО 100, стало 80
-            cv_enabled = bool(getattr(self.cfg, "cv_enabled", True))
-        except Exception:
-            enter_wr, exit_wr, min_ready, cv_enabled = 58.0, 52.0, 100, True
+        def wr(arr, n):
+            if len(arr) < n: return None
+            window = arr[-n:]
+            return 100.0 * (sum(window)/len(window))
         
-        wr_shadow = wr(self.shadow_hits, min_ready)
-        wr_active = wr(self.active_hits, max(30, min_ready // 2))
+        # Текущие метрики
+        wr_shadow = wr(self.shadow_hits, getattr(self.cfg, 'min_ready', 80))
+        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
         
-        # FIX: валидация границ фазы
-        ph = max(0, min(getattr(self, "_last_phase", 0), self.P - 1))
+        # Получаем CV метрики текущей фазы
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_passed = self.validation_passed.get(ph, False)
         
-        # SHADOW → ACTIVE
-        if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= enter_wr:
-            if cv_enabled:
-                cv_metrics = self.cv_metrics.get(ph, {})
-                cv_passed = self.validation_passed.get(ph, False)
-                if cv_passed:
-                    cv_wr = cv_metrics.get("oof_accuracy", 0.0)
-                    ci_lower = cv_metrics.get("ci_lower", 0.0)
-                    min_improvement = float(getattr(self.cfg, "cv_min_improvement", 2.0))
-                    if cv_wr >= enter_wr and ci_lower >= (enter_wr - min_improvement):
-                        self.mode = "ACTIVE"
-                        print(f"[MetaCEMMC] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}%, CV_WR={cv_wr:.2f}% (CI: [{ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
-            else:
-                self.mode = "ACTIVE"
-                print(f"[MetaCEMMC] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}% (CV disabled)")
-        
-        # ACTIVE → SHADOW
-        if self.mode == "ACTIVE" and wr_active is not None:
-            basic_failed = wr_active < exit_wr
-            cv_degraded = cv_enabled and self.cv_metrics.get(ph, {}).get("oof_accuracy", 100.0) < exit_wr
+        # SHADOW → ACTIVE: требуем CV validation + bootstrap CI
+        if self.mode == "SHADOW" and wr_shadow is not None:
+            basic_threshold_met = wr_shadow >= self.cfg.enter_wr
             
-            if basic_failed or cv_degraded:
+            if basic_threshold_met and cv_passed:
+                # Проверяем статистическую значимость
+                cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+                cv_ci_lower = cv_metrics.get("ci_lower", 0.0)
+                
+                # Нужно: OOF accuracy > порог И нижняя граница CI тоже
+                if cv_wr >= self.cfg.enter_wr and cv_ci_lower >= (self.cfg.enter_wr - self.cfg.cv_min_improvement):
+                    self.mode = "ACTIVE"
+                    if HAVE_RIVER:
+                        self.adwin = ADWIN(delta=self.cfg.adwin_delta)
+                    print(f"[{self.__class__.__name__}] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}%, CV_WR={cv_wr:.2f}% (CI: [{cv_ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
+        
+        # ACTIVE → SHADOW: детектируем деградацию
+        if self.mode == "ACTIVE" and wr_active is not None:
+            basic_threshold_failed = wr_active < self.cfg.exit_wr
+            
+            # Также проверяем CV метрики на деградацию
+            cv_wr = cv_metrics.get("oof_accuracy", 100.0)
+            cv_degraded = cv_wr < self.cfg.exit_wr
+            
+            if basic_threshold_failed or cv_degraded:
                 self.mode = "SHADOW"
-                if cv_enabled:
-                    self.validation_passed[ph] = False
-                reason = "WR dropped" if basic_failed else "CV degraded"
-                print(f"[MetaCEMMC] ACTIVE→SHADOW ph={ph}: {reason} (WR={wr_active:.2f}%)")
+                self.validation_passed[ph] = False
+                print(f"[{self.__class__.__name__}] ACTIVE→SHADOW ph={ph}: WR={wr_active:.2f}%, CV_WR={cv_wr:.2f}%")
 
-    # ========== СТАТУС И ДИАГНОСТИКА ==========
-    def status(self) -> Dict[str, str]:
-        """
-        Возвращает текущий статус META с метриками
-        """
-        def _wr(xs: List[int]):
-            if not xs:
-                return None
+    def _maybe_flip_modes_simple(self):
+        """Старая логика для backward compatibility"""
+        def wr(arr, n):
+            if len(arr) < n: return None
+            window = arr[-n:]
+            return 100.0 * (sum(window)/len(window))
+        wr_shadow = wr(self.shadow_hits, getattr(self.cfg, 'min_ready', 80))
+        if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= self.cfg.enter_wr:
+            self.mode = "ACTIVE"
+            if HAVE_RIVER:
+                self.adwin = ADWIN(delta=self.cfg.adwin_delta)
+        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
+        if self.mode == "ACTIVE" and (wr_active is not None and wr_active < self.cfg.exit_wr):
+            self.mode = "SHADOW"
+
+    # ---------- совместимая обёртка ----------
+    def maybe_train(self, ph: Optional[int] = None, reg_ctx: Optional[dict] = None) -> None:
+        """Тренируем по текущей фазе (без «глобального» рефита)."""
+        if not self.enabled or self.n_feats is None:
+            return
+        if ph is None:
+            if isinstance(reg_ctx, dict) and "phase" in reg_ctx:
+                ph = int(reg_ctx["phase"])
+            else:
+                ph = int(getattr(self, "_last_seen_phase", 0))
+        self._maybe_train_phase(int(ph))
+
+    # ---------- статус ----------
+    def status(self):
+        def _wr(xs):
+            if not xs: return None
             return sum(xs) / float(len(xs))
-
-        def _fmt(p):
+        def _fmt_pct(p):
             return "—" if p is None else f"{100.0*p:.2f}%"
-
+        
         wr_a = _wr(self.active_hits)
         wr_s = _wr(self.shadow_hits)
         all_hits = (self.active_hits or []) + (self.shadow_hits or [])
         wr_all = _wr(all_hits)
-
-        ph = getattr(self, "_last_phase", 0)
+        
+        # CV метрики текущей фазы
+        ph = self._last_seen_phase
         cv_metrics = self.cv_metrics.get(ph, {})
         cv_status = cv_metrics.get("status", "N/A")
         cv_wr = cv_metrics.get("oof_accuracy", 0.0)
-        cv_ci = (
-            f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]"
-            if cv_status == "ok" else "N/A"
-        )
-
+        cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
+        
         return {
-            "algo": "CEM+MC" if not getattr(self.cfg, "meta_use_cma_es", False) else "CMA-ES+MC",
             "mode": self.mode,
-            "enabled": str(self.enabled),
-            "features": f"{self.D}D",
-            "wr_active": _fmt(wr_a),
-            "n_active": str(len(self.active_hits or [])),
-            "wr_shadow": _fmt(wr_s),
-            "n_shadow": str(len(self.shadow_hits or [])),
-            "wr_all": _fmt(wr_all),
-            "n": str(len(all_hits)),
-            "cv_oof_wr": _fmt(cv_wr / 100.0) if cv_wr > 0 else "—",
+            "enabled": self.enabled,
+            "wr_active": _fmt_pct(wr_a),
+            "n_active": len(self.active_hits or []),
+            "wr_shadow": _fmt_pct(wr_s),
+            "n_shadow": len(self.shadow_hits or []),
+            "wr_all": _fmt_pct(wr_all),
+            "n": len(all_hits),
+            "cv_oof_wr": _fmt_pct(cv_wr / 100.0) if cv_wr > 0 else "—",
             "cv_ci": cv_ci,
             "cv_validated": str(self.validation_passed.get(ph, False))
         }
 
-    # ========== РАБОТА С ФАЙЛАМИ ==========
-    # СТАЛО:
-    def _append_example(self, ph: int, x: np.ndarray, y: int) -> List:
-        """
-        Добавляет пример в буфер фазы и сохраняет в CSV с временной меткой.
-        Проверяет размер при первой записи и каждые 50 записей для более агрессивного контроля.
-        """
-        self.buf_ph[ph].append((x.tolist(), int(y)))
+
+
+
+
+# ---------- RF ----------
+class RFCalibratedExpert(_BaseExpert):
+    def __init__(self, cfg: MLConfig):
+        self.cfg = cfg
+        self.enabled = HAVE_SKLEARN
+        self.mode = "SHADOW"
+
+        # Калиброванный RF (калибровка внутри CalibratedClassifierCV)
+        self.clf: Optional[CalibratedClassifierCV] = None
+        # --- НОВОЕ: модели по фазам ---
+        self.clf_ph: Dict[int, Optional[CalibratedClassifierCV]] = {}
+
+
+        # Детектор дрейфа (как было)
+        self.adwin = ADWIN(delta=self.cfg.adwin_delta) if HAVE_RIVER else None
+
+        # ===== ГЛОБАЛЬНАЯ ПАМЯТЬ (хвост) =====
+        self.X: List[List[float]] = []
+        self.y: List[int] = []
+        self.new_since_train: int = 0
+
+        # ===== ФАЗОВАЯ ПАМЯТЬ =====
+        self.P: int = int(self.cfg.phase_count)  # 6 фаз: bull/bear/flat × low/high
+        self.X_ph: Dict[int, List[List[float]]] = {p: [] for p in range(self.P)}
+        self.y_ph: Dict[int, List[int]]         = {p: [] for p in range(self.P)}
+        self.new_since_train_ph: Dict[int, int] = {p: 0  for p in range(self.P)}
+
+        self.clf_ph = {p: None for p in range(self.P)}
+        # Последняя стабильная фаза — пригодится, если maybe_train() вызовут без reg_ctx
+        self._last_seen_phase: int = 0
+
+        # Хиты/диагностика
+        self.shadow_hits: List[int] = []
+        self.active_hits: List[int] = []
+        # Cross-validation tracking (per phase)
+        self.cv_oof_preds: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
+        self.cv_oof_labels: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
+        self.cv_metrics: Dict[int, Dict] = {p: {} for p in range(self.P)}
+        self.cv_last_check: Dict[int, int] = {p: 0 for p in range(self.P)}
         
-        csv_path = self._phase_csv_paths.get(ph)
-        if csv_path:
+        # Validation mode tracking
+        # Validation mode tracking
+        self.validation_passed: Dict[int, bool] = {p: False for p in range(self.P)}
+
+        # ===== ФАЗОВЫЕ КАЛИБРАТОРЫ =====
+        self.cal_ph: Dict[int, Optional[_BaseCal]] = {p: None for p in range(self.P)}
+        import os as _os
+        self._cal_path = lambda base, ph: f"{_os.path.splitext(base)[0]}_ph{int(ph)}{_os.path.splitext(base)[1]}"
+
+        # ✅ ДОБАВИЛИ: попытка загрузить фазовые калибраторы
+        for p in range(self.P):
             try:
-                # Инициализируем счетчик если его нет
-                if not hasattr(self, '_csv_counters'):
-                    self._csv_counters = {}
-                if ph not in self._csv_counters:
-                    self._csv_counters[ph] = 0
-                
-                # Проверяем размер чаще: при первой записи и каждые 50 записей
-                self._csv_counters[ph] += 1
-                should_check = (self._csv_counters[ph] == 1) or (self._csv_counters[ph] % 50 == 0)
-                
-                if should_check and os.path.exists(csv_path):
-                    # Быстрый подсчет строк
-                    with open(csv_path, "r", encoding="utf-8") as f:
-                        line_count = sum(1 for _ in f) - 1  # минус header
-                    
-                    # Более агрессивный лимит для гарантии размера в пределах 3000
-                    if line_count >= 3500:
-                        import pandas as pd
-                        df = pd.read_csv(csv_path, encoding="utf-8")
-                        # Оставляем последние 3000 записей
-                        df = df.tail(3000)
-                        df.to_csv(csv_path, index=False, encoding="utf-8")
-                        print(f"[MetaCEMMC] Rotated phase {ph} CSV: {line_count} → 3000 records")
-                        self._csv_counters[ph] = 3000  # Сбрасываем счетчик
-                
-                # Добавляем новую запись
-                file_exists = os.path.isfile(csv_path)
-                current_timestamp = time.time()
-                with open(csv_path, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    if not file_exists:
-                        header = [f"x{i}" for i in range(len(x))] + ["y", "timestamp"]
-                        writer.writerow(header)
-                    row = list(x) + [int(y), current_timestamp]
-                    writer.writerow(row)
-                    
+                self.cal_ph[p] = _BaseCal.load(self._cal_path(self.cfg.rf_cal_path, p))
             except Exception:
-                from error_logger import log_exception
-                log_exception("Failed to append example to phase CSV")
+                self.cal_ph[p] = None
+
+        # Техническое: число фич (заполним при первом вызове)
+        self.n_feats: Optional[int] = None
+
+        # Загрузка стейта (если сериализуете память/модель)
+        self._load_all()
+
+    # ---------- ВСПОМОГАТЕЛЬНЫЕ ----------
+    def _get_global_tail(self, n: int) -> Tuple[np.ndarray, np.ndarray]:
+        if n <= 0 or not self.X:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        Xg = np.array(self.X[-n:], dtype=np.float32)
+        yg = np.array(self.y[-n:], dtype=np.int32)
+        return Xg, yg
+
+    def _get_past_phases_tail(self, ph: int, n: int) -> Tuple[np.ndarray, np.ndarray]:
+        if n <= 0:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
         
-        return self.buf_ph[ph]
-
-    def _load_phase_buffer_from_disk(self, ph: int, max_age_days: Optional[float] = None) -> Tuple[List, List, List]:
-        """
-        Загружает накопленные данные фазы из CSV с экспоненциальным взвешиванием
-        """
-        X_list, y_list, weights = [], [], []
-        csv_path = self._phase_csv_paths.get(ph)
-        if not csv_path or not os.path.isfile(csv_path):
-            return X_list, y_list, weights
-
-        if max_age_days is None:
-            max_age_days = float(getattr(self.cfg, "meta_weight_decay_days", 30.0))
+        X_past = []
+        y_past = []
+        for p in range(ph):
+            # ✅ ИСПРАВЛЕНО: явная проверка существования и непустоты + синхронизация X и y
+            if p in self.X_ph and p in self.y_ph:
+                X_p = self.X_ph[p]
+                y_p = self.y_ph[p]
+                # Проверяем что оба списка не пустые И имеют одинаковую длину
+                if X_p and y_p and len(X_p) == len(y_p):
+                    X_past.extend(X_p)
+                    y_past.extend(y_p)
+                elif len(X_p) != len(y_p):
+                    # Защита от рассинхронизации - логируем ошибку
+                    print(f"[WARNING] Phase {p} data mismatch: X={len(X_p)}, y={len(y_p)}")
         
-        current_time = time.time()
+        if not X_past:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        
+        # Берем последние n записей
+        X_past = X_past[-n:]
+        y_past = y_past[-n:]
+        
+        return np.array(X_past, dtype=np.float32), np.array(y_past, dtype=np.int32)
 
-        try:
-            with open(csv_path, "r", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                header = next(reader, None)
-                has_timestamp = header and "timestamp" in header
-                for row in reader:
-                    if len(row) < 2:
-                        continue
-                    try:
-                        if has_timestamp and len(row) >= 3:
-                            x = [float(v) for v in row[:-2]]
-                            y = int(float(row[-2]))
-                            row_time = float(row[-1])
-                        else:
-                            # ИСПРАВЛЕНО: для старых записей без timestamp используем вес 0.5
-                            # вместо текущего времени (который дает вес 1.0)
-                            x = [float(v) for v in row[:-1]]
-                            y = int(float(row[-1]))
-                            # Используем время примерно месяц назад для старых записей
-                            row_time = current_time - (max_age_days * 86400.0)
-                        age_days = (current_time - row_time) / 86400.0
-                        # ДОБАВЛЕНО: ограничение возраста для предотвращения переполнения
-                        # и слишком маленьких весов
-                        age_days = max(0, min(age_days, max_age_days * 10))  # не более 10x период полураспада
-                        weight = math.exp(-age_days / max_age_days)
-                        # ДОБАВЛЕНО: минимальный вес для очень старых данных
-                        weight = max(weight, 1e-6)  # не допускаем нулевых весов
-                        X_list.append(x)
-                        y_list.append(y)
-                        weights.append(weight)
-                    except (ValueError, IndexError):
-                        continue
-        except Exception:
-            from error_logger import log_exception
-            log_exception("Unhandled exception")
+    def _get_phase_train(self, ph: int) -> Tuple[np.ndarray, np.ndarray]:
+        # X_phase
+        Xp = np.array(self.X_ph[ph], dtype=np.float32) if self.X_ph[ph] else np.empty((0, self.n_feats or 0), dtype=np.float32)
+        yp = np.array(self.y_ph[ph], dtype=np.int32)   if self.y_ph[ph]  else np.empty((0,), dtype=np.int32)
 
-        return X_list, y_list, weights
+        if len(Xp) >= int(self.cfg.phase_min_ready):
+            return Xp, yp
 
-    def _clear_phase_storage(self, ph: int):
+        # иначе смешиваем X_phase ∪ X_past_phases_tail (70/30 по умолчанию)
+        # ИСПРАВЛЕНИЕ: используем только прошлые фазы (0..ph), а не весь глобальный хвост
+        share = float(self.cfg.phase_mix_global_share)  # 0.30
+        need_g = int(round(len(Xp) * share / max(1e-9, (1.0 - share))))
+        need_g = max(need_g, int(self.cfg.phase_min_ready) - len(Xp))   # не менее, чтобы достичь порога
+        
+        # Считаем сколько доступно в фазах 0..ph
+        available_past = sum(len(self.X_ph.get(p, [])) for p in range(ph))  # ✅ ИСПРАВЛЕНО
+        need_g = min(need_g, available_past)  # не больше, чем доступно в прошлых фазах
+        
+        Xg, yg = self._get_past_phases_tail(ph, need_g)
+        if len(Xg) == 0:
+            return Xp, yp
+
+        X = np.concatenate([Xp, Xg], axis=0)
+        y = np.concatenate([yp, yg], axis=0)
+        return X, y
+
+    def _maybe_train_phase(self, ph: int) -> None:
         """
-        Очищает CSV файл фазы после обучения
+        Обучает Random Forest модель для конкретной фазы.
+        
+        Включает:
+        - Проверку накопленных данных
+        - Валидацию фичей
+        - Периодический анализ корреляции
+        - Обучение с калибровкой вероятностей
+        - Интеграцию с TrainingVisualizer
         """
-        csv_path = self._phase_csv_paths.get(ph)
-        if csv_path and os.path.isfile(csv_path):
+        
+        # ========== БЛОК 1: БАЗОВЫЕ ПРОВЕРКИ ==========
+        if self.n_feats is None or not self.enabled:
+            return
+        
+        if self.new_since_train_ph.get(ph, 0) < int(self.cfg.retrain_every):
+            return
+        
+        # ========== БЛОК 2: ПОЛУЧЕНИЕ ДАННЫХ ==========
+        X_all, y_all = self._get_phase_train(ph)
+        
+        if len(X_all) < int(self.cfg.phase_min_ready):
+            return
+        
+        # Ограничиваем окно обучения
+        if len(X_all) > int(self.cfg.train_window):
+            X_all = X_all[-int(self.cfg.train_window):]
+            y_all = y_all[-int(self.cfg.train_window):]
+        
+        # ========== БЛОК 3: ВАЛИДАЦИЯ ДАННЫХ ==========
+        # Проверяем на NaN/Inf перед обучением
+        if np.any(np.isnan(X_all)) or np.any(np.isinf(X_all)):
+            print(f"[RF] ⚠️  Warning: NaN/Inf detected in training data for phase {ph}, cleaning...")
+            X_all = np.nan_to_num(X_all, nan=0.0, posinf=1e10, neginf=-1e10)
+        
+
+        # ========== БЛОК 4: ПЕРИОДИЧЕСКИЙ АНАЛИЗ ФИЧЕЙ ==========
+        # Проверяем каждые 1000 примеров (или при первом достижении 500)
+        should_validate = (
+            (len(X_all) == 500) or  # Первый раз при 500
+            (len(X_all) % 1000 == 0 and len(X_all) >= 1000)  # Потом каждые 1000
+        )
+
+        if should_validate:
             try:
-                os.remove(csv_path)
-            except Exception:
-                from error_logger import log_exception
-                log_exception("Failed to remove file")
-
-
-    def _trim_phase_storage(self, ph: int):
-        """
-        Обрезает CSV файл фазы до phase_memory_cap последних записей
-        """
-        csv_path = self._phase_csv_paths.get(ph)
-        if not csv_path or not os.path.isfile(csv_path):
-            return
+                from feature_validator import analyze_feature_correlation, check_data_leakage
+                
+                print(f"\n[RF] 📊 Запуск валидации фичей для фазы {ph}...")
+                print(f"[RF] Примеров: {len(X_all)}, Фичей: {X_all.shape[1]}")
+                
+                # Анализ корреляции с сохранением отчета
+                results = analyze_feature_correlation(
+                    X_all, 
+                    y_all,
+                    feature_names=[f"f{i}" for i in range(X_all.shape[1])],
+                    top_n=20,
+                    save_report=True,
+                    report_path=f"feature_analysis_rf_ph{ph}_n{len(X_all)}.txt"
+                )
+                
+                # Проверка на утечку данных (ИСПРАВЛЕНО: добавлен y_all)
+                suspicious = check_data_leakage(
+                    X_all,
+                    y_all,  # ✅ ДОБАВЛЕНО
+                    feature_names=[f"f{i}" for i in range(X_all.shape[1])]
+                )
+                
+                # ========== ДЕЙСТВИЯ НА ОСНОВЕ РЕЗУЛЬТАТОВ ==========
+                
+                # 1. Подсчет проблемных фичей
+                excellent = sum(1 for r in results if r.status == "отлично")
+                good = sum(1 for r in results if r.status == "хорошо")
+                useless = sum(1 for r in results if r.status in ["бесполезно", "константа"])
+                
+                print(f"\n[RF] 📈 Итоги валидации:")
+                print(f"[RF]    Отличных фичей: {excellent}/{len(results)}")
+                print(f"[RF]    Хороших фичей: {good}/{len(results)}")
+                print(f"[RF]    Бесполезных фичей: {useless}/{len(results)}")
+                print(f"[RF]    Подозрительных фичей: {len(suspicious)}")
+                
+                # 2. Критическая проблема: более 50% фичей бесполезны
+                if useless > len(results) * 0.5:
+                    print(f"\n[RF] ❌ КРИТИЧЕСКАЯ ПРОБЛЕМА: {useless}/{len(results)} фичей бесполезны!")
+                    print(f"[RF] Рекомендуется пересмотреть feature engineering")
+                    
+                    # Отправляем уведомление в Telegram
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"⚠️ <b>RF: Проблема с фичами!</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Примеров: {len(X_all)}\n"
+                                f"Бесполезных фичей: {useless}/{len(results)} ({100*useless/len(results):.1f}%)\n\n"
+                                f"Требуется проверка feature engineering!")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 3. Предупреждение: мало значимых фичей
+                elif (excellent + good) < len(results) * 0.2:
+                    print(f"\n[RF] ⚠️  ПРОБЛЕМА: Только {excellent + good}/{len(results)} фичей значимы (<20%)")
+                    print(f"[RF] Рекомендуется добавить feature interactions")
+                    
+                    # Уведомление в Telegram (менее критичное)
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"🟡 <b>RF: Мало значимых фичей</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Значимых: {excellent + good}/{len(results)} ({100*(excellent + good)/len(results):.1f}%)\n\n"
+                                f"Рекомендуется feature engineering")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 4. Обнаружен data leakage
+                if suspicious:
+                    print(f"\n[RF] ⚠️  ВНИМАНИЕ: Data leakage обнаружен!")
+                    print(f"[RF] Подозрительные фичи ({len(suspicious)}):")
+                    for feat in suspicious[:5]:  # Показываем первые 5
+                        print(f"[RF]    - {feat}")
+                    if len(suspicious) > 5:
+                        print(f"[RF]    ... и еще {len(suspicious) - 5}")
+                    
+                    # Критическое уведомление в Telegram
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"🚨 <b>RF: Data Leakage!</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Обнаружено {len(suspicious)} подозрительных фичей\n\n"
+                                f"Срочно требуется проверка!\n\n"
+                                f"Список:\n" + "\n".join([f"- {f}" for f in suspicious[:5]]))
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 5. Все хорошо
+                if useless < len(results) * 0.3 and (excellent + good) >= len(results) * 0.2 and not suspicious:
+                    print(f"\n[RF] ✅ Качество фичей в норме!")
+                    
+                    # Позитивное уведомление (опционально, только при первой проверке)
+                    if len(X_all) == 500 and getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"✅ <b>RF: Валидация пройдена</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Примеров: {len(X_all)}\n"
+                                f"Отличных фичей: {excellent}/{len(results)}\n"
+                                f"Хороших фичей: {good}/{len(results)}\n\n"
+                                f"Качество фичей в норме!")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                print(f"[RF] 📄 Отчет сохранен: feature_analysis_rf_ph{ph}_n{len(X_all)}.txt\n")
+                
+                # ========== СОХРАНЕНИЕ СТАТИСТИКИ ==========
+                try:
+                    import json
+                    import time
+                    
+                    stats = {
+                        "timestamp": int(time.time()),
+                        "expert": "RF",
+                        "phase": ph,
+                        "n_samples": len(X_all),
+                        "n_features": X_all.shape[1],
+                        "excellent": excellent,
+                        "good": good,
+                        "useless": useless,
+                        "suspicious_count": len(suspicious),
+                        "suspicious_list": suspicious[:10],  # Первые 10
+                        "quality_score": (excellent * 2 + good) / len(results)  # Оценка 0-2
+                    }
+                    
+                    stats_file = f"feature_stats_rf_ph{ph}.json"
+                    with open(stats_file, 'w') as f:
+                        json.dump(stats, f, indent=2)
+                    
+                    print(f"[RF] 💾 Статистика сохранена: {stats_file}")
+                    
+                except Exception as e:
+                    print(f"[RF] ⚠️  Не удалось сохранить статистику: {e}")
+                
+            except ImportError:
+                # feature_validator не установлен - не критично
+                pass
+            except Exception as e:
+                print(f"[RF] ⚠️  Ошибка валидации фичей: {e}")
+                # Логируем ошибку, но не останавливаем обучение
+                try:
+                    from error_logger import log_exception
+                    log_exception(f"Feature validation failed for RF ph={ph}")
+                except ImportError:
+                    pass
         
+        # ========== БЛОК 5: ОБУЧЕНИЕ МОДЕЛИ ==========
         try:
-            max_cap = int(getattr(self.cfg, "phase_memory_cap", 3000))
+            from sklearn.ensemble import RandomForestClassifier
+            from sklearn.calibration import CalibratedClassifierCV
             
-            # Читаем все строки
-            with open(csv_path, "r", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                header = next(reader, None)
-                rows = list(reader)
-            
-            # Если меньше лимита - ничего не делаем
-            if len(rows) <= max_cap:
-                return
-            
-            # Оставляем последние max_cap записей
-            rows = rows[-max_cap:]
-            
-            # Перезаписываем файл
-            with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                if header:
-                    writer.writerow(header)
-                writer.writerows(rows)
-        except Exception:
-            from error_logger import log_exception
-            log_exception("Unhandled exception")
-
-    def _save_throttled(self):
-        """
-        Сохраняет состояние с ограничением частоты
-        """
-        now = time.time()
-        throttle_s = 60
-        if self._unsaved >= 100 or (now - self._last_save_ts) >= throttle_s:
-            self._save()
-            self._unsaved = 0
-            self._last_save_ts = now
-
-    def _save(self):
-        """Сохранение состояния META в JSON"""
-        try:
-            # FIX: w_meta_ph это numpy array, используем enumerate
-            st = {
-                "w_meta_ph": [w.tolist() for w in self.w_meta_ph],
-                "mode": self.mode,
-                "shadow_hits": list(self.shadow_hits)[-2000:],
-                "active_hits": list(self.active_hits)[-2000:],
-                "seen_ph": {int(k): int(v) for k, v in self.seen_ph.items()},
-                "cv_metrics": {int(k): v for k, v in self.cv_metrics.items()},
-                "validation_passed": {int(k): bool(v) for k, v in self.validation_passed.items()},
-                "cv_oof_window": int(getattr(self.cfg, "cv_oof_window", 500)),
-                "cv_last_check": {int(k): int(v) for k, v in self.cv_last_check.items()},
-                "_last_phase": int(getattr(self, "_last_phase", 0)),
-                "phase_csv_paths": {int(k): str(v) for k, v in self._phase_csv_paths.items()}
-            }
-            atomic_save_json(self.state_path, st)
-        except Exception as e:
-            print(f"[MetaCEMMC] Save error: {e}")
-
-    def _load(self):
-        """Загружает состояние META из JSON"""
-        path = getattr(self.cfg, "meta_state_path", "meta_state.json")
-        if not os.path.isfile(path):
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            
-            self.mode = state.get("mode", "SHADOW")
-            
-            # FIX: правильная обработка list/dict
-            w_data = state.get("w_meta_ph")
-            if w_data:
-                if isinstance(w_data, list):
-                    loaded_w = np.array(w_data, dtype=float)
-                elif isinstance(w_data, dict):
-                    loaded_w = np.array([w_data.get(str(i), np.zeros(self.D)) for i in range(self.P)], dtype=float)
-                else:
-                    loaded_w = None
-                
-                if loaded_w is not None and loaded_w.shape[0] == self.P:
-                    if loaded_w.shape[1] != self.D:
-                        old_D = loaded_w.shape[1]
-                        new_w = np.zeros((self.P, self.D), dtype=float)
-                        min_D = min(old_D, self.D)
-                        new_w[:, :min_D] = loaded_w[:, :min_D]
-                        self.w_meta_ph = new_w
-                        print(f"[MetaCEMMC] Expanded weights {old_D}D → {self.D}D")
-                    else:
-                        self.w_meta_ph = loaded_w
-            
-            self.shadow_hits = state.get("shadow_hits", [])
-            self.active_hits = state.get("active_hits", [])
-            
-            # Нормализация словарей (как было)
-            sp = state.get("seen_ph", {p: 0 for p in range(self.P)})
-            if isinstance(sp, list):
-                sp = {i: int(v) for i, v in enumerate(sp)}
-            elif isinstance(sp, dict):
-                sp = {int(k): int(v) for k, v in sp.items()}
-            for p in range(self.P):
-                sp.setdefault(p, 0)
-            self.seen_ph = sp
-            
-            cm = state.get("cv_metrics", {p: {} for p in range(self.P)})
-            if isinstance(cm, list):
-                cm = {i: v for i, v in enumerate(cm)}
-            elif isinstance(cm, dict):
-                cm = {int(k): v for k, v in cm.items()}
-            for p in range(self.P):
-                cm.setdefault(p, {})
-            self.cv_metrics = cm
-            
-            vp = state.get("validation_passed", {p: False for p in range(self.P)})
-            if isinstance(vp, list):
-                vp = {i: bool(v) for i, v in enumerate(vp)}
-            elif isinstance(vp, dict):
-                vp = {int(k): bool(v) for k, v in vp.items()}
-            for p in range(self.P):
-                vp.setdefault(p, False)
-            self.validation_passed = vp
-            
-            clc = state.get("cv_last_check", {p: 0 for p in range(self.P)})
-            if isinstance(clc, list):
-                clc = {i: int(v) for i, v in enumerate(clc)}
-            elif isinstance(clc, dict):
-                clc = {int(k): int(v) for k, v in clc.items()}
-            for p in range(self.P):
-                clc.setdefault(p, 0)
-            self.cv_last_check = clc
-            
-            # FIX: валидация границ
-            self._last_phase = max(0, min(int(state.get("_last_phase", 0)), self.P - 1))
-            
-            saved_paths = state.get("phase_csv_paths", {})
-            if saved_paths:
-                self._phase_csv_paths = {int(k): str(v) for k, v in saved_paths.items()}
-                
-        except Exception as e:
-            from error_logger import log_exception
-            log_exception("Unhandled exception")
-
-    def _emit_report(
-        self,
-        ph: Optional[int],
-        algo: Optional[str] = None,
-        iters=None,
-        best=None,
-        median=None,
-        sigma=None
-    ):
-        """Генерирует и отправляет отчет об обучении"""
-        if not HAVE_PLOTTING or plot_cma_like is None:
-            return
-        try:
-            fig_path = plot_cma_like(
-                iters=iters,
-                best=best,
-                median=median,
-                sigma=sigma,
-                phase=ph,
-                algo=algo or "CMA-ES"
+            # Создаем базовую модель Random Forest
+            base = RandomForestClassifier(
+                n_estimators=getattr(self.cfg, "rf_n_estimators", 300),
+                max_depth=getattr(self.cfg, "rf_max_depth", None),
+                min_samples_leaf=getattr(self.cfg, "rf_min_samples_leaf", 2),
+                n_jobs=-1,
+                random_state=42,
+                class_weight=None
             )
             
-            if send_telegram_photo and os.path.isfile(fig_path):
-                token = getattr(self.cfg, 'tg_bot_token', '')
-                chat_id = getattr(self.cfg, 'tg_chat_id', '')
-                if token and chat_id:
-                    send_telegram_photo(token, chat_id, fig_path, caption=f"META {algo} phase {ph}")
-                try:
-                    os.remove(fig_path)
-                except Exception:
-                    pass
+            # Оборачиваем в калибратор для получения откалиброванных вероятностей
+            cal_method = getattr(self.cfg, "rf_calibration_method", "sigmoid")
+            try:
+                # Новый API sklearn
+                model = CalibratedClassifierCV(estimator=base, method=cal_method, cv=3)
+            except TypeError:
+                # Старый API sklearn
+                model = CalibratedClassifierCV(base_estimator=base, method=cal_method, cv=3)
+            
+            # Обучение на фазовом батче
+            model.fit(X_all, y_all)
+            
+            # Сохраняем модель для конкретной фазы
+            self.clf_ph[ph] = model
+            
+            # Обратная совместимость: ссылка на последнюю обученную модель
+            self.clf = model
+            
+            # Сбрасываем счетчик новых примеров
+            self.new_since_train_ph[ph] = 0
+            
+            # Сохраняем состояние на диск
+            self._save_all()
+            
+            print(f"[RF] ✅ Trained on phase {ph}: {len(X_all)} samples, {cal_method} calibration")
+            
         except Exception as e:
-            print(f"[MetaCEMMC] Report failed: {e.__class__.__name__}: {e}")
+            print(f"[RF] ❌ Training error (ph={ph}): {e}")
+            import traceback
+            traceback.print_exc()
+            return
+        
+        # ========== БЛОК 6: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            
+            # Вычисляем общий winrate
+            all_hits = self.active_hits + self.shadow_hits
+            wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
+            
+            # Получаем CV метрики текущей фазы
+            cv_metrics = self.cv_metrics.get(ph, {})
+            cv_accuracy = cv_metrics.get("oof_accuracy")
+            cv_ci_lower = cv_metrics.get("ci_lower")
+            cv_ci_upper = cv_metrics.get("ci_upper")
+            
+            # Отправляем метрики в visualizer
+            viz.record_expert_metrics(
+                expert_name="RF",
+                accuracy=wr_all,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
+                mode=self.mode
+            )
+            
+        except ImportError:
+            pass  # TrainingVisualizer не установлен
+        except Exception as e:
+            print(f"[RF] Warning: Failed to send metrics to visualizer: {e}")
 
-# ========== ЭКСПОРТ ==========
 
-__all__ = ["MetaCEMMC"]
+    def _run_cv_validation(self, ph: int) -> Dict:
+        """
+        Walk-forward purged cross-validation для фазы ph.
+        Возвращает метрики: accuracy, CI bounds, fold scores.
+        """
+        X_all, y_all = self._get_phase_train(ph)
+        
+        if len(X_all) < self.cfg.cv_min_train_size:
+            return {"status": "insufficient_data", "oof_accuracy": 0.0}
+        
+        n_samples = len(X_all)
+        n_splits = min(self.cfg.cv_n_splits, n_samples // self.cfg.cv_min_train_size)
+        
+        if n_splits < 2:
+            return {"status": "insufficient_splits", "oof_accuracy": 0.0}
+        
+        # Walk-forward splits с purge и embargo
+        embargo_size = max(1, int(n_samples * self.cfg.cv_embargo_pct))
+        purge_size = max(1, int(n_samples * self.cfg.cv_purge_pct))
+        
+        fold_size = n_samples // n_splits
+        oof_preds = np.zeros(n_samples)
+        oof_mask = np.zeros(n_samples, dtype=bool)
+        fold_scores = []
+        
+        for fold_idx in range(n_splits):
+            # Test fold
+            test_start = fold_idx * fold_size
+            test_end = min(test_start + fold_size, n_samples)
+            
+            # Train: всё до (test_start - purge_size)
+            train_end = max(0, test_start - purge_size)
+            
+            if train_end < self.cfg.cv_min_train_size:
+                continue
+            
+            X_train = X_all[:train_end]
+            y_train = y_all[:train_end]
+            X_test = X_all[test_start:test_end]
+            y_test = y_all[test_start:test_end]
+            
+            # Обучаем временную модель на train fold
+            temp_model = self._train_fold_model(X_train, y_train, ph)
+            
+            # Предсказания на test fold
+            preds = self._predict_fold(temp_model, X_test, ph)
+            
+            # Сохраняем OOF predictions
+            oof_preds[test_start:test_end] = preds
+            oof_mask[test_start:test_end] = True
+            
+            # Метрики фолда
+            fold_acc = np.mean((preds >= 0.5) == y_test)
+            fold_scores.append(fold_acc)
+        
+        # Итоговые OOF метрики
+        oof_valid = oof_mask.sum()
+        if oof_valid < self.cfg.cv_min_train_size:
+            return {"status": "insufficient_oof", "oof_accuracy": 0.0}
+        
+        oof_accuracy = 100.0 * np.mean((oof_preds[oof_mask] >= 0.5) == y_all[oof_mask])
+        
+        # Bootstrap confidence intervals
+        ci_lower, ci_upper = self._bootstrap_ci(
+            oof_preds[oof_mask], 
+            y_all[oof_mask],
+            n_bootstrap=self.cfg.cv_bootstrap_n,
+            confidence=self.cfg.cv_confidence
+        )
+        
+        return {
+            "status": "ok",
+            "oof_accuracy": oof_accuracy,
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
+            "fold_scores": fold_scores,
+            "n_folds": len(fold_scores),
+            "oof_samples": int(oof_valid)
+        }
+
+    def _bootstrap_ci(self, preds: np.ndarray, labels: np.ndarray, 
+                    n_bootstrap: int, confidence: float) -> tuple:
+        """
+        Bootstrap confidence intervals для accuracy.
+        """
+        accuracies = []
+        n = len(preds)
+        
+        for _ in range(n_bootstrap):
+            # Resample с возвратом
+            idx = np.random.choice(n, size=n, replace=True)
+            boot_preds = preds[idx]
+            boot_labels = labels[idx]
+            boot_acc = 100.0 * np.mean((boot_preds >= 0.5) == boot_labels)
+            accuracies.append(boot_acc)
+        
+        accuracies = np.array(accuracies)
+        alpha = 1.0 - confidence
+        ci_lower = np.percentile(accuracies, 100 * alpha / 2)
+        ci_upper = np.percentile(accuracies, 100 * (1 - alpha / 2))
+        
+        return ci_lower, ci_upper
+
+    def _train_fold_model(self, X: np.ndarray, y: np.ndarray, ph: int):
+        """
+        Обучает временную модель для CV fold.
+        Реализация зависит от типа эксперта (XGB/RF/ARF/NN).
+        """
+        # Пример для XGB
+        if not HAVE_XGB:
+            return None
+        
+        scaler = StandardScaler().fit(X) if HAVE_SKLEARN else None
+        X_scaled = scaler.transform(X) if scaler else X
+        
+        dtrain = xgb.DMatrix(X_scaled, label=y)
+        model = xgb.train(
+            params={
+                "objective": "binary:logistic",
+                "max_depth": self.cfg.xgb_max_depth,
+                "eta": self.cfg.xgb_eta,
+                "subsample": self.cfg.xgb_subsample,
+                "colsample_bytree": self.cfg.xgb_colsample_bytree,
+                "min_child_weight": self.cfg.xgb_min_child_weight,
+                "eval_metric": "logloss",
+            },
+            dtrain=dtrain,
+            num_boost_round=self.cfg.xgb_rounds_warm,
+            verbose_eval=False
+        )
+        
+        return {"model": model, "scaler": scaler}
+
+    def _predict_fold(self, fold_model, X: np.ndarray, ph: int) -> np.ndarray:
+        """
+        Предсказания временной модели CV fold.
+        """
+        if fold_model is None:
+            return np.full(len(X), 0.5)
+        
+        scaler = fold_model.get("scaler")
+        model = fold_model.get("model")
+        
+        X_scaled = scaler.transform(X) if scaler else X
+        dtest = xgb.DMatrix(X_scaled)
+        preds = model.predict(dtest)
+        
+        return preds
+
+    def _ensure_dim(self, x_raw: np.ndarray):
+        d = int(x_raw.reshape(1, -1).shape[1])
+        if self.n_feats is None:
+            self.n_feats = d
+            self.X, self.y = [], []
+            self.clf = None
+            self.new_since_train = 0
+            # также обнулим фазовые буферы и счётчики
+            self.X_ph = {p: [] for p in range(self.P)}
+            self.y_ph = {p: [] for p in range(self.P)}
+            self.new_since_train_ph = {p: 0 for p in range(self.P)}
+            self._last_seen_phase = 0
+        elif self.n_feats != d:
+            # смена размерности — сбросить все накопленные данные
+            self.n_feats = d
+            self.X, self.y = [], []
+            self.clf = None
+            self.new_since_train = 0
+            self.X_ph = {p: [] for p in range(self.P)}
+            self.y_ph = {p: [] for p in range(self.P)}
+            self.new_since_train_ph = {p: 0 for p in range(self.P)}
+            self._last_seen_phase = 0
+
+    def _predict_raw(self, x_raw: np.ndarray) -> Optional[float]:
+        """
+        Сырое предсказание модели БЕЗ калибровки.
+        Для CalibratedClassifierCV возвращает предсказание базового estimator.
+        """
+        if not self.enabled:
+            return None
+        
+        # Определяем текущую фазу
+        ph = getattr(self, '_last_seen_phase', 0)
+        
+        # Выбираем модель: фазовая или глобальная
+        model = self.clf_ph.get(ph) or self.clf
+        
+        if model is None:
+            return None
+        
+        try:
+            xx = x_raw.astype(np.float32).reshape(1, -1)
+            if self.n_feats is None:
+                self.n_feats = xx.shape[1]
+            
+            # Пытаемся получить СЫРОЕ предсказание до калибровки
+            # CalibratedClassifierCV хранит базовый estimator
+            if hasattr(model, 'calibrated_classifiers_'):
+                # Берем первый калиброванный классификатор
+                base = model.calibrated_classifiers_[0].base_estimator
+                p = float(base.predict_proba(xx)[0, 1])
+            elif hasattr(model, 'base_estimator'):
+                p = float(model.base_estimator.predict_proba(xx)[0, 1])
+            elif hasattr(model, 'estimator'):
+                p = float(model.estimator.predict_proba(xx)[0, 1])
+            else:
+                # Fallback: используем калиброванную вероятность
+                # (не идеально, но лучше чем крэш)
+                p = float(model.predict_proba(xx)[0, 1])
+            
+            return float(min(max(p, 1e-6), 1.0 - 1e-6))
+        except Exception:
+            return None
+
+
+    # ---------- ЗАГРУЗКА/СОХРАНЕНИЕ ----------
+    def _load_all(self) -> None:
+        # --- загружаем состояние эксперта (JSON) ---
+        try:
+            if os.path.exists(self.cfg.rf_state_path):
+                with open(self.cfg.rf_state_path, "r") as f:
+                    st = json.load(f)
+
+                # Базовые поля (как раньше)
+                self.mode = st.get("mode", self.mode if hasattr(self, "mode") else "SHADOW")
+                self.shadow_hits = st.get("shadow_hits", [])[-1000:]
+                self.active_hits = st.get("active_hits", [])[-1000:]
+                self.n_feats = st.get("n_feats", self.n_feats if hasattr(self, "n_feats") else None)
+
+                # NEW: глобальная память (если есть в стейте)
+                self.X = st.get("X", self.X if hasattr(self, "X") else [])
+                self.y = st.get("y", self.y if hasattr(self, "y") else [])
+
+                # NEW: фазовая память (ключи → int; если нет — создаём пустые буферы)
+                X_ph = st.get("X_ph")
+                y_ph = st.get("y_ph")
+                if isinstance(X_ph, dict) and isinstance(y_ph, dict):
+                    self.X_ph = {int(k): v for k, v in X_ph.items()}
+                    self.y_ph = {int(k): v for k, v in y_ph.items()}
+                else:
+                    # старый формат без фаз — инициализируем по умолчанию
+                    self.X_ph = {p: [] for p in range(self.P)}
+                    self.y_ph = {p: [] for p in range(self.P)}
+
+                # NEW: счётчики retrain по фазам
+                self.new_since_train_ph = {p: 0 for p in range(self.P)}
+                if isinstance(st.get("new_since_train_ph"), dict):
+                    for k, v in st["new_since_train_ph"].items():
+                        try:
+                            self.new_since_train_ph[int(k)] = int(v)
+                        except Exception:
+                            log_exception("Unhandled exception")
+
+                # NEW: последняя увиденная фаза (для maybe_train без reg_ctx)
+                try:
+                    self._last_seen_phase = int(st.get("_last_seen_phase", 0))
+                except Exception:
+                    self._last_seen_phase = 0
+
+                # Безопасные обрезки по капам (на случай старых больших стейтов)
+                max_mem = getattr(self.cfg, "max_memory", None)
+                if isinstance(max_mem, int) and max_mem > 0 and len(self.X) > max_mem:
+                    self.X = self.X[-max_mem:]
+                    self.y = self.y[-max_mem:]
+
+                cap = int(self.cfg.phase_memory_cap)
+                for p in range(self.P):
+                    if len(self.X_ph.get(p, [])) > cap:
+                        self.X_ph[p] = self.X_ph[p][-cap:]
+                        self.y_ph[p] = self.y_ph[p][-cap:]
+        except Exception as e:
+            print(f"[rf  ] _load_all state error: {e}")
+
+        # --- загружаем модель RF+калибратор (pickle) ---
+        try:
+            if os.path.exists(self.cfg.rf_model_path):
+                with open(self.cfg.rf_model_path, "rb") as f:
+                    self.clf = pickle.load(f)
+        except Exception as e:
+            print(f"[rf  ] _load_all model error: {e}")
+            self.clf = None
+
+        # --- НОВОЕ: загрузка фазовых моделей ---
+        try:
+            root, ext = os.path.splitext(self.cfg.rf_model_path)
+            for p in range(self.P):
+                ph_path = f"{root}_ph{p}{ext}"
+                if os.path.exists(ph_path):
+                    with open(ph_path, "rb") as f:
+                        self.clf_ph[p] = pickle.load(f)
+        except Exception as e:
+            print(f"[rf  ] _load_all per-phase model error: {e}")
+
+    def _save_all(self) -> None:
+        # --- сохраняем состояние эксперта (JSON) ---
+        try:
+            # Перед сохранением гарантируем обрезку по капам
+            max_mem = getattr(self.cfg, "max_memory", None)
+            X_tail = self.X
+            y_tail = self.y
+            if isinstance(max_mem, int) and max_mem > 0:
+                X_tail = self.X[-max_mem:]
+                y_tail = self.y[-max_mem:]
+
+            cap = int(self.cfg.phase_memory_cap)
+            X_ph_tail: Dict[int, List[List[float]]] = {}
+            y_ph_tail: Dict[int, List[int]] = {}
+            for p in range(self.P):
+                Xp = self.X_ph.get(p, [])
+                yp = self.y_ph.get(p, [])
+                X_ph_tail[p] = Xp[-cap:]
+                y_ph_tail[p] = yp[-cap:]
+
+            st = {
+                # базовые поля
+                "mode": self.mode,
+                "shadow_hits": self.shadow_hits[-1000:],
+                "active_hits": self.active_hits[-1000:],
+                "n_feats": self.n_feats,
+
+                # NEW: глобальная и фазовая память
+                "X": X_tail,
+                "y": y_tail,
+                "X_ph": X_ph_tail,
+                "y_ph": y_ph_tail,
+                "new_since_train_ph": {int(p): int(self.new_since_train_ph.get(p, 0)) for p in range(self.P)},
+                "_last_seen_phase": int(self._last_seen_phase),
+
+                # на всякий случай — пишем P (для отладки/совместимости)
+                "P": int(self.P),
+            }
+
+            with open(self.cfg.rf_state_path, "w") as f:
+                json.dump(st, f)
+        except Exception as e:
+            print(f"[rf  ] _save_all state error: {e}")
+
+        # --- сохраняем модель RF+калибратор (pickle) ---
+        try:
+            if self.clf is not None:
+                with open(self.cfg.rf_model_path, "wb") as f:
+                    pickle.dump(self.clf, f)
+        except Exception as e:
+            print(f"[rf  ] _save_all model error: {e}")
+
+        # --- НОВОЕ: сохранение фазовых моделей ---
+        try:
+            root, ext = os.path.splitext(self.cfg.rf_model_path)
+            for p, model in (self.clf_ph or {}).items():
+                if model is None:
+                    continue
+                ph_path = f"{root}_ph{int(p)}{ext}"
+                with open(ph_path, "wb") as f:
+                    pickle.dump(model, f)
+        except Exception as e:
+            print(f"[rf  ] _save_all per-phase model error: {e}")
+
+
+    # ---------- ИНФЕРЕНС / ОБУЧЕНИЕ ----------
+    def proba_up(self, x_raw: np.ndarray, reg_ctx: Optional[dict] = None) -> Tuple[Optional[float], str]:
+        # гарантируем корректную размерность
+        try:
+            self._ensure_dim(x_raw)
+        except Exception:
+            log_exception("Failed to save pickle")
+
+        # выбрать модель фазы, при отсутствии — глобальную
+        model = None
+        if isinstance(reg_ctx, dict):
+            ph = int(reg_ctx.get("phase", 0))
+            self._last_seen_phase = ph
+            model = self.clf_ph.get(ph)
+        if model is None:
+            model = self.clf
+
+        if not self.enabled or model is None:
+            return (None, self.mode)
+
+        # определим фазу (стабилизированную — вы добавляете в reg_ctx["phase"])
+        ph = 0
+        if isinstance(reg_ctx, dict):
+            ph = int(reg_ctx.get("phase", 0))
+        self._last_seen_phase = ph
+
+        xx = x_raw.astype(np.float32).reshape(1, -1)
+        if self.n_feats is None:
+            self.n_feats = xx.shape[1]
+
+        try:
+            p = float(model.predict_proba(xx)[0, 1])   # калибровка внутри
+            p = max(1e-6, min(1.0 - 1e-6, p))
+            return (p, self.mode)
+        except Exception:
+            return (None, self.mode)
+
+    def record_result(self, x_raw: np.ndarray, y_up: int, used_in_live: bool,
+                    p_pred: Optional[float] = None, reg_ctx: Optional[dict] = None) -> None:
+        """
+        Записывает результат предсказания и обновляет модель.
+        
+        Теперь включает:
+        - Валидацию и очистку фичей от NaN/Inf
+        - Сохранение в глобальную и фазовую память
+        - Трекинг хитов для оценки качества
+        - Out-of-fold predictions для cross-validation
+        - Периодическую CV проверку для валидации модели
+        - Обучение модели при накоплении данных
+        - Переключение режимов SHADOW/ACTIVE на основе метрик
+        - Интеграцию с TrainingVisualizer для мониторинга
+        """
+        
+        # ========== БЛОК 0: ПРОВЕРКА АКТИВНОСТИ ЭКСПЕРТА ==========
+        if not self.enabled:
+            return
+        
+        # ========== БЛОК 0.5: ВАЛИДАЦИЯ И ОЧИСТКА ФИЧЕЙ ==========
+        x_raw = validate_and_clean_features(x_raw, "RF")
+        if x_raw is None:
+            return
+        
+        # ========== БЛОК 1: ИНИЦИАЛИЗАЦИЯ И ПРОВЕРКА РАЗМЕРНОСТИ ==========
+        self._ensure_dim(x_raw)
+
+        # ========== БЛОК 2: СОХРАНЕНИЕ В ГЛОБАЛЬНУЮ ПАМЯТЬ ==========
+        self.X.append(x_raw.astype(np.float32).ravel().tolist())
+        self.y.append(int(y_up))
+        
+        if len(self.X) > int(getattr(self.cfg, "max_memory", 10_000)):
+            self.X = self.X[-self.cfg.max_memory:]
+            self.y = self.y[-self.cfg.max_memory:]
+        
+        self.new_since_train += 1
+
+        # ========== БЛОК 3: ОПРЕДЕЛЕНИЕ ФАЗЫ ==========
+        ph = 0
+        if isinstance(reg_ctx, dict):
+            ph = int(reg_ctx.get("phase", 0))
+        self._last_seen_phase = ph
+
+        # ========== БЛОК 4: СОХРАНЕНИЕ В ФАЗОВУЮ ПАМЯТЬ ==========
+        self.X_ph[ph].append(x_raw.astype(np.float32).ravel().tolist())
+        self.y_ph[ph].append(int(y_up))
+        
+        cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
+        if len(self.X_ph[ph]) > cap:
+            self.X_ph[ph] = self.X_ph[ph][-cap:]
+            self.y_ph[ph] = self.y_ph[ph][-cap:]
+        
+        self.new_since_train_ph[ph] = self.new_since_train_ph.get(ph, 0) + 1
+
+        # ========== БЛОК 5: ТРЕКИНГ ХИТОВ И DRIFT DETECTION ==========
+        if p_pred is not None:
+            try:
+                hit = int((float(p_pred) >= 0.5) == bool(y_up))
+                
+                if self.mode == "ACTIVE" and used_in_live:
+                    self.active_hits.append(hit)
+                    
+                    if self.adwin is not None:
+                        in_drift = self.adwin.update(1 - hit)
+                        if in_drift:
+                            self.mode = "SHADOW"
+                            self.active_hits = []
+                else:
+                    self.shadow_hits.append(hit)
+                
+                # КРИТИЧЕСКОЕ ДОПОЛНЕНИЕ: ограничиваем размер массивов хитов
+                self.active_hits = self.active_hits[-2000:]
+                self.shadow_hits = self.shadow_hits[-2000:]
+                
+                # ОТЛАДКА: проверяем накопление хитов каждые 10 примеров
+                total_hits = len(self.active_hits) + len(self.shadow_hits)
+                if total_hits > 0 and total_hits % 10 == 0:
+                    wr = sum(self.shadow_hits[-100:]) / min(100, len(self.shadow_hits)) if self.shadow_hits else 0
+                    print(f"[RF] Hits accumulated: shadow={len(self.shadow_hits)}, active={len(self.active_hits)}, "
+                        f"last_100_wr={wr:.2%}")
+                    
+            except Exception as e:
+                print(f"[RF] ERROR updating hits: {e}, p_pred={p_pred}, y_up={y_up}")
+                log_exception("Failed to update RF hits")
+        else:
+            # ОТЛАДКА: логируем если p_pred отсутствует
+            if self.new_since_train % 50 == 0:
+                print(f"[RF] WARNING: p_pred is None for {self.new_since_train} samples")
+
+        # ========== БЛОК 6: СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
+        if self.cfg.cv_enabled and p_pred is not None:
+            self.cv_oof_preds[ph].append(float(p_pred))
+            self.cv_oof_labels[ph].append(int(y_up))
+
+        # ========== БЛОК 7: ФАЗОВАЯ КАЛИБРОВКА ==========
+        try:
+            p_raw = self._predict_raw(x_raw)
+            if p_raw is not None:
+                if self.cal_ph[ph] is None:
+                    from prob_calibrators import make_calibrator
+                    method = getattr(self.cfg, "rf_calibration_method", "sigmoid")
+                    self.cal_ph[ph] = make_calibrator(method)
+                if self.cal_ph[ph] is not None:
+                    self.cal_ph[ph].observe(float(p_raw), int(y_up))
+                    if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
+                        cal_path = self._cal_path(self.cfg.rf_cal_path, ph)
+                        self.cal_ph[ph].save(cal_path)
+        except Exception as e:
+            import logging
+            logging.getLogger("errors").error("[rf] calibrator failed ph=%s: %s", ph, e, exc_info=True)
+
+        # ========== БЛОК 8: ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
+        # ИСПРАВЛЕНО: безопасная инициализация cv_last_check
+        self.cv_last_check[ph] = self.cv_last_check.get(ph, 0) + 1
+        
+        if self.cfg.cv_enabled and self.cv_last_check[ph] >= self.cfg.cv_check_every:
+            self.cv_last_check[ph] = 0
+            
+            cv_results = self._run_cv_validation(ph)
+            self.cv_metrics[ph] = cv_results
+            
+            if cv_results.get("status") == "ok":
+                self.validation_passed[ph] = True
+                print(f"[RF] CV ph={ph}: "
+                    f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
+                    f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
+                    f"folds={cv_results['n_folds']}")
+
+        # ========== БЛОК 9: ОБУЧЕНИЕ МОДЕЛИ ПО ФАЗЕ ==========
+        self._maybe_train_phase(ph)
+
+        # ========== БЛОК 10: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ==========
+        self._maybe_flip_modes()
+        
+        # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
+        self._save_all()
+
+        # ========== БЛОК 12: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            
+            # Теперь массивы гарантированно содержат актуальные данные
+            all_hits = self.active_hits + self.shadow_hits
+            wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
+            
+            cv_metrics = self.cv_metrics.get(ph, {})
+            cv_accuracy = cv_metrics.get("oof_accuracy")
+            cv_ci_lower = cv_metrics.get("ci_lower")
+            cv_ci_upper = cv_metrics.get("ci_upper")
+            
+            # Отправляем реальные метрики в визуализатор
+            viz.record_expert_metrics(
+                expert_name="RF",
+                accuracy=wr_all,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
+                mode=self.mode
+            )
+            
+            # Дополнительная отладка для контроля отправки метрик
+            if len(all_hits) == 1:  # Первый пример
+                print(f"[RF] First metrics sent to viz: WR={wr_all:.2%}, n={len(all_hits)}, mode={self.mode}")
+            elif len(all_hits) % 50 == 0:  # Каждые 50 примеров
+                print(f"[RF] Metrics update: WR={wr_all:.2%}, n={len(all_hits)}, mode={self.mode}, "
+                    f"CV={cv_accuracy:.1f}%" if cv_accuracy else "")
+                
+        except ImportError:
+            pass  # TrainingVisualizer не установлен
+        except Exception as e:
+            print(f"[RF] ERROR: Failed to send metrics to visualizer: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+    def _maybe_flip_modes(self):
+        """
+        Улучшенное переключение режимов с учётом:
+        1. Cross-validation метрик
+        2. Статистической значимости (bootstrap CI)
+        3. Out-of-fold predictions
+        """
+        if not self.cfg.cv_enabled:
+            # fallback к старой логике
+            self._maybe_flip_modes_simple()
+            return
+        
+        def wr(arr, n):
+            if len(arr) < n: return None
+            window = arr[-n:]
+            return 100.0 * (sum(window)/len(window))
+        
+        # Текущие метрики
+        wr_shadow = wr(self.shadow_hits, getattr(self.cfg, 'min_ready', 80))
+        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
+        
+        # Получаем CV метрики текущей фазы
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_passed = self.validation_passed.get(ph, False)
+        
+        # SHADOW → ACTIVE: требуем CV validation + bootstrap CI
+        if self.mode == "SHADOW" and wr_shadow is not None:
+            basic_threshold_met = wr_shadow >= self.cfg.enter_wr
+            
+            if basic_threshold_met and cv_passed:
+                # Проверяем статистическую значимость
+                cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+                cv_ci_lower = cv_metrics.get("ci_lower", 0.0)
+                
+                # Нужно: OOF accuracy > порог И нижняя граница CI тоже
+                if cv_wr >= self.cfg.enter_wr and cv_ci_lower >= (self.cfg.enter_wr - self.cfg.cv_min_improvement):
+                    self.mode = "ACTIVE"
+                    if HAVE_RIVER:
+                        self.adwin = ADWIN(delta=self.cfg.adwin_delta)
+                    print(f"[{self.__class__.__name__}] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}%, CV_WR={cv_wr:.2f}% (CI: [{cv_ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
+        
+        # ACTIVE → SHADOW: детектируем деградацию
+        if self.mode == "ACTIVE" and wr_active is not None:
+            basic_threshold_failed = wr_active < self.cfg.exit_wr
+            
+            # Также проверяем CV метрики на деградацию
+            cv_wr = cv_metrics.get("oof_accuracy", 100.0)
+            cv_degraded = cv_wr < self.cfg.exit_wr
+            
+            if basic_threshold_failed or cv_degraded:
+                self.mode = "SHADOW"
+                self.validation_passed[ph] = False
+                print(f"[{self.__class__.__name__}] ACTIVE→SHADOW ph={ph}: WR={wr_active:.2f}%, CV_WR={cv_wr:.2f}%")
+
+    def _maybe_flip_modes_simple(self):
+        """Старая логика для backward compatibility"""
+        def wr(arr, n):
+            if len(arr) < n: return None
+            window = arr[-n:]
+            return 100.0 * (sum(window)/len(window))
+        wr_shadow = wr(self.shadow_hits, getattr(self.cfg, 'min_ready', 80))
+        if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= self.cfg.enter_wr:
+            self.mode = "ACTIVE"
+            if HAVE_RIVER:
+                self.adwin = ADWIN(delta=self.cfg.adwin_delta)
+        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
+        if self.mode == "ACTIVE" and (wr_active is not None and wr_active < self.cfg.exit_wr):
+            self.mode = "SHADOW"
+
+    def maybe_train(self, ph: Optional[int] = None, reg_ctx: Optional[dict] = None) -> None:
+        """Совместимая обёртка: тренируем по текущей фазе (без глобального рефита)."""
+        if not self.enabled or self.n_feats is None:
+            return
+        if ph is None:
+            if isinstance(reg_ctx, dict) and "phase" in reg_ctx:
+                ph = int(reg_ctx["phase"])
+            else:
+                ph = int(getattr(self, "_last_seen_phase", 0))
+        self._maybe_train_phase(int(ph))
+
+
+
+    def status(self):
+        def _wr(xs):
+            if not xs: return None
+            return sum(xs) / float(len(xs))
+        def _fmt_pct(p):
+            return "—" if p is None else f"{100.0*p:.2f}%"
+        
+        wr_a = _wr(self.active_hits)
+        wr_s = _wr(self.shadow_hits)
+        all_hits = (self.active_hits or []) + (self.shadow_hits or [])
+        wr_all = _wr(all_hits)
+        
+        # CV метрики текущей фазы
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_status = cv_metrics.get("status", "N/A")
+        cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+        cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
+    
+        
+        return {
+            "mode": self.mode,
+            "enabled": self.enabled,
+            "wr_active": _fmt_pct(wr_a),
+            "n_active": len(self.active_hits or []),
+            "wr_shadow": _fmt_pct(wr_s),
+            "n_shadow": len(self.shadow_hits or []),
+            "wr_all": _fmt_pct(wr_all),
+            "n": len(all_hits),
+            "cv_oof_wr": _fmt_pct(cv_wr / 100.0) if cv_wr > 0 else "—",
+            "cv_ci": cv_ci,
+            "cv_validated": str(self.validation_passed.get(ph, False))
+        }
+
+
+
+# ---------- ARF (River) ----------
+class RiverARFExpert(_BaseExpert):
+    def __init__(self, cfg: MLConfig):
+        self.cfg = cfg
+        self.enabled = HAVE_RIVER and (river_forest is not None)
+        self.mode = "SHADOW"
+        self.adwin = ADWIN(delta=self.cfg.adwin_delta) if HAVE_RIVER else None
+        self.clf = None
+        if self.enabled:
+            try:
+                self.clf = river_forest.ARFClassifier(n_models=self.cfg.arf_n_models, seed=42)
+            except Exception:
+                self.clf = None
+                self.enabled = False
+
+        self.shadow_hits: List[int] = []
+        self.active_hits: List[int] = []
+
+        from collections import deque
+        self._seen_epochs = deque(maxlen=5000)
+
+        # Фазовая калибровка
+        self.P = int(getattr(self.cfg, "phase_count", 6))
+        self.cal_ph = {p: None for p in range(self.P)}
+        self._last_seen_phase = 0
+        self.n_feats: Optional[int] = None
+
+        # Минимальная память для CV (только последние N примеров)
+        # River работает онлайн, но для CV нужна небольшая история
+        cv_window = int(getattr(self.cfg, "cv_oof_window", 2000))
+        self.X: deque = deque(maxlen=cv_window)
+        self.y: deque = deque(maxlen=cv_window)
+        
+        # Фазовая память (ограниченная)
+        phase_cap = int(getattr(self.cfg, "phase_memory_cap", 2000))
+        self.X_ph: Dict[int, deque] = {p: deque(maxlen=phase_cap) for p in range(self.P)}
+        self.y_ph: Dict[int, deque] = {p: deque(maxlen=phase_cap) for p in range(self.P)}
+        self.new_since_train = 0
+        self.new_since_train_ph: Dict[int, int] = {p: 0 for p in range(self.P)}
+
+        # Cross-validation tracking (per phase)
+        self.cv_oof_preds: Dict[int, deque] = {p: deque(maxlen=cv_window) for p in range(self.P)}
+        self.cv_oof_labels: Dict[int, deque] = {p: deque(maxlen=cv_window) for p in range(self.P)}
+        self.cv_metrics: Dict[int, Dict] = {p: {} for p in range(self.P)}
+        self.cv_last_check: Dict[int, int] = {p: 0 for p in range(self.P)}
+        self.validation_passed: Dict[int, bool] = {p: False for p in range(self.P)}
+
+        # Загрузка калибраторов
+        for p in range(self.P):
+            try:
+                self.cal_ph[p] = _BaseCal.load(self._cal_path(self.cfg.arf_cal_path, p))
+            except Exception:
+                self.cal_ph[p] = None
+
+        self._load_all()
+
+    def _cal_path(self, base: str, ph: int) -> str:
+        """Генерирует путь к калибратору для конкретной фазы"""
+        root, ext = os.path.splitext(base)
+        return f"{root}_ph{int(ph)}{ext}"
+
+    def _ensure_dim(self, x_raw: np.ndarray):
+        """Проверяет и обновляет размерность признаков"""
+        d = int(x_raw.reshape(1, -1).shape[1])
+        if self.n_feats is None:
+            self.n_feats = d
+        elif self.n_feats != d:
+            # Смена размерности - переинициализируем модель
+            self.n_feats = d
+            self.clf = None
+            if self.enabled:
+                try:
+                    self.clf = river_forest.ARFClassifier(n_models=self.cfg.arf_n_models, seed=42)
+                except Exception:
+                    self.clf = None
+                    self.enabled = False
+            # Очищаем буферы
+            cv_window = int(getattr(self.cfg, "cv_oof_window", 2000))
+            self.X = deque(maxlen=cv_window)
+            self.y = deque(maxlen=cv_window)
+            phase_cap = int(getattr(self.cfg, "phase_memory_cap", 2000))
+            self.X_ph = {p: deque(maxlen=phase_cap) for p in range(self.P)}
+            self.y_ph = {p: deque(maxlen=phase_cap) for p in range(self.P)}
+
+    def _load_all(self):
+        """Загрузка сохраненного состояния"""
+        try:
+            if os.path.exists(self.cfg.arf_state_path):
+                with open(self.cfg.arf_state_path, "r") as f:
+                    st = json.load(f)
+                self.mode = st.get("mode", "SHADOW")
+                self.shadow_hits = st.get("shadow_hits", [])[-1000:]
+                self.active_hits = st.get("active_hits", [])[-1000:]
+                self.n_feats = st.get("n_feats")
+        except Exception:
+            log_exception("Failed to load JSON")
+        
+        if self.enabled:
+            try:
+                if os.path.exists(self.cfg.arf_model_path):
+                    with open(self.cfg.arf_model_path, "rb") as f:
+                        self.clf = pickle.load(f)
+            except Exception:
+                log_exception("Failed to load pickle")
+
+    def _save_all(self):
+        """Сохранение состояния"""
+        try:
+            with open(self.cfg.arf_state_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "mode": self.mode,
+                    "shadow_hits": self.shadow_hits[-1000:],
+                    "active_hits": self.active_hits[-1000:],
+                    "n_feats": self.n_feats,
+                }, f)
+        except Exception:
+            log_exception("Failed to save JSON")
+
+        if self.enabled and self.clf is not None:
+            try:
+                with open(self.cfg.arf_model_path, "wb") as f:
+                    pickle.dump(self.clf, f)
+            except Exception:
+                log_exception("Failed to save JSON")
+
+        # Сохранение калибраторов
+        try:
+            for ph, cal in (self.cal_ph or {}).items():
+                if cal is not None and getattr(cal, "ready", False):
+                    cal_path = self._cal_path(self.cfg.arf_cal_path, ph)
+                    try:
+                        cal.save(cal_path)
+                    except Exception:
+                        log_exception("Failed to save pickle")
+        except Exception:
+            log_exception("Failed to save pickle")
+
+    def _to_dict(self, x_raw: np.ndarray) -> Dict[str, float]:
+        """Преобразует numpy массив в dict для River"""
+        return {f"f{k}": float(v) for k, v in enumerate(x_raw.ravel().tolist())}
+
+    def _predict_raw(self, x_raw: np.ndarray) -> Optional[float]:
+        """Сырое предсказание модели без калибровки"""
+        if not self.enabled or self.clf is None:
+            return None
+        try:
+            pmap = self.clf.predict_proba_one(self._to_dict(x_raw))
+            p = float(pmap.get(True, pmap.get(1, 0.5)))
+            return float(min(max(p, 1e-6), 1.0 - 1e-6))
+        except Exception:
+            return None
+
+    def proba_up(self, x_raw: np.ndarray, reg_ctx: Optional[dict] = None) -> Tuple[Optional[float], str]:
+        """Предсказание вероятности UP с калибровкой"""
+        if not self.enabled or self.clf is None:
+            return (None, "DISABLED" if not self.enabled else self.mode)
+        
+        try:
+            self._ensure_dim(x_raw)
+            
+            # Сырой прогноз
+            p = self._predict_raw(x_raw)
+            if p is None:
+                return (None, self.mode)
+
+            # Фазовая калибровка
+            ph = int(reg_ctx.get("phase")) if isinstance(reg_ctx, dict) and "phase" in reg_ctx else 0
+            self._last_seen_phase = ph
+            cal = self.cal_ph.get(ph)
+            if cal is not None and getattr(cal, "ready", False):
+                try:
+                    p = float(cal.transform(float(p)))
+                except Exception:
+                    log_exception("Failed to transform")
+
+            p = float(min(max(p, 1e-6), 1.0 - 1e-6))
+            return (p, self.mode)
+        except Exception:
+            return (None, self.mode)
+
+    def record_result(self, x_raw: np.ndarray, y_up: int, used_in_live: bool,
+                    p_pred: Optional[float] = None, reg_ctx: Optional[dict] = None) -> None:
+        """
+        Записывает результат и обновляет модель онлайн.
+        River ARF обучается инкрементально без полного переобучения.
+        
+        Теперь включает:
+        - Валидацию и очистку фичей от NaN/Inf
+        - Онлайн-обучение на каждом примере
+        - Дедупликацию по epoch
+        - Трекинг качества и drift detection
+        - Out-of-fold predictions для CV
+        - Фазовую калибровку вероятностей
+        - Периодическую CV проверку
+        - Интеграцию с TrainingVisualizer
+        """
+        
+        # ========== БЛОК 0: ПРОВЕРКА АКТИВНОСТИ ==========
+        if not self.enabled or self.clf is None:
+            return
+        
+        # ========== БЛОК 0.5: ВАЛИДАЦИЯ И ОЧИСТКА ФИЧЕЙ ==========
+        x_raw = validate_and_clean_features(x_raw, "ARF")
+        if x_raw is None:
+            return
+        
+        # ========== БЛОК 1: ПРОВЕРКА РАЗМЕРНОСТИ ==========
+        self._ensure_dim(x_raw)
+
+        # ========== БЛОК 2: ДЕДУПЛИКАЦИЯ ПО EPOCH ==========
+        try:
+            eid = int(reg_ctx.get("epoch")) if isinstance(reg_ctx, dict) and "epoch" in reg_ctx else None
+        except Exception:
+            eid = None
+        if eid is not None and eid in self._seen_epochs:
+            return
+        if eid is not None:
+            self._seen_epochs.append(eid)
+
+        # ========== БЛОК 3: ОНЛАЙН-ОБУЧЕНИЕ RIVER ARF ==========
+        try:
+            self.clf.learn_one(self._to_dict(x_raw), bool(y_up))
+        except Exception as e:
+            print(f"[ARF] ERROR in online learning: {e}")
+            log_exception("ARF learn_one failed")
+
+        # ========== БЛОК 4: СОХРАНЕНИЕ В БУФЕРЫ ==========
+        self.X.append(x_raw.astype(np.float32).ravel().tolist())
+        self.y.append(int(y_up))
+        self.new_since_train += 1
+
+        # ========== БЛОК 5: ОПРЕДЕЛЕНИЕ ФАЗЫ ==========
+        ph = 0
+        if isinstance(reg_ctx, dict):
+            ph = int(reg_ctx.get("phase", 0))
+        self._last_seen_phase = ph
+
+        # ========== БЛОК 6: ФАЗОВАЯ ПАМЯТЬ ==========
+        self.X_ph[ph].append(x_raw.astype(np.float32).ravel().tolist())
+        self.y_ph[ph].append(int(y_up))
+        self.new_since_train_ph[ph] = self.new_since_train_ph.get(ph, 0) + 1
+
+        # ========== БЛОК 7: ТРЕКИНГ КАЧЕСТВА И DRIFT DETECTION ==========
+        if p_pred is not None:
+            try:
+                hit = int((float(p_pred) >= 0.5) == bool(y_up))
+                
+                if self.mode == "ACTIVE" and used_in_live:
+                    self.active_hits.append(hit)
+                    if self.adwin is not None:
+                        try:
+                            in_drift = self.adwin.update(1 - hit)
+                            if in_drift:
+                                self.mode = "SHADOW"
+                                self.active_hits = []
+                        except Exception:
+                            log_exception("ARF ADWIN failed")
+                else:
+                    self.shadow_hits.append(hit)
+                
+                # КРИТИЧЕСКОЕ ДОПОЛНЕНИЕ: ограничиваем размер массивов хитов
+                self.active_hits = self.active_hits[-2000:]
+                self.shadow_hits = self.shadow_hits[-2000:]
+                
+                # ОТЛАДКА: проверяем накопление хитов каждые 10 примеров
+                total_hits = len(self.active_hits) + len(self.shadow_hits)
+                if total_hits > 0 and total_hits % 10 == 0:
+                    wr = sum(self.shadow_hits[-100:]) / min(100, len(self.shadow_hits)) if self.shadow_hits else 0
+                    active_wr = sum(self.active_hits[-100:]) / min(100, len(self.active_hits)) if self.active_hits else 0
+                    print(f"[ARF] Hits accumulated: shadow={len(self.shadow_hits)} (WR={wr:.2%}), "
+                        f"active={len(self.active_hits)} (WR={active_wr:.2%})")
+                    
+            except Exception as e:
+                print(f"[ARF] ERROR updating hits: {e}, p_pred={p_pred}, y_up={y_up}")
+                log_exception("Failed to update ARF hits")
+        else:
+            # ОТЛАДКА: логируем если p_pred отсутствует
+            if self.new_since_train % 50 == 0:
+                print(f"[ARF] WARNING: p_pred is None for {self.new_since_train} samples")
+
+        # ========== БЛОК 8: OOF PREDICTIONS ДЛЯ CV ==========
+        if getattr(self.cfg, "cv_enabled", False) and p_pred is not None:
+            self.cv_oof_preds[ph].append(float(p_pred))
+            self.cv_oof_labels[ph].append(int(y_up))
+
+        # ========== БЛОК 9: ФАЗОВАЯ КАЛИБРОВКА ==========
+        try:
+            p_raw = self._predict_raw(x_raw)
+            if p_raw is not None:
+                if self.cal_ph[ph] is None:
+                    from prob_calibrators import make_calibrator
+                    method = getattr(self.cfg, "arf_calibration_method", "logistic")
+                    self.cal_ph[ph] = make_calibrator(method)
+                if self.cal_ph[ph] is not None:
+                    self.cal_ph[ph].observe(float(p_raw), int(y_up))
+                    if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
+                        cal_path = self._cal_path(self.cfg.arf_cal_path, ph)
+                        self.cal_ph[ph].save(cal_path)
+        except Exception as e:
+            import logging
+            logging.getLogger("errors").error("[arf] calibrator failed ph=%s: %s", ph, e, exc_info=True)
+
+        # ========== БЛОК 10: ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
+        self.cv_last_check[ph] = self.cv_last_check.get(ph, 0) + 1
+        
+        if getattr(self.cfg, "cv_enabled", False):
+            cv_check_every = int(getattr(self.cfg, "cv_check_every", 200))
+            if self.cv_last_check[ph] >= cv_check_every:
+                self.cv_last_check[ph] = 0
+                cv_results = self._run_cv_validation(ph)
+                self.cv_metrics[ph] = cv_results
+                
+                if cv_results.get("status") == "ok":
+                    self.validation_passed[ph] = True
+                    print(f"[ARF] CV ph={ph}: "
+                        f"ACC={cv_results['oof_accuracy']:.2f}% "
+                        f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
+                        f"n={cv_results['oof_samples']}")
+
+        # ========== БЛОК 11: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ==========
+        self._maybe_flip_modes()
+        
+        # ========== БЛОК 12: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
+        self._save_all()
+
+        # ========== БЛОК 13: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            
+            # Теперь массивы гарантированно содержат актуальные данные
+            all_hits = self.active_hits + self.shadow_hits
+            wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
+            
+            cv_metrics = self.cv_metrics.get(ph, {})
+            cv_accuracy = cv_metrics.get("oof_accuracy")
+            cv_ci_lower = cv_metrics.get("ci_lower")
+            cv_ci_upper = cv_metrics.get("ci_upper")
+            
+            # Отправляем реальные метрики в визуализатор
+            viz.record_expert_metrics(
+                expert_name="ARF",
+                accuracy=wr_all,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
+                mode=self.mode
+            )
+            
+            # КРИТИЧЕСКАЯ ОТЛАДКА: проверяем что данные действительно отправляются
+            if len(all_hits) == 1:  # Первый пример
+                print(f"[ARF] ✅ First metrics sent to viz: WR={wr_all:.2%}, n={len(all_hits)}, mode={self.mode}")
+            elif len(all_hits) % 20 == 0:  # Каждые 20 примеров (чаще чем у других)
+                print(f"[ARF] ✅ Metrics update sent: WR={wr_all:.2%}, n={len(all_hits)}, mode={self.mode}, "
+                    f"CV={cv_accuracy:.1f}%" if cv_accuracy else "")
+                
+                # Проверка состояния модели ARF
+                if hasattr(self.clf, 'n_models'):
+                    print(f"[ARF] Model status: n_models={self.clf.n_models}, "
+                        f"n_features={self.n_feats}")
+            
+            # Дополнительная проверка что визуализатор получил данные
+            if len(all_hits) == 10:
+                print(f"[ARF] 📊 Viz integration check: metrics should be visible in training_data.json now")
+                
+        except ImportError:
+            print("[ARF] WARNING: TrainingVisualizer not imported")
+        except Exception as e:
+            print(f"[ARF] ERROR: Failed to send metrics to visualizer: {e}")
+            import traceback
+            traceback.print_exc()
+            # Продолжаем работу даже если визуализатор сломан
+
+    def _get_phase_train(self, ph: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Получает данные для обучения/валидации фазы"""
+        if not self.X_ph[ph]:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        
+        X = np.array(list(self.X_ph[ph]), dtype=np.float32)
+        y = np.array(list(self.y_ph[ph]), dtype=np.int32)
+        return X, y
+
+    def _run_cv_validation(self, ph: int) -> Dict:
+        """
+        Простая walk-forward валидация для River ARF.
+        Использует последние N примеров из буфера.
+        """
+        X_all, y_all = self._get_phase_train(ph)
+        
+        cv_min_train = int(getattr(self.cfg, "cv_min_train_size", 100))
+        if len(X_all) < cv_min_train:
+            return {"status": "insufficient_data", "oof_accuracy": 0.0, "oof_samples": 0}
+        
+        # Используем OOF predictions из буфера (честная оценка)
+        if ph in self.cv_oof_preds and len(self.cv_oof_preds[ph]) >= cv_min_train:
+            preds = np.array(list(self.cv_oof_preds[ph]))
+            labels = np.array(list(self.cv_oof_labels[ph]))
+            
+            oof_accuracy = 100.0 * np.mean((preds >= 0.5) == labels)
+            
+            # Bootstrap CI
+            ci_lower, ci_upper = self._bootstrap_ci(
+                preds, labels,
+                n_bootstrap=int(getattr(self.cfg, "cv_bootstrap_n", 100)),
+                confidence=float(getattr(self.cfg, "cv_confidence", 0.95))
+            )
+            
+            return {
+                "status": "ok",
+                "oof_accuracy": oof_accuracy,
+                "ci_lower": ci_lower,
+                "ci_upper": ci_upper,
+                "oof_samples": len(preds)
+            }
+        
+        # Fallback: простая валидация на последних данных
+        n_test = max(50, len(X_all) // 5)
+        X_train, y_train = X_all[:-n_test], y_all[:-n_test]
+        X_test, y_test = X_all[-n_test:], y_all[-n_test:]
+        
+        if len(X_train) < cv_min_train // 2:
+            return {"status": "insufficient_train", "oof_accuracy": 0.0, "oof_samples": 0}
+        
+        # Временная модель для валидации
+        temp_clf = None
+        if HAVE_RIVER:
+            try:
+                temp_clf = river_forest.ARFClassifier(n_models=self.cfg.arf_n_models, seed=42)
+                for i in range(len(X_train)):
+                    x_dict = {f"f{k}": float(v) for k, v in enumerate(X_train[i])}
+                    temp_clf.learn_one(x_dict, bool(y_train[i]))
+            except Exception:
+                temp_clf = None
+        
+        if temp_clf is None:
+            return {"status": "temp_model_failed", "oof_accuracy": 0.0, "oof_samples": 0}
+        
+        # Предсказания
+        preds = []
+        for i in range(len(X_test)):
+            x_dict = {f"f{k}": float(v) for k, v in enumerate(X_test[i])}
+            pmap = temp_clf.predict_proba_one(x_dict)
+            p = float(pmap.get(True, pmap.get(1, 0.5)))
+            preds.append(p)
+        
+        preds = np.array(preds)
+        oof_accuracy = 100.0 * np.mean((preds >= 0.5) == y_test)
+        
+        ci_lower, ci_upper = self._bootstrap_ci(
+            preds, y_test,
+            n_bootstrap=int(getattr(self.cfg, "cv_bootstrap_n", 100)),
+            confidence=float(getattr(self.cfg, "cv_confidence", 0.95))
+        )
+        
+        return {
+            "status": "ok",
+            "oof_accuracy": oof_accuracy,
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
+            "oof_samples": len(preds)
+        }
+
+    def _bootstrap_ci(self, preds: np.ndarray, labels: np.ndarray, 
+                    n_bootstrap: int, confidence: float) -> tuple:
+        """Bootstrap confidence intervals для accuracy"""
+        accuracies = []
+        n = len(preds)
+        
+        if n < 10:
+            return (0.0, 100.0)
+        
+        for _ in range(n_bootstrap):
+            idx = np.random.choice(n, size=n, replace=True)
+            boot_preds = preds[idx]
+            boot_labels = labels[idx]
+            boot_acc = 100.0 * np.mean((boot_preds >= 0.5) == boot_labels)
+            accuracies.append(boot_acc)
+        
+        accuracies = np.array(accuracies)
+        alpha = 1.0 - confidence
+        ci_lower = np.percentile(accuracies, 100 * alpha / 2)
+        ci_upper = np.percentile(accuracies, 100 * (1 - alpha / 2))
+        
+        return ci_lower, ci_upper
+
+    def maybe_train(self, ph: Optional[int] = None, reg_ctx: Optional[dict] = None) -> None:
+        """
+        River ARF обучается онлайн в record_result(), поэтому этот метод пустой.
+        Оставлен для совместимости с интерфейсом _BaseExpert.
+        """
+        pass
+
+    def _maybe_flip_modes(self):
+        """Переключение режимов SHADOW ↔ ACTIVE с учетом CV"""
+        def wr(arr, n):
+            if len(arr) < n:
+                return None
+            window = arr[-n:]
+            return 100.0 * (sum(window) / len(window))
+        
+        min_ready = int(getattr(self.cfg, "min_ready", 500))
+        enter_wr = float(getattr(self.cfg, "enter_wr", 55.0))
+        exit_wr = float(getattr(self.cfg, "exit_wr", 50.0))
+        cv_enabled = getattr(self.cfg, "cv_enabled", True)
+        
+        wr_shadow = wr(self.shadow_hits, min_ready)
+        wr_active = wr(self.active_hits, max(30, min_ready // 2))
+        
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_passed = self.validation_passed.get(ph, False)
+        
+        # SHADOW → ACTIVE
+        if self.mode == "SHADOW" and wr_shadow is not None:
+            basic_met = wr_shadow >= enter_wr
+            
+            if cv_enabled and basic_met and cv_passed:
+                cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+                cv_ci_lower = cv_metrics.get("ci_lower", 0.0)
+                cv_min_improvement = float(getattr(self.cfg, "cv_min_improvement", 2.0))
+                
+                if cv_wr >= enter_wr and cv_ci_lower >= (enter_wr - cv_min_improvement):
+                    self.mode = "ACTIVE"
+                    if HAVE_RIVER:
+                        self.adwin = ADWIN(delta=self.cfg.adwin_delta)
+                    print(f"[ARF] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}%, "
+                          f"CV={cv_wr:.2f}% (CI: [{cv_ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
+            elif not cv_enabled and basic_met:
+                self.mode = "ACTIVE"
+                if HAVE_RIVER:
+                    self.adwin = ADWIN(delta=self.cfg.adwin_delta)
+        
+        # ACTIVE → SHADOW
+        if self.mode == "ACTIVE" and wr_active is not None:
+            basic_failed = wr_active < exit_wr
+            
+            cv_wr = cv_metrics.get("oof_accuracy", 100.0)
+            cv_degraded = cv_enabled and cv_wr < exit_wr
+            
+            if basic_failed or cv_degraded:
+                self.mode = "SHADOW"
+                self.validation_passed[ph] = False
+                print(f"[ARF] ACTIVE→SHADOW ph={ph}: WR={wr_active:.2f}%, CV={cv_wr:.2f}%")
+
+    def status(self):
+        def _wr(xs):
+            if not xs: return None
+            return sum(xs) / float(len(xs))
+        def _fmt_pct(p):
+            return "—" if p is None else f"{100.0*p:.2f}%"
+        
+        wr_a = _wr(self.active_hits)
+        wr_s = _wr(self.shadow_hits)
+        all_hits = (self.active_hits or []) + (self.shadow_hits or [])
+        wr_all = _wr(all_hits)
+        
+        # CV метрики текущей фазы
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_status = cv_metrics.get("status", "N/A")
+        cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+        cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
+
+        
+        return {
+            "mode": self.mode,
+            "enabled": self.enabled,
+            "wr_active": _fmt_pct(wr_a),
+            "n_active": len(self.active_hits or []),
+            "wr_shadow": _fmt_pct(wr_s),
+            "n_shadow": len(self.shadow_hits or []),
+            "wr_all": _fmt_pct(wr_all),
+            "n": len(all_hits),
+            "cv_oof_wr": _fmt_pct(cv_wr / 100.0) if cv_wr > 0 else "—",
+            "cv_ci": cv_ci,
+            "cv_validated": str(self.validation_passed.get(ph, False))
+        }
+
+
+
+# =============================
+# NNExpert — компактная MLP с калибровкой температурой (ПО ФАЗАМ)
+# =============================
+class _SimpleMLP:
+    def __init__(self, n_in: int, n_h: int, eta: float, l2: float):
+        rng = np.random.default_rng(42)
+        self.n_in, self.n_h = int(n_in), int(n_h)
+        self.W1 = rng.normal(0, 0.1, size=(n_in, n_h)).astype(np.float32)
+        self.b1 = np.zeros(n_h, dtype=np.float32)
+        self.W2 = rng.normal(0, 0.1, size=(n_h,)).astype(np.float32)
+        self.b2 = np.float32(0.0)
+        self.eta = float(eta)
+        self.l2 = float(l2)
+
+    @staticmethod
+    def _sigmoid(z):
+        z = np.clip(z, -60.0, 60.0)
+        return 1.0/(1.0 + np.exp(-z))
+
+    @staticmethod
+    def _tanh(z):
+        return np.tanh(z)
+
+    def forward_logits(self, X: np.ndarray) -> np.ndarray:
+        H = self._tanh(X @ self.W1 + self.b1)
+        z = H @ self.W2 + self.b2
+        return z.astype(np.float32), H.astype(np.float32)
+
+    def predict_proba(self, X: np.ndarray, T: float = 1.0) -> np.ndarray:
+        z, _ = self.forward_logits(X)
+        zT = z / max(1e-3, float(T))
+        return self._sigmoid(zT).astype(np.float32)
+
+    def fit_epoch(self, X: np.ndarray, y: np.ndarray, batch_size: int = 128):
+        n = len(X)
+        if n <= 0:
+            return
+        idx = np.arange(n)
+        np.random.shuffle(idx)
+        for start in range(0, n, batch_size):
+            sl = idx[start:start+batch_size]
+            xb, yb = X[sl], y[sl]
+            z, H = self.forward_logits(xb)
+            p = self._sigmoid(z)
+            g = (p - yb).reshape(-1, 1)  # (B,1)
+            # grads
+            dW2 = (H * g).mean(axis=0) + self.l2 * self.W2
+            db2 = g.mean()
+            dH = g * (1.0 - H*H)  # tanh'
+            dW1 = (xb.T @ dH).astype(np.float32)/len(xb) + self.l2 * self.W1
+            db1 = dH.mean(axis=0)
+            # step
+            self.W2 -= self.eta * dW2
+            self.b2 -= self.eta * db2
+            self.W1 -= self.eta * dW1
+            self.b1 -= self.eta * db1
+
+    def save(self, path: str):
+        obj = dict(W1=self.W1, b1=self.b1, W2=self.W2, b2=self.b2, n_in=self.n_in, n_h=self.n_h, eta=self.eta, l2=self.l2)
+        with open(path, "wb") as f:
+            pickle.dump(obj, f)
+
+    @staticmethod
+    def load(path: str) -> Optional["_SimpleMLP"]:
+        try:
+            with open(path, "rb") as f:
+                obj = pickle.load(f)
+            m = _SimpleMLP(obj["n_in"], obj["n_h"], obj["eta"], obj["l2"])
+            m.W1, m.b1, m.W2, m.b2 = obj["W1"], obj["b1"], obj["W2"], obj["b2"]
+            return m
+        except Exception:
+            return None
+
+
+class NNExpert(_BaseExpert):
+    def __init__(self, cfg: MLConfig):
+        self.cfg = cfg
+        self.enabled = True  # без внешних зависимостей
+        self.mode = "SHADOW"
+        self.adwin = ADWIN(delta=self.cfg.adwin_delta) if HAVE_RIVER else None
+
+        # Скейлер + сеть
+        self.scaler: Optional[StandardScaler] = None
+        self.net: Optional[_SimpleMLP] = None
+        # --- НОВОЕ: перефазные сети и скейлеры ---
+        self.net_ph: Dict[int, Optional[_SimpleMLP]] = {}
+        self.scaler_ph: Dict[int, Optional[StandardScaler]] = {}
+        self.n_feats: Optional[int] = None
+
+        # ===== Глобальная память (хвост), как было =====
+        self.X: List[List[float]] = []
+        self.y: List[int] = []
+        self.new_since_train: int = 0
+
+        # ===== ФАЗОВАЯ ПАМЯТЬ =====
+        self.P: int = int(getattr(self.cfg, "phase_count", 6))  # 6 фаз по умолчанию
+        self.X_ph: Dict[int, List[List[float]]] = {p: [] for p in range(self.P)}
+        self.y_ph: Dict[int, List[int]]         = {p: [] for p in range(self.P)}
+        self.new_since_train_ph: Dict[int, int] = {p: 0  for p in range(self.P)}
+        self._last_seen_phase: int = 0
+
+        # ===== ФАЗОВЫЕ КАЛИБРАТОРЫ (НОВОЕ) =====
+        self.cal_ph: Dict[int, Optional[_BaseCal]] = {p: None for p in range(self.P)}
+        import os as _os
+        self._cal_path = lambda base, ph: f"{_os.path.splitext(base)[0]}_ph{int(ph)}{_os.path.splitext(base)[1]}"
+        try:
+            base_cal = getattr(self.cfg, "nn_cal_path", self.cfg.xgb_cal_path)
+            for p in range(self.P):
+                try:
+                    self.cal_ph[p] = _BaseCal.load(self._cal_path(base_cal, p))
+                except Exception:
+                    self.cal_ph[p] = None
+        except Exception:
+            log_exception("Failed to import os")
+
+        # ===== Калибровка температурой ПО ФАЗАМ =====
+        # T_ph[φ] — температура фазы; seen_since_calib_ph[φ] — накопленные наблюдения для пересчёта
+        self.T_ph: Dict[int, float] = {p: 1.0 for p in range(self.P)}
+        self.seen_since_calib_ph: Dict[int, int] = {p: 0 for p in range(self.P)}
+        # Старое поле T оставляем для обратной совместимости (не используется в прогнозе)
+        self.T: float = 1.0
+        # Cross-validation tracking (per phase)
+        self.cv_oof_preds: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
+        self.cv_oof_labels: Dict[int, deque] = {p: deque(maxlen=cfg.cv_oof_window) for p in range(self.P)}
+        self.cv_metrics: Dict[int, Dict] = {p: {} for p in range(self.P)}
+        self.cv_last_check: Dict[int, int] = {p: 0 for p in range(self.P)}
+        
+        # Validation mode tracking
+        self.validation_passed: Dict[int, bool] = {p: False for p in range(self.P)}
+
+        # Хиты
+        self.shadow_hits: List[int] = []
+        self.active_hits: List[int] = []
+
+        self._load_all()
+
+    # ---------- ВСПОМОГАТЕЛЬНЫЕ УТИЛЫ ----------
+    @staticmethod
+    def _clip01(p: float) -> float:
+        return float(min(max(p, 1e-6), 1 - 1e-6))
+
+    @staticmethod
+    def _sigmoid(z: float) -> float:
+        z = float(np.clip(z, -60.0, 60.0))
+        return 1.0/(1.0 + math.exp(-z))
+
+    @staticmethod
+    def _logit(p: float) -> float:
+        p = NNExpert._clip01(p)
+        return math.log(p / (1 - p))
+
+    def _ensure_dim(self, x_raw: np.ndarray):
+        d = int(x_raw.reshape(1, -1).shape[1])
+        if self.n_feats is None or self.n_feats != d:
+            # сбрасываем состояния под новую размерность
+            self.n_feats = d
+            self.net = None
+            self.scaler = None
+            self.X, self.y = [], []
+            self.new_since_train = 0
+            # фазовые буферы и счётчики тоже лучше сбросить, чтобы не мешались разные d
+            self.X_ph = {p: [] for p in range(self.P)}
+            self.y_ph = {p: [] for p in range(self.P)}
+            self.new_since_train_ph = {p: 0 for p in range(self.P)}
+            self.net_ph     = {p: None for p in range(self.P)}
+            self.scaler_ph  = {p: None for p in range(self.P)}
+            self.seen_since_calib_ph = {p: 0 for p in range(self.P)}
+            self.T_ph = {p: 1.0 for p in range(self.P)}
+
+    def _transform(self, X: np.ndarray) -> np.ndarray:
+        if self.scaler is None:
+            return X.astype(np.float32)
+        return self.scaler.transform(X.astype(np.float32))
+
+    def _get_global_tail(self, n: int) -> Tuple[np.ndarray, np.ndarray]:
+        if n <= 0 or not self.X:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        Xg = np.array(self.X[-n:], dtype=np.float32)
+        yg = np.array(self.y[-n:], dtype=np.int32)
+        return Xg, yg
+
+    def _get_past_phases_tail(self, ph: int, n: int) -> Tuple[np.ndarray, np.ndarray]:
+        # Берет последние n записей только из фаз 0..ph-1 (исключая текущую)
+        # Исключает данные из будущих фаз → нет утечки
+        if n <= 0:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        
+        # Собираем все данные из прошлых фаз (0..ph-1)
+        X_past = []
+        y_past = []
+        for p in range(ph):  # ✅ ИСПРАВЛЕНО: было range(min(ph + 1, self.P))
+            if self.X_ph.get(p):
+                X_past.extend(self.X_ph[p])
+                y_past.extend(self.y_ph[p])
+        
+        if not X_past:
+            return np.empty((0, self.n_feats or 0), dtype=np.float32), np.empty((0,), dtype=np.int32)
+        
+        # Берем последние n записей
+        X_past = X_past[-n:]
+        y_past = y_past[-n:]
+        
+        return np.array(X_past, dtype=np.float32), np.array(y_past, dtype=np.int32)
+
+    def _get_phase_train(self, ph: int) -> Tuple[np.ndarray, np.ndarray]:
+        # X_phase
+        Xp = np.array(self.X_ph[ph], dtype=np.float32) if self.X_ph[ph] else np.empty((0, self.n_feats or 0), dtype=np.float32)
+        yp = np.array(self.y_ph[ph], dtype=np.int32)   if self.y_ph[ph]  else np.empty((0,), dtype=np.int32)
+
+        if len(Xp) >= int(self.cfg.phase_min_ready):
+            return Xp, yp
+
+        # иначе смешиваем X_phase ∪ X_past_phases_tail (70/30 по умолчанию)
+        # ИСПРАВЛЕНИЕ: используем только прошлые фазы (0..ph), а не весь глобальный хвост
+        share = float(self.cfg.phase_mix_global_share)  # 0.30
+        need_g = int(round(len(Xp) * share / max(1e-9, (1.0 - share))))
+        need_g = max(need_g, int(self.cfg.phase_min_ready) - len(Xp))   # не менее, чтобы достичь порога
+        
+        # Считаем сколько доступно в фазах 0..ph
+        available_past = sum(len(self.X_ph.get(p, [])) for p in range(ph))  # ✅ ИСПРАВЛЕНО
+        need_g = min(need_g, available_past)  # не больше, чем доступно в прошлых фазах
+        
+        Xg, yg = self._get_past_phases_tail(ph, need_g)
+        if len(Xg) == 0:
+            return Xp, yp
+
+        X = np.concatenate([Xp, Xg], axis=0)
+        y = np.concatenate([yp, yg], axis=0)
+        return X, y
+
+    def _nll_with_T(self, z_list: np.ndarray, y: np.ndarray, T: float) -> float:
+        zT = z_list / float(max(T, 1e-6))
+        p = 1.0 / (1.0 + np.exp(-np.clip(zT, -60, 60)))
+        p = np.clip(p, 1e-6, 1 - 1e-6)
+        return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
+
+    def _maybe_recalibrate_T(self, ph: int) -> None:
+        """УПРОЩЕНО: Фиксированная температура T=1.0 (без grid search)."""
+        # ОТКЛЮЧЕНО: grid search по 25 температурам
+        # Используем фиксированную температуру для упрощения
+        self.T_ph[ph] = 1.0
+        self.seen_since_calib_ph[ph] = 0
+        return
+
+    # ---------- API ЭКСПЕРТА ----------
+    def proba_up(self, x_raw: np.ndarray, reg_ctx: Optional[dict] = None) -> Tuple[Optional[float], str]:
+        try:
+            self._ensure_dim(x_raw)
+        except Exception:
+            log_exception("Error in proba_up")
+
+        # стабильная фаза приходит в reg_ctx["phase"] (гистерезис выше по коду)
+        ph = 0
+        if isinstance(reg_ctx, dict):
+            ph = int(reg_ctx.get("phase", 0))
+        self._last_seen_phase = ph
+
+        # сеть / скейлер по фазе (fallback на глобальные, если нет)
+        net = (self.net_ph.get(ph) if hasattr(self, "net_ph") else None) or self.net
+        scaler = (self.scaler_ph.get(ph) if hasattr(self, "scaler_ph") else None) or self.scaler
+        if net is None:
+            return (None, self.mode)
+
+        try:
+            X = x_raw.reshape(1, -1).astype(np.float32)
+            Xt = scaler.transform(X) if scaler is not None else X
+            T = float(self.T_ph.get(ph, 1.0))
+            p = float(net.predict_proba(Xt, T=T)[0])
+            p = self._clip01(p)
+            return (p, self.mode)
+        except Exception:
+            return (None, self.mode)
+
+    def _predict_raw(self, x_raw: np.ndarray) -> Optional[float]:
+        """
+        Сырое (некалиброванное) p_up из текущей NN без температуры.
+        Использует фазовую сеть/скейлер, если есть; иначе — глобальные.
+        """
+        if not self.enabled:
+            return None
+
+        # берём последнюю «стабильную» фазу, которую фиксируем в proba_up/record_result
+        ph = int(getattr(self, "_last_seen_phase", 0))
+
+        net = (self.net_ph.get(ph) if hasattr(self, "net_ph") else None) or self.net
+        scaler = (self.scaler_ph.get(ph) if hasattr(self, "scaler_ph") else None) or self.scaler
+        if net is None:
+            return None
+
+        try:
+            X = x_raw.reshape(1, -1).astype(np.float32)
+            Xt = scaler.transform(X) if scaler is not None else X
+            # НЕ используем температуру: это сырое p для калибратора
+            p = float(net.predict_proba(Xt, T=1.0)[0])
+            return self._clip01(p)
+        except Exception:
+            return None
+
+    def record_result(self, x_raw: np.ndarray, y_up: int, used_in_live: bool,
+                    p_pred: Optional[float] = None, reg_ctx: Optional[dict] = None) -> None:
+        """
+        Записывает результат предсказания и обновляет модель.
+        
+        Теперь включает:
+        - Валидацию и очистку фичей от NaN/Inf
+        - Сохранение в глобальную и фазовую память
+        - Трекинг хитов для оценки качества
+        - Out-of-fold predictions для cross-validation
+        - Периодическую CV проверку для валидации модели
+        - Обучение модели при накоплении данных
+        - Переключение режимов SHADOW/ACTIVE на основе метрик
+        - Интеграцию с TrainingVisualizer для мониторинга
+        """
+        
+        # ========== БЛОК 0: ПРОВЕРКА АКТИВНОСТИ ЭКСПЕРТА ==========
+        if not self.enabled:
+            return
+        
+        # ========== БЛОК 0.5: ВАЛИДАЦИЯ И ОЧИСТКА ФИЧЕЙ ==========
+        x_raw = validate_and_clean_features(x_raw, "NN")
+        if x_raw is None:
+            return
+        
+        # ========== БЛОК 1: ИНИЦИАЛИЗАЦИЯ И ПРОВЕРКА РАЗМЕРНОСТИ ==========
+        self._ensure_dim(x_raw)
+
+        # ========== БЛОК 2: СОХРАНЕНИЕ В ГЛОБАЛЬНУЮ ПАМЯТЬ ==========
+        self.X.append(x_raw.astype(np.float32).ravel().tolist())
+        self.y.append(int(y_up))
+        
+        if len(self.X) > int(getattr(self.cfg, "max_memory", 10_000)):
+            self.X = self.X[-self.cfg.max_memory:]
+            self.y = self.y[-self.cfg.max_memory:]
+        
+        self.new_since_train += 1
+
+        # ========== БЛОК 3: ОПРЕДЕЛЕНИЕ ФАЗЫ ==========
+        ph = 0
+        if isinstance(reg_ctx, dict):
+            ph = int(reg_ctx.get("phase", 0))
+        self._last_seen_phase = ph
+
+        # ========== БЛОК 4: СОХРАНЕНИЕ В ФАЗОВУЮ ПАМЯТЬ ==========
+        self.X_ph[ph].append(x_raw.astype(np.float32).ravel().tolist())
+        self.y_ph[ph].append(int(y_up))
+        
+        cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
+        if len(self.X_ph[ph]) > cap:
+            self.X_ph[ph] = self.X_ph[ph][-cap:]
+            self.y_ph[ph] = self.y_ph[ph][-cap:]
+        
+        self.new_since_train_ph[ph] = self.new_since_train_ph.get(ph, 0) + 1
+
+        # ========== БЛОК 5: ТРЕКИНГ ХИТОВ И DRIFT DETECTION ==========
+        if p_pred is not None:
+            try:
+                hit = int((float(p_pred) >= 0.5) == bool(y_up))
+                
+                if self.mode == "ACTIVE" and used_in_live:
+                    self.active_hits.append(hit)
+                    
+                    if self.adwin is not None:
+                        in_drift = self.adwin.update(1 - hit)
+                        if in_drift:
+                            self.mode = "SHADOW"
+                            self.active_hits = []
+                else:
+                    self.shadow_hits.append(hit)
+                
+                # КРИТИЧЕСКОЕ ДОПОЛНЕНИЕ: ограничиваем размер массивов хитов
+                self.active_hits = self.active_hits[-2000:]
+                self.shadow_hits = self.shadow_hits[-2000:]
+                
+                # ОТЛАДКА: проверяем накопление хитов каждые 10 примеров
+                total_hits = len(self.active_hits) + len(self.shadow_hits)
+                if total_hits > 0 and total_hits % 10 == 0:
+                    wr = sum(self.shadow_hits[-100:]) / min(100, len(self.shadow_hits)) if self.shadow_hits else 0
+                    print(f"[NN] Hits accumulated: shadow={len(self.shadow_hits)}, active={len(self.active_hits)}, "
+                        f"last_100_wr={wr:.2%}")
+                    
+            except Exception as e:
+                print(f"[NN] ERROR updating hits: {e}, p_pred={p_pred}, y_up={y_up}")
+                log_exception("Failed to update NN hits")
+        else:
+            # ОТЛАДКА: логируем если p_pred отсутствует
+            if self.new_since_train % 50 == 0:
+                print(f"[NN] WARNING: p_pred is None for {self.new_since_train} samples")
+
+        # ========== БЛОК 6: СОХРАНЕНИЕ OOF PREDICTIONS ДЛЯ CV ==========
+        if self.cfg.cv_enabled and p_pred is not None:
+            self.cv_oof_preds[ph].append(float(p_pred))
+            self.cv_oof_labels[ph].append(int(y_up))
+
+        # ========== БЛОК 7: ФАЗОВАЯ КАЛИБРОВКА ==========
+        try:
+            p_raw = self._predict_raw(x_raw)
+            if p_raw is not None:
+                if self.cal_ph[ph] is None:
+                    from prob_calibrators import make_calibrator
+                    method = getattr(self.cfg, "nn_calibration_method",
+                                    getattr(self.cfg, "xgb_calibration_method", "logistic"))
+                    self.cal_ph[ph] = make_calibrator(method)
+                
+                if self.cal_ph[ph] is not None:
+                    self.cal_ph[ph].observe(float(p_raw), int(y_up))
+                    
+                    if self.cal_ph[ph].maybe_fit(min_samples=200, every=100):
+                        cal_path = self._cal_path(getattr(self.cfg, "nn_cal_path", self.cfg.xgb_cal_path), ph)
+                        self.cal_ph[ph].save(cal_path)
+        except Exception as e:
+            print(f"[NN] Calibration error: {e}")
+            log_exception("Failed to observe NN calibration")
+
+        # ========== БЛОК 8: ПЕРИОДИЧЕСКАЯ CV ПРОВЕРКА ==========
+        # ИСПРАВЛЕНО: безопасная инициализация cv_last_check
+        self.cv_last_check[ph] = self.cv_last_check.get(ph, 0) + 1
+        
+        if self.cfg.cv_enabled and self.cv_last_check[ph] >= self.cfg.cv_check_every:
+            self.cv_last_check[ph] = 0
+            
+            cv_results = self._run_cv_validation(ph)
+            self.cv_metrics[ph] = cv_results
+            
+            if cv_results.get("status") == "ok":
+                self.validation_passed[ph] = True
+                print(f"[NN] CV ph={ph}: "
+                    f"OOF_ACC={cv_results['oof_accuracy']:.2f}% "
+                    f"CI=[{cv_results['ci_lower']:.2f}%, {cv_results['ci_upper']:.2f}%] "
+                    f"folds={cv_results['n_folds']}")
+
+        # ========== БЛОК 9: ОБУЧЕНИЕ МОДЕЛИ ПО ФАЗЕ ==========
+        self._maybe_train_phase(ph)
+
+        # ========== БЛОК 10: ПЕРЕКЛЮЧЕНИЕ РЕЖИМОВ ==========
+        self._maybe_flip_modes()
+        
+        # ========== БЛОК 11: СОХРАНЕНИЕ СОСТОЯНИЯ ==========
+        self._save_all()
+
+        # ========== БЛОК 12: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            
+            # Теперь массивы гарантированно содержат актуальные данные
+            all_hits = self.active_hits + self.shadow_hits
+            wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
+            
+            cv_metrics = self.cv_metrics.get(ph, {})
+            cv_accuracy = cv_metrics.get("oof_accuracy")
+            cv_ci_lower = cv_metrics.get("ci_lower")
+            cv_ci_upper = cv_metrics.get("ci_upper")
+            
+            # Отправляем реальные метрики в визуализатор
+            viz.record_expert_metrics(
+                expert_name="NN",
+                accuracy=wr_all,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
+                mode=self.mode
+            )
+            
+            # Дополнительная отладка для контроля отправки метрик
+            if len(all_hits) == 1:  # Первый пример
+                print(f"[NN] First metrics sent to viz: WR={wr_all:.2%}, n={len(all_hits)}, mode={self.mode}")
+            elif len(all_hits) % 50 == 0:  # Каждые 50 примеров
+                print(f"[NN] Metrics update: WR={wr_all:.2%}, n={len(all_hits)}, mode={self.mode}, "
+                    f"CV={cv_accuracy:.1f}%" if cv_accuracy else "")
+                
+                # Проверка корректности нейросети
+                if hasattr(self, 'net') and self.net is not None:
+                    print(f"[NN] Network status: layers={len(self.net.layers) if hasattr(self.net, 'layers') else 'unknown'}, "
+                        f"trained={self.net is not None}")
+                
+        except ImportError:
+            pass  # TrainingVisualizer не установлен
+        except Exception as e:
+            print(f"[NN] ERROR: Failed to send metrics to visualizer: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _maybe_flip_modes(self):
+        """
+        Улучшенное переключение режимов с учётом:
+        1. Cross-validation метрик
+        2. Статистической значимости (bootstrap CI)
+        3. Out-of-fold predictions
+        """
+        if not self.cfg.cv_enabled:
+            # fallback к старой логике
+            self._maybe_flip_modes_simple()
+            return
+        
+        def wr(arr, n):
+            if len(arr) < n: return None
+            window = arr[-n:]
+            return 100.0 * (sum(window)/len(window))
+        
+        # Текущие метрики
+        wr_shadow = wr(self.shadow_hits, getattr(self.cfg, 'min_ready', 80))
+        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
+        
+        # Получаем CV метрики текущей фазы
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_passed = self.validation_passed.get(ph, False)
+        
+        # SHADOW → ACTIVE: требуем CV validation + bootstrap CI
+        if self.mode == "SHADOW" and wr_shadow is not None:
+            basic_threshold_met = wr_shadow >= self.cfg.enter_wr
+            
+            if basic_threshold_met and cv_passed:
+                # Проверяем статистическую значимость
+                cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+                cv_ci_lower = cv_metrics.get("ci_lower", 0.0)
+                
+                # Нужно: OOF accuracy > порог И нижняя граница CI тоже
+                if cv_wr >= self.cfg.enter_wr and cv_ci_lower >= (self.cfg.enter_wr - self.cfg.cv_min_improvement):
+                    self.mode = "ACTIVE"
+                    if HAVE_RIVER:
+                        self.adwin = ADWIN(delta=self.cfg.adwin_delta)
+                    print(f"[{self.__class__.__name__}] SHADOW→ACTIVE ph={ph}: WR={wr_shadow:.2f}%, CV_WR={cv_wr:.2f}% (CI: [{cv_ci_lower:.2f}%, {cv_metrics.get('ci_upper', 0):.2f}%])")
+        
+        # ACTIVE → SHADOW: детектируем деградацию
+        if self.mode == "ACTIVE" and wr_active is not None:
+            basic_threshold_failed = wr_active < self.cfg.exit_wr
+            
+            # Также проверяем CV метрики на деградацию
+            cv_wr = cv_metrics.get("oof_accuracy", 100.0)
+            cv_degraded = cv_wr < self.cfg.exit_wr
+            
+            if basic_threshold_failed or cv_degraded:
+                self.mode = "SHADOW"
+                self.validation_passed[ph] = False
+                print(f"[{self.__class__.__name__}] ACTIVE→SHADOW ph={ph}: WR={wr_active:.2f}%, CV_WR={cv_wr:.2f}%")
+
+    def _maybe_flip_modes_simple(self):
+        """Старая логика для backward compatibility"""
+        def wr(arr, n):
+            if len(arr) < n: return None
+            window = arr[-n:]
+            return 100.0 * (sum(window)/len(window))
+        wr_shadow = wr(self.shadow_hits, getattr(self.cfg, 'min_ready', 80))
+        if self.mode == "SHADOW" and wr_shadow is not None and wr_shadow >= self.cfg.enter_wr:
+            self.mode = "ACTIVE"
+            if HAVE_RIVER:
+                self.adwin = ADWIN(delta=self.cfg.adwin_delta)
+        wr_active = wr(self.active_hits, max(30, self.cfg.min_ready // 2))
+        if self.mode == "ACTIVE" and (wr_active is not None and wr_active < self.cfg.exit_wr):
+            self.mode = "SHADOW"
+
+    # --- обучение NN по ФАЗЕ ---
+    # --- обучение NN по ФАЗЕ ---
+    def _maybe_train_phase(self, ph: int) -> None:
+        """
+        Обучает Neural Network модель для конкретной фазы.
+        
+        Включает:
+        - Проверку накопленных данных
+        - Валидацию фичей
+        - Периодический анализ корреляции
+        - Градиентное обучение с эпохами
+        - Стандартизацию данных
+        - Интеграцию с TrainingVisualizer
+        """
+        
+        # ========== БЛОК 1: БАЗОВЫЕ ПРОВЕРКИ ==========
+        if self.new_since_train_ph.get(ph, 0) < int(getattr(self.cfg, "nn_retrain_every", 100)):
+            return
+        
+        # ========== БЛОК 2: ПОЛУЧЕНИЕ ДАННЫХ ==========
+        X_all, y_all = self._get_phase_train(ph)
+        
+        if len(X_all) < int(self.cfg.phase_min_ready):
+            return
+        
+        # Ограничиваем окно обучения по свежести
+        train_window = int(getattr(self.cfg, "train_window", 5000))
+        if len(X_all) > train_window:
+            X_all = X_all[-train_window:]
+            y_all = y_all[-train_window:]
+        
+        # ========== БЛОК 3: ВАЛИДАЦИЯ ДАННЫХ ==========
+        # Проверяем на NaN/Inf перед обучением
+        if np.any(np.isnan(X_all)) or np.any(np.isinf(X_all)):
+            print(f"[NN] ⚠️  Warning: NaN/Inf detected in training data for phase {ph}, cleaning...")
+            X_all = np.nan_to_num(X_all, nan=0.0, posinf=1e10, neginf=-1e10)
+        
+
+
+        # ========== БЛОК 4: ПЕРИОДИЧЕСКИЙ АНАЛИЗ ФИЧЕЙ ==========
+        # Проверяем каждые 1000 примеров (или при первом достижении 500)
+        should_validate = (
+            (len(X_all) == 500) or  # Первый раз при 500
+            (len(X_all) % 1000 == 0 and len(X_all) >= 1000)  # Потом каждые 1000
+        )
+
+        if should_validate:
+            try:
+                from feature_validator import analyze_feature_correlation, check_data_leakage
+                
+                print(f"\n[NN] 📊 Запуск валидации фичей для фазы {ph}...")
+                print(f"[NN] Примеров: {len(X_all)}, Фичей: {X_all.shape[1]}")
+                
+                # Анализ корреляции с сохранением отчета
+                results = analyze_feature_correlation(
+                    X_all, 
+                    y_all,
+                    feature_names=[f"f{i}" for i in range(X_all.shape[1])],
+                    top_n=20,
+                    save_report=True,
+                    report_path=f"feature_analysis_nn_ph{ph}_n{len(X_all)}.txt"
+                )
+                
+                # Проверка на утечку данных (ИСПРАВЛЕНО: добавлен y_all)
+                suspicious = check_data_leakage(
+                    X_all,
+                    y_all,  # ✅ ДОБАВЛЕНО
+                    feature_names=[f"f{i}" for i in range(X_all.shape[1])]
+                )
+                
+                # ========== ДЕЙСТВИЯ НА ОСНОВЕ РЕЗУЛЬТАТОВ ==========
+                
+                # 1. Подсчет проблемных фичей
+                excellent = sum(1 for r in results if r.status == "отлично")
+                good = sum(1 for r in results if r.status == "хорошо")
+                weak = sum(1 for r in results if r.status == "слабо")
+                useless = sum(1 for r in results if r.status in ["бесполезно", "константа"])
+                
+                print(f"\n[NN] 📈 Итоги валидации:")
+                print(f"[NN]    Отличных фичей: {excellent}/{len(results)}")
+                print(f"[NN]    Хороших фичей: {good}/{len(results)}")
+                print(f"[NN]    Слабых фичей: {weak}/{len(results)}")
+                print(f"[NN]    Бесполезных фичей: {useless}/{len(results)}")
+                print(f"[NN]    Подозрительных фичей: {len(suspicious)}")
+                
+                # 2. Критическая проблема: более 50% фичей бесполезны
+                if useless > len(results) * 0.5:
+                    print(f"\n[NN] ❌ КРИТИЧЕСКАЯ ПРОБЛЕМА: {useless}/{len(results)} фичей бесполезны!")
+                    print(f"[NN] Рекомендуется пересмотреть feature engineering")
+                    print(f"[NN] Нейронная сеть не может обучиться на бесполезных фичах!")
+                    
+                    # Отправляем уведомление в Telegram
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"⚠️ <b>NN: Проблема с фичами!</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Примеров: {len(X_all)}\n"
+                                f"Бесполезных фичей: {useless}/{len(results)} ({100*useless/len(results):.1f}%)\n\n"
+                                f"⚠️ Нейронная сеть не может обучиться!\n"
+                                f"Требуется проверка feature engineering!")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 3. Предупреждение: мало значимых фичей
+                elif (excellent + good) < len(results) * 0.2:
+                    print(f"\n[NN] ⚠️  ПРОБЛЕМА: Только {excellent + good}/{len(results)} фичей значимы (<20%)")
+                    print(f"[NN] Рекомендуется:")
+                    print(f"[NN]    - Добавить feature interactions")
+                    print(f"[NN]    - Проверить нормализацию данных")
+                    print(f"[NN]    - Использовать feature selection")
+                    
+                    # Уведомление в Telegram (менее критичное)
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"🟡 <b>NN: Мало значимых фичей</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Значимых: {excellent + good}/{len(results)} ({100*(excellent + good)/len(results):.1f}%)\n\n"
+                                f"Рекомендуется улучшить feature engineering")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 4. Обнаружен data leakage
+                if suspicious:
+                    print(f"\n[NN] ⚠️  ВНИМАНИЕ: Data leakage обнаружен!")
+                    print(f"[NN] Подозрительные фичи ({len(suspicious)}):")
+                    for feat in suspicious[:5]:  # Показываем первые 5
+                        print(f"[NN]    - {feat}")
+                    if len(suspicious) > 5:
+                        print(f"[NN]    ... и еще {len(suspicious) - 5}")
+                    
+                    print(f"\n[NN] ⚠️  Data leakage может привести к переобучению!")
+                    print(f"[NN] Модель будет отлично работать на train, но плохо на test")
+                    
+                    # Критическое уведомление в Telegram
+                    if getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"🚨 <b>NN: Data Leakage!</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Обнаружено {len(suspicious)} подозрительных фичей\n\n"
+                                f"⚠️ Риск переобучения!\n"
+                                f"Срочно требуется проверка!\n\n"
+                                f"Список:\n" + "\n".join([f"- {f}" for f in suspicious[:5]]))
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 5. Все хорошо
+                if useless < len(results) * 0.3 and (excellent + good) >= len(results) * 0.2 and not suspicious:
+                    print(f"\n[NN] ✅ Качество фичей в норме!")
+                    print(f"[NN] Нейронная сеть может успешно обучаться на этих данных")
+                    
+                    # Позитивное уведомление (только при первой проверке)
+                    if len(X_all) == 500 and getattr(self.cfg, 'tg_bot_token', None):
+                        try:
+                            from telegram_notifier import send_telegram_text
+                            msg = (f"✅ <b>NN: Валидация пройдена</b>\n\n"
+                                f"Фаза: {ph}\n"
+                                f"Примеров: {len(X_all)}\n"
+                                f"Отличных фичей: {excellent}/{len(results)}\n"
+                                f"Хороших фичей: {good}/{len(results)}\n\n"
+                                f"Качество фичей в норме!\n"
+                                f"NN готова к обучению.")
+                            send_telegram_text(self.cfg.tg_bot_token, self.cfg.tg_chat_id, msg)
+                        except Exception:
+                            pass
+                
+                # 6. Специфичные рекомендации для нейронной сети
+                if weak > len(results) * 0.5:
+                    print(f"\n[NN] 💡 СОВЕТ: Много слабых фичей ({weak}/{len(results)})")
+                    print(f"[NN] Для нейронной сети это может быть нормально")
+                    print(f"[NN] NN может находить нелинейные комбинации слабых фичей")
+                
+                print(f"[NN] 📄 Отчет сохранен: feature_analysis_nn_ph{ph}_n{len(X_all)}.txt\n")
+                
+                # ========== СОХРАНЕНИЕ СТАТИСТИКИ ==========
+                try:
+                    import json
+                    import time
+                    
+                    stats = {
+                        "timestamp": int(time.time()),
+                        "expert": "NN",
+                        "phase": ph,
+                        "n_samples": len(X_all),
+                        "n_features": X_all.shape[1],
+                        "excellent": excellent,
+                        "good": good,
+                        "weak": weak,
+                        "useless": useless,
+                        "suspicious_count": len(suspicious),
+                        "suspicious_list": suspicious[:10],  # Первые 10
+                        "quality_score": (excellent * 2 + good) / len(results),  # Оценка 0-2
+                        "nn_specific_score": (excellent * 2 + good + weak * 0.5) / len(results)  # NN может использовать слабые фичи
+                    }
+                    
+                    stats_file = f"feature_stats_nn_ph{ph}.json"
+                    with open(stats_file, 'w') as f:
+                        json.dump(stats, f, indent=2)
+                    
+                    print(f"[NN] 💾 Статистика сохранена: {stats_file}")
+                    
+                    # Вывод NN-specific score
+                    nn_score = stats['nn_specific_score']
+                    if nn_score >= 1.5:
+                        score_status = "отлично"
+                    elif nn_score >= 1.0:
+                        score_status = "хорошо"
+                    elif nn_score >= 0.5:
+                        score_status = "средне"
+                    else:
+                        score_status = "плохо"
+                    
+                    print(f"[NN] 📊 NN Quality Score: {nn_score:.2f} ({score_status})")
+                    
+                except Exception as e:
+                    print(f"[NN] ⚠️  Не удалось сохранить статистику: {e}")
+                
+            except ImportError:
+                # feature_validator не установлен - не критично
+                pass
+            except Exception as e:
+                print(f"[NN] ⚠️  Ошибка валидации фичей: {e}")
+                import traceback
+                print(f"[NN] Traceback:")
+                traceback.print_exc()
+                
+                # Логируем ошибку, но не останавливаем обучение
+                try:
+                    from error_logger import log_exception
+                    log_exception(f"Feature validation failed for NN ph={ph}: {e}")
+                except ImportError:
+                    pass
+        
+        # ========== БЛОК 5: ИНИЦИАЛИЗАЦИЯ СЕТИ И СКЕЙЛЕРА ==========
+        # Гарантируем сеть для конкретной фазы
+        net = self.net_ph.get(ph)
+        if net is None and self.n_feats is not None:
+            net = _SimpleMLP(
+                n_in=self.n_feats,
+                n_h=int(getattr(self.cfg, "nn_hidden", 32)),
+                eta=float(getattr(self.cfg, "nn_eta", 0.01)),
+                l2=float(getattr(self.cfg, "nn_l2", 0.0)),
+            )
+            print(f"[NN] 🆕 Created new network for phase {ph}: {self.n_feats}→{int(getattr(self.cfg, 'nn_hidden', 32))}→1")
+        
+        # Скейлер по батчу фазы
+        scaler = None
+        if HAVE_SKLEARN:
+            try:
+                scaler = StandardScaler().fit(X_all)
+            except Exception as e:
+                print(f"[NN] Warning: Failed to create scaler: {e}")
+                scaler = None
+        
+        # ========== БЛОК 6: ОБУЧЕНИЕ МОДЕЛИ ==========
+        try:
+            # Трансформация данных
+            Xt = scaler.transform(X_all) if (scaler is not None) else X_all
+            y_float = y_all.astype(np.float32)
+            
+            # Градиентное обучение с эпохами
+            epochs = int(getattr(self.cfg, "nn_epochs", 1))
+            batch_size = int(getattr(self.cfg, "nn_batch_size", 128))
+            
+            for epoch in range(max(1, epochs)):
+                net.fit_epoch(Xt, y_float, batch_size=batch_size)
+            
+            # Сохраняем модель и скейлер для конкретной фазы
+            self.net_ph[ph] = net
+            self.scaler_ph[ph] = scaler
+            
+            # Обратная совместимость: глобальные ссылки
+            self.net = net
+            self.scaler = scaler
+            
+            # Сбрасываем счетчик новых примеров
+            self.new_since_train_ph[ph] = 0
+            
+            # Сохраняем состояние на диск
+            self._save_all()
+            
+            print(f"[NN] ✅ Trained on phase {ph}: {len(X_all)} samples, {epochs} epochs, batch_size={batch_size}")
+            
+        except Exception as e:
+            print(f"[NN] ❌ Training error (ph={ph}): {e}")
+            import traceback
+            traceback.print_exc()
+            return
+        
+        # ========== БЛОК 7: ИНТЕГРАЦИЯ С TRAINING VISUALIZER ==========
+        try:
+            from training_visualizer import get_visualizer
+            viz = get_visualizer()
+            
+            # Вычисляем общий winrate
+            all_hits = self.active_hits + self.shadow_hits
+            wr_all = sum(all_hits) / len(all_hits) if all_hits else 0.0
+            
+            # Получаем CV метрики текущей фазы
+            cv_metrics = self.cv_metrics.get(ph, {})
+            cv_accuracy = cv_metrics.get("oof_accuracy")
+            cv_ci_lower = cv_metrics.get("ci_lower")
+            cv_ci_upper = cv_metrics.get("ci_upper")
+            
+            # Отправляем метрики в visualizer
+            viz.record_expert_metrics(
+                expert_name="NN",
+                accuracy=wr_all,
+                n_samples=len(all_hits),
+                cv_accuracy=cv_accuracy / 100.0 if cv_accuracy else None,
+                cv_ci_lower=cv_ci_lower / 100.0 if cv_ci_lower else None,
+                cv_ci_upper=cv_ci_upper / 100.0 if cv_ci_upper else None,
+                mode=self.mode
+            )
+            
+        except ImportError:
+            pass  # TrainingVisualizer не установлен
+        except Exception as e:
+            print(f"[NN] Warning: Failed to send metrics to visualizer: {e}")
+
+
+    def _run_cv_validation(self, ph: int) -> Dict:
+        """
+        Walk-forward purged cross-validation для фазы ph.
+        Возвращает метрики: accuracy, CI bounds, fold scores.
+        """
+        X_all, y_all = self._get_phase_train(ph)
+        
+        if len(X_all) < self.cfg.cv_min_train_size:
+            return {"status": "insufficient_data", "oof_accuracy": 0.0}
+        
+        n_samples = len(X_all)
+        n_splits = min(self.cfg.cv_n_splits, n_samples // self.cfg.cv_min_train_size)
+        
+        if n_splits < 2:
+            return {"status": "insufficient_splits", "oof_accuracy": 0.0}
+        
+        # Walk-forward splits с purge и embargo
+        embargo_size = max(1, int(n_samples * self.cfg.cv_embargo_pct))
+        purge_size = max(1, int(n_samples * self.cfg.cv_purge_pct))
+        
+        fold_size = n_samples // n_splits
+        oof_preds = np.zeros(n_samples)
+        oof_mask = np.zeros(n_samples, dtype=bool)
+        fold_scores = []
+        
+        for fold_idx in range(n_splits):
+            # Test fold
+            test_start = fold_idx * fold_size
+            test_end = min(test_start + fold_size, n_samples)
+            
+            # Train: всё до (test_start - purge_size)
+            train_end = max(0, test_start - purge_size)
+            
+            if train_end < self.cfg.cv_min_train_size:
+                continue
+            
+            X_train = X_all[:train_end]
+            y_train = y_all[:train_end]
+            X_test = X_all[test_start:test_end]
+            y_test = y_all[test_start:test_end]
+            
+            # Обучаем временную модель на train fold
+            temp_model = self._train_fold_model(X_train, y_train, ph)
+            
+            # Предсказания на test fold
+            preds = self._predict_fold(temp_model, X_test, ph)
+            
+            # Сохраняем OOF predictions
+            oof_preds[test_start:test_end] = preds
+            oof_mask[test_start:test_end] = True
+            
+            # Метрики фолда
+            fold_acc = np.mean((preds >= 0.5) == y_test)
+            fold_scores.append(fold_acc)
+        
+        # Итоговые OOF метрики
+        oof_valid = oof_mask.sum()
+        if oof_valid < self.cfg.cv_min_train_size:
+            return {"status": "insufficient_oof", "oof_accuracy": 0.0}
+        
+        oof_accuracy = 100.0 * np.mean((oof_preds[oof_mask] >= 0.5) == y_all[oof_mask])
+        
+        # Bootstrap confidence intervals
+        ci_lower, ci_upper = self._bootstrap_ci(
+            oof_preds[oof_mask], 
+            y_all[oof_mask],
+            n_bootstrap=self.cfg.cv_bootstrap_n,
+            confidence=self.cfg.cv_confidence
+        )
+        
+        return {
+            "status": "ok",
+            "oof_accuracy": oof_accuracy,
+            "ci_lower": ci_lower,
+            "ci_upper": ci_upper,
+            "fold_scores": fold_scores,
+            "n_folds": len(fold_scores),
+            "oof_samples": int(oof_valid)
+        }
+
+    def _bootstrap_ci(self, preds: np.ndarray, labels: np.ndarray, 
+                    n_bootstrap: int, confidence: float) -> tuple:
+        """
+        Bootstrap confidence intervals для accuracy.
+        """
+        accuracies = []
+        n = len(preds)
+        
+        for _ in range(n_bootstrap):
+            # Resample с возвратом
+            idx = np.random.choice(n, size=n, replace=True)
+            boot_preds = preds[idx]
+            boot_labels = labels[idx]
+            boot_acc = 100.0 * np.mean((boot_preds >= 0.5) == boot_labels)
+            accuracies.append(boot_acc)
+        
+        accuracies = np.array(accuracies)
+        alpha = 1.0 - confidence
+        ci_lower = np.percentile(accuracies, 100 * alpha / 2)
+        ci_upper = np.percentile(accuracies, 100 * (1 - alpha / 2))
+        
+        return ci_lower, ci_upper
+
+    def _train_fold_model(self, X: np.ndarray, y: np.ndarray, ph: int):
+        """
+        Обучает временную NN (MLP) для CV fold по данным фазы ph.
+        """
+        # скейлер (если sklearn есть — норм; иначе «заглушка» уже задана выше)
+        scaler = StandardScaler().fit(X) if HAVE_SKLEARN else None
+        X_scaled = scaler.transform(X) if scaler is not None else X
+
+        # гиперпараметры те же, что у основного эксперта
+        n_in = X_scaled.shape[1]
+        net = _SimpleMLP(
+            n_in=n_in,
+            n_h=int(getattr(self.cfg, "nn_hidden", 32)),
+            eta=float(getattr(self.cfg, "nn_eta", 0.01)),
+            l2=float(getattr(self.cfg, "nn_l2", 0.0)),
+        )
+
+        # обучение небольшим числом эпох
+        y_float = y.astype(np.float32)
+        epochs = int(getattr(self.cfg, "nn_epochs_cv", max(1, int(getattr(self.cfg, "nn_epochs", 1)))))
+        for _ in range(max(1, epochs)):
+            net.fit_epoch(X_scaled, y_float, batch_size=128)
+
+        return {"model": net, "scaler": scaler}
+
+    def _predict_fold(self, fold_model, X: np.ndarray, ph: int) -> np.ndarray:
+        """
+        Предсказания временной NN для CV fold (с температурой фазы).
+        """
+        if fold_model is None:
+            return np.full(len(X), 0.5, dtype=np.float32)
+
+        scaler = fold_model.get("scaler")
+        net = fold_model.get("model")
+        X_scaled = scaler.transform(X) if scaler is not None else X
+
+        T = float(self.T_ph.get(ph, 1.0))
+        preds = net.predict_proba(X_scaled, T=T).astype(np.float32)
+        return preds
+
+
+    def maybe_train(self, ph: Optional[int] = None, reg_ctx: Optional[dict] = None) -> None:
+        if ph is None:
+            if isinstance(reg_ctx, dict) and "phase" in reg_ctx:
+                ph = int(reg_ctx["phase"])
+            else:
+                ph = int(getattr(self, "_last_seen_phase", 0))
+        self._maybe_train_phase(int(ph))
+
+    # ---------- сохранение/загрузка ----------
+    def _load_all(self) -> None:
+        # state (mode, hits, T, n_feats, фазовые буферы, температуры по фазам)
+        try:
+            if os.path.exists(self.cfg.nn_state_path):
+                with open(self.cfg.nn_state_path, "r") as f:
+                    st = json.load(f)
+
+                self.mode = st.get("mode", "SHADOW")
+                self.shadow_hits = st.get("shadow_hits", [])[-1000:]
+                self.active_hits = st.get("active_hits", [])[-1000:]
+                self.n_feats = st.get("n_feats", None)
+
+                # глобальная память
+                self.X = st.get("X", [])
+                self.y = st.get("y", [])
+
+                # фазовые буферы
+                X_ph = st.get("X_ph"); y_ph = st.get("y_ph")
+                if isinstance(X_ph, dict) and isinstance(y_ph, dict):
+                    self.X_ph = {int(k): v for k, v in X_ph.items()}
+                    self.y_ph = {int(k): v for k, v in y_ph.items()}
+                else:
+                    self.X_ph = {p: [] for p in range(self.P)}
+                    self.y_ph = {p: [] for p in range(self.P)}
+
+                # счётчики тренировки
+                self.new_since_train_ph = {p: 0 for p in range(self.P)}
+                if isinstance(st.get("new_since_train_ph"), dict):
+                    for k, v in st["new_since_train_ph"].items():
+                        try:
+                            self.new_since_train_ph[int(k)] = int(v)
+                        except Exception:
+                            log_exception("state_load: new_since_train_ph cast failed")
+
+                # температуры по фазам + счётчики для перекалибровки
+                T_ph = st.get("T_ph")
+                self.T_ph = {p: 1.0 for p in range(self.P)}
+                if isinstance(T_ph, dict):
+                    for k, v in T_ph.items():
+                        try:
+                            self.T_ph[int(k)] = float(v)
+                        except Exception:
+                            log_exception("state_load: T_ph cast failed")
+                ssc = st.get("seen_since_calib_ph")
+                self.seen_since_calib_ph = {p: 0 for p in range(self.P)}
+                if isinstance(ssc, dict):
+                    for k, v in ssc.items():
+                        try:
+                            self.seen_since_calib_ph[int(k)] = int(v)
+                        except Exception:
+                            log_exception("state_load: seen_since_calib_ph cast failed")
+
+                self._last_seen_phase = int(st.get("_last_seen_phase", 0))
+                # старое поле T (для обратной совместимости)
+                try:
+                    self.T = float(st.get("T", 1.0))
+                except Exception:
+                    self.T = 1.0
+
+                # обрезки по капам
+                if isinstance(getattr(self.cfg, "max_memory", None), int) and self.cfg.max_memory > 0:
+                    self.X = self.X[-self.cfg.max_memory:]
+                    self.y = self.y[-self.cfg.max_memory:]
+                cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
+                for p in range(self.P):
+                    self.X_ph[p] = self.X_ph.get(p, [])[-cap:]
+                    self.y_ph[p] = self.y_ph.get(p, [])[-cap:]
+        except Exception as e:
+            print(f"[nn  ] _load_all state error: {e}")
+
+        # scaler
+        try:
+            if os.path.exists(self.cfg.nn_scaler_path):
+                with open(self.cfg.nn_scaler_path, "rb") as f:
+                    self.scaler = pickle.load(f)
+        except Exception as e:
+            print(f"[nn  ] _load_all scaler error: {e}")
+            self.scaler = None
+
+        # model
+        try:
+            self.net = _SimpleMLP.load(self.cfg.nn_model_path)
+        except Exception as e:
+            print(f"[nn  ] _load_all model error: {e}")
+            self.net = None
+
+        # --- НОВОЕ: загрузка перефазных сетей и скейлеров ---
+        try:
+            root_m, ext_m = os.path.splitext(self.cfg.nn_model_path)
+            root_s, ext_s = os.path.splitext(self.cfg.nn_scaler_path)
+            for p in range(self.P):
+                mp = f"{root_m}_ph{p}{ext_m}"
+                sp = f"{root_s}_ph{p}{ext_s}"
+                # сеть
+                try:
+                    self.net_ph[p] = _SimpleMLP.load(mp)
+                except Exception:
+                    self.net_ph[p] = None
+                # скейлер
+                try:
+                    with open(sp, "rb") as f:
+                        self.scaler_ph[p] = pickle.load(f)
+                except Exception:
+                    self.scaler_ph[p] = None
+        except Exception as e:
+            print(f"[nn  ] _load_all per-phase error: {e}")
+
+
+    def _save_all(self) -> None:
+        try:
+            # обрезки
+            X_tail, y_tail = self.X, self.y
+            if isinstance(getattr(self.cfg, "max_memory", None), int) and self.cfg.max_memory > 0:
+                X_tail = self.X[-self.cfg.max_memory:]
+                y_tail = self.y[-self.cfg.max_memory:]
+            cap = int(getattr(self.cfg, "phase_memory_cap", 10_000))
+            X_ph_tail = {p: self.X_ph.get(p, [])[-cap:] for p in range(self.P)}
+            y_ph_tail = {p: self.y_ph.get(p, [])[-cap:] for p in range(self.P)}
+
+            st = {
+                "mode": self.mode,
+                "shadow_hits": self.shadow_hits[-1000:],
+                "active_hits": self.active_hits[-1000:],
+                "n_feats": self.n_feats,
+
+                "X": X_tail, "y": y_tail,
+                "X_ph": X_ph_tail, "y_ph": y_ph_tail,
+                "new_since_train_ph": {int(p): int(self.new_since_train_ph.get(p, 0)) for p in range(self.P)},
+                "_last_seen_phase": int(self._last_seen_phase),
+
+                # температуры и счётчики
+                "T_ph": {int(p): float(self.T_ph.get(p, 1.0)) for p in range(self.P)},
+                "seen_since_calib_ph": {int(p): int(self.seen_since_calib_ph.get(p, 0)) for p in range(self.P)},
+
+                # для обратной совместимости
+                "T": float(self.T),
+                "P": int(self.P),
+            }
+            with open(self.cfg.nn_state_path, "w") as f:
+                json.dump(st, f)
+        except Exception as e:
+            print(f"[nn  ] _save_all state error: {e}")
+
+        # scaler
+        try:
+            if self.scaler is not None:
+                with open(self.cfg.nn_scaler_path, "wb") as f:
+                    pickle.dump(self.scaler, f)
+        except Exception as e:
+            print(f"[nn  ] _save_all scaler error: {e}")
+
+        # model
+        try:
+            if self.net is not None:
+                self.net.save(self.cfg.nn_model_path)
+        except Exception as e:
+            print(f"[nn  ] _save_all model error: {e}")
+
+        # --- НОВОЕ: сохранение перефазных сетей и скейлеров ---
+        try:
+            root_m, ext_m = os.path.splitext(self.cfg.nn_model_path)
+            root_s, ext_s = os.path.splitext(self.cfg.nn_scaler_path)
+            for p in range(self.P):
+                net = self.net_ph.get(p)
+                if net is not None:
+                    net.save(f"{root_m}_ph{p}{ext_m}")
+                sc = self.scaler_ph.get(p)
+                if sc is not None:
+                    with open(f"{root_s}_ph{p}{ext_s}", "wb") as f:
+                        pickle.dump(sc, f)
+        except Exception as e:
+            print(f"[nn  ] _save_all per-phase error: {e}")
+
+
+    # ---------- статус ----------
+    def status(self):
+        def _wr(xs):
+            if not xs: return None
+            return sum(xs) / float(len(xs))
+        def _fmt_pct(p):
+            return "—" if p is None else f"{100.0*p:.2f}%"
+        
+        wr_a = _wr(self.active_hits)
+        wr_s = _wr(self.shadow_hits)
+        all_hits = (self.active_hits or []) + (self.shadow_hits or [])
+        wr_all = _wr(all_hits)
+        
+        # CV метрики текущей фазы
+        ph = self._last_seen_phase
+        cv_metrics = self.cv_metrics.get(ph, {})
+        cv_status = cv_metrics.get("status", "N/A")
+        cv_wr = cv_metrics.get("oof_accuracy", 0.0)
+        cv_ci = f"[{cv_metrics.get('ci_lower', 0):.1f}%, {cv_metrics.get('ci_upper', 0):.1f}%]" if cv_status == "ok" else "N/A"
+        
+        return {
+            "mode": self.mode,
+            "enabled": self.enabled,
+            "wr_active": _fmt_pct(wr_a),
+            "n_active": len(self.active_hits or []),
+            "wr_shadow": _fmt_pct(wr_s),
+            "n_shadow": len(self.shadow_hits or []),
+            "wr_all": _fmt_pct(wr_all),
+            "n": len(all_hits),
+            "cv_oof_wr": _fmt_pct(cv_wr / 100.0) if cv_wr > 0 else "—",
+            "cv_ci": cv_ci,
+            "cv_validated": str(self.validation_passed.get(ph, False))
+        }
+
+# =============================
+# REST MODE
+# =============================
+
+def _prune_bets(bets: Dict[int, Dict], keep_settled_last: int = 500, keep_other_last: int = 200):
+    settled = sorted([e for e, b in bets.items() if b.get("settled")])
+    to_drop = settled[:-keep_settled_last] if len(settled) > keep_settled_last else []
+    for e in to_drop:
+        bets.pop(e, None)
+    # чистим старые «не закрытые», включая skipped=True
+    others = sorted([e for e, b in bets.items() if not b.get("settled")])
+    to_drop2 = others[:-keep_other_last] if len(others) > keep_other_last else []
+    for e in to_drop2:
+        bets.pop(e, None)
+
+def _settled_trades_count(csv_path: str) -> int:
+    """Подсчет количества завершенных сделок в CSV."""
+    try:
+        if not os.path.exists(csv_path):
+            return 0
+        df = pd.read_csv(csv_path)
+        # Считаем только сделки с результатом (settled=1 или has payout_ratio)
+        if "settled" in df.columns:
+            return int(df[df["settled"] == 1].shape[0])
+        elif "payout_ratio" in df.columns:
+            return int(df[df["payout_ratio"].notna()].shape[0])
+        else:
+            return len(df)
+    except Exception:
+        return 0
+
+# =============================
+# ГЛАВНЫЙ ЦИКЛ (с ансамблем)
+# =============================
+def main_loop():
+    global rpc_fail_streak
+    global DELTA_PROTECT  # будем менять модульную константу
+    # --- Фаза-гистерезис --
+    hours = None
+    ml_cfg = MLConfig() 
+    phase_filter = PhaseFilter(hysteresis_s=ml_cfg.phase_hysteresis_s)
+    # (опционально можно загрузить last_phase/last_change_ts из JSON, если нужно переживать рестарт)
+    # восстановить состояние
+    try:
+        if os.path.exists(ml_cfg.phase_state_path):
+            with open(ml_cfg.phase_state_path, "r") as f:
+                st = json.load(f)
+            phase_filter.last_phase = st.get("last_phase", None)
+            phase_filter.last_change_ts = st.get("last_change_ts", None)
+    except Exception:
+        log_exception("Failed to load JSON")
+        # === δ: суточный подбор по последним 100 сделкам ===
+    try:
+        # Проверяем количество доступных сделок
+        n_trades = _settled_trades_count(CSV_PATH)
+        
+        delta_daily = DeltaDaily(csv_path=CSV_PATH, state_path=DELTA_STATE_PATH,
+                                n_last=min(100, n_trades),  # Не больше чем есть сделок
+                                grid_start=0.000, grid_stop=0.100, grid_step=0.005,
+                                csv_shadow_path=CSV_SHADOW_PATH,
+                                window_hours=24,
+                                opt_mode="dr_lcb")  # ✳️ анализируем последние 24 часа
+        st = delta_daily.load_or_recompute_every_hours(period_hours=4)
+        
+        if st and isinstance(st.get("delta"), (int, float)):
+            if n_trades < MIN_TRADES_FOR_DELTA:
+                DELTA_PROTECT = 0.0
+                print(
+                    "[delta] startup(4h/24h): δ=0.000 (FORCED) "
+                    f"| trades={n_trades}/{MIN_TRADES_FOR_DELTA} — копим статистику; "
+                    f"p_opt={st.get('p_thr_opt', float('nan')):.4f} | avg_used={st.get('avg_p_thr_used', float('nan')):.4f}"
+                )
+            else:
+                DELTA_PROTECT = float(st["delta"])
+                method = str(st.get("method","?")).lower()
+                if method == "dr_lcb":
+                    # Проверяем наличие lcb15 в правильном формате
+                    lcb_value = st.get('lcb15', 0.0)
+                    # Защита от -1e9 при выводе
+                    if lcb_value < -1000:
+                        lcb_str = "N/A"
+                    else:
+                        lcb_str = f"{lcb_value:.6f}"
+                    
+                    print(
+                        "[delta] startup(4h/24h): "
+                        f"δ={DELTA_PROTECT:.3f} | method=DR-LCB | p_opt={st.get('p_thr_opt', float('nan')):.4f} | "
+                        f"N={st.get('sample_size','?')}, picked={st.get('selected_n','?')} | "
+                        f"LCB15={lcb_str} | window={st.get('window_hours','?')}h"
+                    )
+                elif method == "grid_pnl":
+                    print(
+                        "[delta] startup(4h/24h): "
+                        f"δ={DELTA_PROTECT:.3f} | method=GRID-PnL | p_opt={st.get('p_thr_opt', float('nan')):.4f} | "
+                        f"N={st.get('sample_size','?')}, picked={st.get('selected_n','?')} | "
+                        f"P&L*={st.get('pnl_at_opt', float('nan')):.6f} BNB | window={st.get('window_hours','?')}h"
+                    )
+                else:
+                    print(
+                        "[delta] startup(4h/24h): "
+                        f"δ={DELTA_PROTECT:.3f} | method=P*-AVG_USED | p_opt={st.get('p_thr_opt', float('nan')):.4f} | "
+                        f"avg_used={st.get('avg_p_thr_used', float('nan')):.4f} | "
+                        f"N={st.get('sample_size','?')}, picked={st.get('selected_n','?')} | "
+                        f"P&L*={st.get('pnl_at_opt', float('nan')):.6f} BNB | window={st.get('window_hours','?')}h"
+                    )
+
+    except Exception as e:
+        print(f"[warn] delta_daily init failed: {e}")
+    
+    # --- init web3/contract
+    w3 = connect_web3_resilient()
+    c = get_prediction_contract(w3)
+    interval_sec = int(c.functions.intervalSeconds().call())
+    buffer_sec   = int(c.functions.bufferSeconds().call())
+    min_bet_bnb  = get_min_bet_bnb(c)
+    print(f"[init] Connected. interval={interval_sec}s buffer={buffer_sec}s minBet={min_bet_bnb:.6f} BNB")
+
+    # --- ПЕРЕМЕСТИЛИ СЮДА: восстановим капитал из CSV (или из capital_state.json, если CSV пуст)
+    # --- восстановим капитал: приоритет capital_state.json (актуальный), потом CSV
+    capital_state = CapitalState(path=os.path.join(os.path.dirname(__file__), "capital_state.json"))
+    
+    # Сначала пробуем загрузить из capital_state.json
+    cap_state = None
+    if os.path.exists(capital_state.path):
+        try:
+            with open(capital_state.path, "r") as f:
+                obj = json.load(f)
+            cap_state = float(obj.get("capital"))
+            if not math.isfinite(cap_state) or cap_state <= 0:
+                cap_state = None
+        except Exception:
+            cap_state = None
+    
+    # Потом из CSV
+    cap_csv = _restore_capital_from_csv(CSV_PATH)
+    
+    # Выбираем источник: capital_state.json имеет приоритет, если существует
+    if cap_state is not None:
+        capital = cap_state
+        cap_src = "capital_state.json"
+    elif cap_csv is not None:
+        capital = cap_csv
+        cap_src = "trades_prediction.csv"
+    else:
+        capital = START_CAPITAL_BNB
+        cap_src = "default"
+    print(f"[init] Capital restored: {capital:.6f} BNB (source={cap_src})")
+    print(f"[init] Trading mode: {'📄 PAPER TRADING' if PAPER_TRADING else '💰 REAL TRADING'}")
+
+    # --- ТЕПЕРЬ МОЖНО отправить в Telegram (capital уже определён)
+    if tg_enabled():
+        mode_emoji = "📄" if PAPER_TRADING else "💰"
+        mode_text = "PAPER TRADING" if PAPER_TRADING else "REAL TRADING"
+        tg_send(
+            f"🤖 Bot online ({mode_emoji} {mode_text})\n"
+            f"Interval: {interval_sec}s | Buffer: {buffer_sec}s\n"
+            f"MinBet: {min_bet_bnb:.6f} BNB\n"
+            f"Capital: {capital:.6f} BNB"  # ✅ Теперь capital уже определён!
+        )
+    
+    if PAPER_TRADING:
+        print("[init] Balance checks will use virtual capital from capital_state.json")
+    else:
+        print(f"[init] Balance checks will use real wallet: {WALLET_ADDRESS}")
+
+    # --- монитор производительности (EV & log-growth)
+    try:
+        perf = PerfMonitor(
+            path=os.path.join(os.path.dirname(__file__), "perf_state.json"),
+            window_trades=500,              # можно 300–1000
+            min_trades_for_report=50,       # минимум для отчёта
+            fees_net=True                   # pnl уже NET → c=0 в p_BE
+        )
+        print("[init] PerfMonitor ready")
+    except Exception as e:
+        perf = None
+        print(f"[warn] perf init failed: {e}")
+
+
+    # --- резервный фонд: загрузка состояния
+    try:
+        reserve = ReserveFund(path=os.path.join(os.path.dirname(__file__), "reserve_state.json"), checkpoint_hour=23)
+        # опционально покажем баланс при старте
+        print(f"[init] Reserve balance: {reserve.balance:.6f} BNB")
+    except Exception as e:
+        reserve = None
+        print(f"[warn] reserve init failed: {e}")
+
+
+
+
+    # REST/WR трекер (используем CSV_PATH)
+    # REST/WR трекер (используем CSV_PATH)
+    stats = StatsTracker(csv_path=CSV_PATH)
+    rest  = RestState.load(path="rest_state.json")
+    rest_cfg = RestConfig(drop_for_rest4h=0.10, drop_for_rest24h=0.15,
+                        min_trades_per_window=40, min_trades_after_rest4h=10)
+    # 👇 добавляем атрибут напрямую (сработает даже если у класса нет __init__ с kwargs)
+    rest_cfg.min_total_trades_for_rest = 500
+
+
+    # сглаживание базовых вероятностей
+    alpha = 2.0 / (SMOOTH_N + 1.0)
+    p_up_ema = None
+    p_ss = EhlersSuperSmoother(SS_LEN) if USE_SUPER_SMOOTHER else None
+
+    logreg = OnlineLogReg(state_path="calib_logreg_state.json") if NN_USE else None
+    
+    # ========== АВТОМАТИЧЕСКАЯ АДАПТАЦИЯ К НОВОЙ РАЗМЕРНОСТИ NN-КАЛИБРАТОРА ==========
+    # ========== АВТОМАТИЧЕСКАЯ АДАПТАЦИЯ К НОВОЙ РАЗМЕРНОСТИ NN-КАЛИБРАТОРА ==========
+    # bnbusdrt6.py, строка ~3560
+    if logreg is not None:
+        EXPECTED_PHI_DIM = 11
+        
+        if len(logreg.w) != EXPECTED_PHI_DIM:
+            old_dim = len(logreg.w)
+            print(f"[nn  ] ⚠️  Размерность logreg изменилась: {old_dim} → {EXPECTED_PHI_DIM}")
+            
+            import numpy
+            
+            # ✅ СОХРАНЯЕМ СТАРЫЕ ВЕСА при расширении
+            if old_dim < EXPECTED_PHI_DIM:
+                print(f"[nn  ] Расширение весов с {old_dim} до {EXPECTED_PHI_DIM} (сохраняем старые)")
+                new_w = numpy.zeros(EXPECTED_PHI_DIM, dtype=numpy.float64)
+                new_w[:old_dim] = logreg.w[:old_dim]  # ✅ Копируем старые веса
+                logreg.w = new_w
+            else:
+                # ✅ Урезаем лишние веса
+                print(f"[nn  ] Урезание весов с {old_dim} до {EXPECTED_PHI_DIM}")
+                logreg.w = logreg.w[:EXPECTED_PHI_DIM]
+            
+            logreg.save()
+            print(f"[nn  ] ✅ logreg готов к использованию с {EXPECTED_PHI_DIM} признаками")
+    # ==================================================================================
+    # ==================================================================================
+    
+    wf = WalkForwardWeighter() if WF_USE else None
+    if wf:
+        print(f"[wf  ] init weights = {wf.w}")
+
+    # --- ансамбль экспертов + мета
+    xgb_exp = XGBExpert(ml_cfg)
+    rf_exp  = RFCalibratedExpert(ml_cfg)
+    arf_exp = RiverARFExpert(ml_cfg)
+    nn_exp  = NNExpert(ml_cfg)
+
+    # Если в этом файле уже есть переменные с токеном/чатом — подставляем их в cfg:
+# В конфигурации (добавить новые параметры)
+class MLConfig:
+    # META CEM+MC / Neural
+    meta_use_cma_es: bool = True
+    meta_enter_wr: float = 0.58
+    meta_exit_wr: float = 0.52
+    meta_min_ready: int = 80
+    meta_weight_decay_days: float = 30.0
+    phase_state_path: str = "phase_state.json"
+    
+    # НОВОЕ: параметры для нейросетевой META
+    meta_mc_n_inference: int = 30         # MC Dropout проходов при предсказании
+    meta_mc_uncertainty_threshold: float = 0.15  # порог uncertainty для коррекции
+    meta_neural_dropout_rates: List[float] = None  # будет [0.20, 0.20, 0.15] по умолчанию
+    meta_state_path: str = "meta_neural_state.json"  # отдельный файл для нейросети
+    
+    # CV параметры (общие)
+    cv_enabled: bool = True
+    cv_n_splits: int = 3
+    cv_embargo_pct: float = 0.02
+    cv_purge_pct: float = 0.01
+    cv_min_train_size: int = 150
+    cv_bootstrap_n: int = 1000
+    cv_confidence: float = 0.95
+    cv_min_improvement: float = 0.02
+    cv_oof_window: int = 500
+    cv_check_every: int = 100
+
+    # --- калибровщики и вторая МЕТА + блендер ---
+    from calib.manager import OnlineCalibManager
+    _CALIB_MGR = globals().get("_CALIB_MGR")
+    if _CALIB_MGR is None:
+        _CALIB_MGR = OnlineCalibManager()
+        globals()["_CALIB_MGR"] = _CALIB_MGR
+        try:
+            import pandas as pd, numpy as np
+            if os.path.exists(CSV_PATH):
+                df_hist = pd.read_csv(CSV_PATH, encoding="utf-8-sig")
+                if {"p_meta_raw","outcome"}.issubset(df_hist.columns):
+                    y_hist = (df_hist["outcome"].astype(str).str.lower()=="win").astype(int).to_numpy()
+                    p_hist = df_hist["p_meta_raw"].astype(float).to_numpy()
+                    mask = np.isfinite(p_hist)
+                    if mask.sum() >= int(os.getenv("CALIB_MIN_N","300")):
+                        _CALIB_MGR.fit_global(p_hist[mask], y_hist[mask])
+        except Exception:
+            log_exception("Unhandled exception")
+
+
+    import atexit, signal, sys
+
+    def _meta_flush(*_):
+        try: meta._save_throttled(force=True)
+        except: pass
+
+    atexit.register(_meta_flush)
+    try:
+        signal.signal(signal.SIGTERM, _meta_flush)              # OK: мягко флашим при SIGTERM
+        signal.signal(signal.SIGINT,  signal.default_int_handler)  # ← вернуть дефолт
+    except Exception:
+        log_exception("Failed to import atexit")
+ 
+
+    def _status_line(name, st):
+        return (f"{name}: enabled={st['enabled']}, mode={st['mode']}, "
+                f"wr_act={st.get('wr_active','—')} (n={st.get('n_active','0')}), "
+                f"wr_sh={st.get('wr_shadow','—')} (n={st.get('n_shadow','0')}), "
+                f"wr_all={st.get('wr_all','—')} (n={st.get('n','0')})")
+
+    print("[ens ] " + _status_line("XGB", xgb_exp.status()))
+    print("[ens ] " + _status_line("RF ", rf_exp.status()))
+    print("[ens ] " + _status_line("ARF", arf_exp.status()))
+    print("[ens ] " + _status_line("NN ", nn_exp.status()))
+    print("[ens ] " + _status_line("META", meta.status()))
+
+    # --- NEW: contexts for addons ---
+    micro = MicrostructureClient(SESSION, SYMBOL)
+    fut   = FuturesContext(SESSION, SYMBOL, min_refresh_sec=30)
+    pool  = PoolFeaturesCtx(k=10, late_sec=30)
+
+    # НОВОЕ: персистентная 2D-таблица квантилей r̂ по (t_rem × pool)
+    r2d   = RHat2D(state_path="rhat2d_state.json", pending_path="rhat2d_pending.json")
+
+    gas_hist = GasHistory(maxlen=1200)
+
+    # НОВОЕ: калькулятор рыночных фич для META
+    market_calc = MarketFeaturesCalculator(
+        max_history=300,
+        trend_window=5,
+        vol_window=20,
+        jump_threshold=0.005
+    )
+    print("[init] MarketFeaturesCalculator инициализирован")
+
+    # Вывод статистики калькулятора (ПОСЛЕ инициализации!)
+    market_stats = market_calc.get_stats()
+    print(f"[market] History: {market_stats['history_size']}/{market_stats['max_history']} | "
+        f"OrderBook: {market_stats['has_orderbook']} | "
+        f"Futures: {market_stats['has_futures']} | "
+        f"Funding: {market_stats['has_funding']}")
+
+    if tg_enabled():
+        tg_send("🧠 Ensemble init:\n" +
+                _status_line("XGB", xgb_exp.status()) + "\n" +
+                _status_line("RF ", rf_exp.status()) + "\n" +
+                _status_line("ARF", arf_exp.status()) + "\n" +
+                _status_line("NN ",  nn_exp.status())  + "\n" +
+                _status_line("META", meta.status()))
+
+
+
+    # кешы свечей/фич
+    # кешы свечей/фич
+    kl_df: Optional[pd.DataFrame] = None
+    cross_df_map: Dict[str, Optional[pd.DataFrame]] = {}
+    stab_df_map: Dict[str, Optional[pd.DataFrame]] = {}
+    feats: Optional[Dict[str, pd.Series]] = None
+    cross_feats_map: Dict[str, Dict[str, pd.Series]] = {}
+    stab_feats_map: Dict[str, Dict[str, pd.Series]] = {}
+
+    # ========== НОВОЕ: КЭШИРОВАНИЕ ИСТОРИЧЕСКИХ ДАННЫХ ==========
+    # Кэш последних успешных данных для фолбэка при RPC timeout
+    historical_data_cache = {
+        "kl_df": None,
+        "feats": None,
+        "cross_df_map": {},
+        "stab_df_map": {},
+        "cross_feats_map": {},
+        "stab_feats_map": {},
+        "last_update_time": None,
+        "cache_ttl_seconds": 300  # 5 минут - данные остаются актуальными
+    }
+
+    def update_historical_cache():
+        """Обновляет кэш исторических данных после успешной загрузки"""
+        historical_data_cache["kl_df"] = kl_df.copy() if kl_df is not None and not kl_df.empty else None
+        historical_data_cache["feats"] = feats.copy() if feats is not None else None
+        historical_data_cache["cross_df_map"] = {k: v.copy() if v is not None and not v.empty else None for k, v in cross_df_map.items()}
+        historical_data_cache["stab_df_map"] = {k: v.copy() if v is not None and not v.empty else None for k, v in stab_df_map.items()}
+        historical_data_cache["cross_feats_map"] = {k: v.copy() if v is not None else None for k, v in cross_feats_map.items()}
+        historical_data_cache["stab_feats_map"] = {k: v.copy() if v is not None else None for k, v in stab_feats_map.items()}
+        historical_data_cache["last_update_time"] = time.time()
+
+    def restore_from_historical_cache():
+        """Восстанавливает данные из кэша при RPC timeout"""
+        global kl_df, feats, cross_df_map, stab_df_map, cross_feats_map, stab_feats_map
+        
+        if historical_data_cache["kl_df"] is None:
+            return False
+        
+        # Проверяем актуальность кэша
+        cache_age = time.time() - historical_data_cache["last_update_time"] if historical_data_cache["last_update_time"] else float('inf')
+        if cache_age > historical_data_cache["cache_ttl_seconds"]:
+            print(f"[cache] Historical cache too old ({cache_age:.0f}s), skipping restore")
+            return False
+        
+        kl_df = historical_data_cache["kl_df"].copy() if historical_data_cache["kl_df"] is not None else None
+        feats = historical_data_cache["feats"].copy() if historical_data_cache["feats"] is not None else None
+        cross_df_map = {k: v.copy() if v is not None else None for k, v in historical_data_cache["cross_df_map"].items()}
+        stab_df_map = {k: v.copy() if v is not None else None for k, v in historical_data_cache["stab_df_map"].items()}
+        cross_feats_map = {k: v.copy() if v is not None else None for k, v in historical_data_cache["cross_feats_map"].items()}
+        stab_feats_map = {k: v.copy() if v is not None else None for k, v in historical_data_cache["stab_feats_map"].items()}
+        
+        print(f"[cache] Restored historical data from cache (age: {cache_age:.0f}s)")
+        return True
+    # ============================================================
+
+    # фабрика расширенных признаков для экспертов
+    ext_builder = ExtendedMLFeatures()
+
+    bets: Dict[int, Dict] = {}
+    last_seen_epoch = None
+    print("[loop] Press Ctrl+C to stop.")
+
+    rpc_fail_streak = 0
+    RPC_FAIL_MAX = 5
+    _last_gc = 0  # unix-ts последнего ручного GC
+
+    # OU/Logit-OU
+    ou_skew = OUOnlineSkew(dt_unit=OU_SKEW_DT_UNIT, decay=OU_SKEW_DECAY) if OU_SKEW_USE else None
+    logit_ou = LogitOUSmoother(half_life_sec=LOGIT_OU_HALF_LIFE_SEC,
+                               mu_beta=LOGIT_OU_MU_BETA,
+                               z_clip=LOGIT_OU_Z_CLIP) if LOGIT_OU_USE else None
+
+    def notify_ens_used(p_base: Optional[float],
+                        px: Optional[float], prf: Optional[float], parf: Optional[float], pnn: Optional[float],
+                        p_final: Optional[float], used: bool, meta_mode: str):
+        try:
+            if used and p_final is not None:
+                tg_send(
+                    "📊 ENS used=<b>YES</b>\n"
+                    f"mode=<b>{meta_mode}</b>, "
+                    f"p_base={fmt_prob(p_base)}, "
+                    f"p_xgb={fmt_prob(px)}, "
+                    f"p_rf={fmt_prob(prf)}, "
+                    f"p_arf={fmt_prob(parf)}, "
+                    f"p_nn={fmt_prob(pnn)}, "
+                    f"p_final={fmt_prob(p_final)}"
+                )
+
+            else:
+                s_x = xgb_exp.status(); s_r = rf_exp.status(); s_a = arf_exp.status(); s_n = nn_exp.status(); s_m = meta.status()
+                tg_send("📊 ENS used=no\n"
+                        + _status_line("XGB", s_x) + "\n"
+                        + _status_line("RF ", s_r) + "\n"
+                        + _status_line("ARF", s_a) + "\n"
+                        + _status_line("NN ", s_n) + "\n"
+                        + _status_line("META", s_m))
+        except Exception:
+            log_exception("Failed to send Telegram notification")
+
+    while True:
+        try:
+            now = int(time.time())
+
+            # — пересчёт «хороших часов» по окну 14 дней (по умолчанию) каждые 4 часа
+            try:
+                if 'hours' in globals() and hours is not None:
+                    hours.maybe_recompute(now_ts=now)
+            except Exception as e:
+                print(f"[hours] recompute failed: {e}")
+
+            # — ежедневная отсечка резерва в 23:00 UTC (при первом тике после 23:00)
+            try:
+                if reserve is not None:
+                    evt = reserve.maybe_eod_rebalance(now_ts=now, capital=capital)
+                    if evt and evt.get("changed"):
+                        new_capital = float(evt["capital"])
+                        try:
+                            capital_state.save(new_capital, ts=now)  # сохраняем новый рабочий капитал
+                        except Exception as e:
+                            print(f"[warn] capital_state save failed: {e}")
+                        # информируем в TG (тихо игнорим сбои)
+                        try:
+                            tg_send(evt["message"])
+                        except Exception:
+                            log_exception("Failed to send Telegram notification")
+                        capital = new_capital  # обновляем capital в самом конце
+            except Exception as e:
+                print(f"[reserve] eod rebalance failed: {e}")
+
+
+
+            # --- текущий epoch
+            try:
+                cur = int(c.functions.currentEpoch().call())
+                rpc_fail_streak = 0
+            except Exception as e:
+                print(f"[rpc ] currentEpoch failed: {e}")
+                rpc_fail_streak += 1
+                if rpc_fail_streak >= RPC_FAIL_MAX:
+                    try:
+                        w3 = connect_web3()
+                        c = get_prediction_contract(w3)
+                        rpc_fail_streak = 0
+                        print("[rpc ] reconnected")
+                    except Exception as ee:
+                        print(f"[rpc ] reconnect failed: {ee}")
+                time.sleep(1.0)
+                continue
+
+            if last_seen_epoch != cur:
+                print(f"\n[epoch] currentEpoch={cur} (time={now})")
+                last_seen_epoch = cur
+            try:
+                try_settle_shadow_rows(CSV_SHADOW_PATH, w3, c, cur)
+            except Exception as e:
+                print(f"[shadow] settle pass failed: {e}")
+
+
+            try:
+                st = delta_daily.maybe_update_every_hours(period_hours=4, now_ts=now)
+                if st and isinstance(st.get("delta"), (int, float)):
+                    n_trades = _settled_trades_count(CSV_PATH)
+
+                    if n_trades < MIN_TRADES_FOR_DELTA:
+                        DELTA_PROTECT = 0.0
+                        try:
+                            tg_send(
+                                "⚙️ Обновление δ (каждые 4ч)\n"
+                                f"δ=<b>0.000</b> (FORCED: trades={n_trades}/{MIN_TRADES_FOR_DELTA})\n"
+                                f"p_opt=<b>{st.get('p_thr_opt', float('nan')):.4f}</b> | "
+                                f"avg_used=<b>{st.get('avg_p_thr_used', float('nan')):.4f}</b>\n"
+                                f"N={st.get('sample_size','?')}  взяли={st.get('selected_n','?')}\n"
+                                f"P&L*={st.get('pnl_at_opt', float('nan')):.6f} BNB\n"
+                                "<i>* по подмножеству исторически взятых сделок</i>"
+                            )
+                        except Exception:
+                            log_exception("Unhandled exception")
+
+                    elif (meta.mode != "ACTIVE") or (not had_trade_in_last_hours(CSV_PATH, 1.0)):
+                        DELTA_PROTECT = 0.0
+                        reason = "meta≠ACTIVE" if meta.mode != "ACTIVE" else "idle≥1h"
+                        try:
+                            tg_send(
+                                "⚙️ Обновление δ (каждые 4ч)\n"
+                                f"δ=<b>0.000</b> (DISABLED: {reason})\n"
+                                f"p_opt=<b>{st.get('p_thr_opt', float('nan')):.4f}</b> | "
+                                f"avg_used=<b>{st.get('avg_p_thr_used', float('nan')):.4f}</b>\n"
+                                f"N={st.get('sample_size','?')}  взяли={st.get('selected_n','?')}\n"
+                                f"P&L*={st.get('pnl_at_opt', float('nan')):.6f} BNB\n"
+                                "<i>* по подмножеству исторически взятых сделок</i>"
+                            )
+                        except Exception:
+                            log_exception("Unhandled exception")
+
+                    else:
+                        DELTA_PROTECT = float(st["delta"])
+                        try:
+                            tg_send(
+                                "⚙️ Обновление δ (каждые 4ч)\n"
+                                f"δ=<b>{DELTA_PROTECT:.3f}</b>\n"
+                                f"p_opt=<b>{st.get('p_thr_opt', float('nan')):.4f}</b> | "
+                                f"avg_used=<b>{st.get('avg_p_thr_used', float('nan')):.4f}</b>\n"
+                                f"N={st.get('sample_size','?')}  взяли={st.get('selected_n','?')}\n"
+                                f"P&L*={st.get('pnl_at_opt', float('nan')):.6f} BNB\n"
+                                "<i>* по подмножеству исторически взятых сделок</i>"
+                            )
+                        except Exception:
+                            log_exception("Unhandled exception")
+            except Exception as e:
+                print(f"[delta] update failed: {e}")
+
+
+
+            # проверяем активные/пропущенные
+            pending = sorted([e for e, b in bets.items() if not b.get("settled") and e < cur - 1])[-50:]
+
+            for epoch in [cur, cur - 1] + pending:
+                if epoch <= 0:
+                    continue
+
+# ========== УЛУЧШЕННАЯ ОБРАБОТКА RPC TIMEOUT С КЭШИРОВАНИЕМ ==========
+                rd = None
+                use_cached_data = False
+
+                try:
+                    rd = get_round(w3, c, epoch)
+                    if rd is None:
+                        print(f"[rpc ] timeout on rounds({epoch}), attempting to use cached data")
+                        
+                        # Пытаемся восстановить данные из кэша
+                        if restore_from_historical_cache():
+                            use_cached_data = True
+                            # Создаем минимальный объект rd с дефолтными значениями для продолжения работы
+                            from collections import namedtuple
+                            RoundInfoFallback = namedtuple('RoundInfo', 
+                                ['epoch', 'start_ts', 'lock_ts', 'close_ts', 'lock_price', 'close_price',
+                                 'bull_amount', 'bear_amount', 'reward_base', 'reward_amt', 'oracle_called'])
+                            
+                            # Вычисляем примерные таймстемпы на основе текущего времени и интервала
+                            estimated_lock_ts = now + 60
+                            estimated_close_ts = estimated_lock_ts + 300
+                            
+                            rd = RoundInfoFallback(
+                                epoch=epoch,
+                                start_ts=now - 60,
+                                lock_ts=estimated_lock_ts,
+                                close_ts=estimated_close_ts,
+                                lock_price=0,
+                                close_price=0,
+                                bull_amount=0,
+                                bear_amount=0,
+                                reward_base=0,
+                                reward_amt=0,
+                                oracle_called=False
+                            )
+                            print(f"[fallback] Using cached data with estimated round info for epoch {epoch}")
+                        else:
+                            print(f"[skip] epoch={epoch} (rpc timeout, no cache available)")
+                            continue
+                    else:
+                        rpc_fail_streak = 0
+                        
+                except Exception as e:
+                    print(f"[rpc ] get_round({epoch}) failed: {e}")
+                    rpc_fail_streak += 1
+                    if rpc_fail_streak >= RPC_FAIL_MAX:
+                        try:
+                            w3 = connect_web3()
+                            c = get_prediction_contract(w3)
+                            rpc_fail_streak = 0
+                            print("[rpc ] reconnected")
+                        except Exception as ee:
+                            print(f"[rpc ] reconnect failed: {ee}")
+                    
+                    # Пытаемся использовать кэшированные данные даже при исключении
+                    if restore_from_historical_cache():
+                        use_cached_data = True
+                        from collections import namedtuple
+                        RoundInfoFallback = namedtuple('RoundInfo', 
+                            ['epoch', 'start_ts', 'lock_ts', 'close_ts', 'lock_price', 'close_price',
+                             'bull_amount', 'bear_amount', 'reward_base', 'reward_amt', 'oracle_called'])
+                        
+                        estimated_lock_ts = now + 60
+                        estimated_close_ts = estimated_lock_ts + 300
+                        
+                        rd = RoundInfoFallback(
+                            epoch=epoch,
+                            start_ts=now - 60,
+                            lock_ts=estimated_lock_ts,
+                            close_ts=estimated_close_ts,
+                            lock_price=0,
+                            close_price=0,
+                            bull_amount=0,
+                            bear_amount=0,
+                            reward_base=0,
+                            reward_amt=0,
+                            oracle_called=False
+                        )
+                        print(f"[fallback] Exception recovery: using cached data for epoch {epoch}")
+                    else:
+                        continue
+
+                if epoch not in bets:
+                    # === COOLING PERIOD: умная пауза после серии проигрышей ===
+                    if epoch == cur and now < rd.lock_ts:
+                        try:
+                            df_recent = _read_csv_df(CSV_PATH).sort_values("settled_ts")
+                            if not df_recent.empty:
+                                # Смотрим на последние 5 сделок
+                                recent_trades = df_recent[df_recent["outcome"].isin(["win", "loss"])].tail(5)
+                                
+                                if len(recent_trades) >= 5:
+                                    # Считаем количество проигрышей
+                                    losses = (recent_trades["outcome"] == "loss").sum()
+                                    
+                                    # Анализируем КАЧЕСТВО проигрышей (edge_at_entry)
+                                    loss_rows = recent_trades[recent_trades["outcome"] == "loss"]
+                                    
+                                    # Безопасно извлекаем edge_at_entry
+                                    loss_edges = pd.to_numeric(
+                                        loss_rows.get("edge_at_entry", pd.Series(dtype=float)), 
+                                        errors="coerce"
+                                    ).dropna()
+                                    
+                                    avg_loss_edge = float(loss_edges.mean()) if len(loss_edges) > 0 else 0.0
+                                    
+                                    # === УСЛОВИЯ ДЛЯ COOLING ===
+                                    # 1) 3+ проигрыша из последних 5
+                                    # 2) Средний edge проигрышей >= 0.03 (не маргинальные ставки)
+                                    cooling_needed = (losses >= 3) and (avg_loss_edge >= 0.03)
+                                    
+                                    if cooling_needed:
+                                        # Проверяем timestamp ПЕРВОГО проигрыша в серии
+                                        first_loss_ts = int(recent_trades[recent_trades["outcome"] == "loss"].iloc[0]["settled_ts"])
+                                        hours_since = (now - first_loss_ts) / 3600.0
+                                        COOLDOWN_HOURS = 1.0
+                                        
+                                        if hours_since < COOLDOWN_HOURS:
+                                            bets[epoch] = dict(
+                                                skipped=True, 
+                                                reason="cooling_period", 
+                                                wait_polls=0, 
+                                                settled=False
+                                            )
+                                            
+                                            # Детальное сообщение
+                                            print(f"[cool] epoch={epoch} COOLING: {losses}/5 losses "
+                                                f"(avg_edge={avg_loss_edge:.3f}) | "
+                                                f"series started {hours_since:.1f}h ago | "
+                                                f"wait {COOLDOWN_HOURS-hours_since:.1f}h more")
+                                            
+                                            send_round_snapshot(
+                                                prefix=f"🧊 <b>Cooling</b> epoch={epoch}",
+                                                extra_lines=[
+                                                    f"Пауза после {losses}/5 проигрышей.",
+                                                    f"Серия началась {hours_since:.1f}ч назад",
+                                                    f"Средний edge проигрышей: {avg_loss_edge:.3f}",
+                                                    f"Осталось: {COOLDOWN_HOURS-hours_since:.1f}ч"
+                                                ]
+                                            )
+                                            
+                                            notify_ens_used(None, None, None, None, None, None, False, meta.mode)
+                                            continue
+                                
+                        except Exception as e:
+                            print(f"[cool] check failed: {e}")
+                    
+                    # --- стадия принятия решения
+                    if epoch == cur and now < rd.lock_ts:
+                        # --- Guard: ждём до окна последних 15 секунд перед lock
+                        time_left = rd.lock_ts - now
+                        if time_left > GUARD_SECONDS:
+                            if not use_cached_data:
+                                pool.observe(epoch, now, rd.bull_amount, rd.bear_amount)
+                            continue
+
+                        # --- тики/фичи к lock-1s
+                        t_lock = pd.to_datetime((rd.lock_ts - 1) * 1000, unit="ms", utc=True)
+                        need_until_ms = int(t_lock.timestamp() * 1000)
+
+                        # ========== ЗАГРУЗКА ДАННЫХ С КЭШИРОВАНИЕМ ==========
+                        if not use_cached_data:
+                            # Обычный режим: загружаем свежие данные
+                            try:
+                                kl_df = ensure_klines_cover(kl_df, SYMBOL, BINANCE_INTERVAL, need_until_ms)
+                                if kl_df is None or kl_df.empty:
+                                    # Пытаемся использовать кэш при неудаче загрузки Binance
+                                    if restore_from_historical_cache():
+                                        print(f"[fallback] Binance data unavailable, using cached klines")
+                                    else:
+                                        print(f"[skip] epoch={epoch} (no Binance data, no cache)")
+                                        continue
+                                else:
+                                    feats = features_from_binance(kl_df)
+                                    
+                                    if USE_CROSS_ASSETS:
+                                        cross_df_map = ensure_klines_cover_map(cross_df_map, CROSS_SYMBOLS, BINANCE_INTERVAL, need_until_ms)
+                                        stab_df_map  = ensure_klines_cover_map(stab_df_map,  STABLE_SYMBOLS, BINANCE_INTERVAL, need_until_ms)
+                                        cross_feats_map = features_for_symbols(cross_df_map)
+                                        stab_feats_map  = features_for_symbols(stab_df_map)
+                                    
+                                    # Обновляем кэш после успешной загрузки
+                                    update_historical_cache()
+                                    
+                            except Exception as e:
+                                print(f"[error] Data loading failed: {e}, attempting cache restore")
+                                if not restore_from_historical_cache():
+                                    print(f"[skip] epoch={epoch} (data loading error, no cache)")
+                                    continue
+                        else:
+                            # Режим кэша: данные уже восстановлены, просто логируем
+                            print(f"[cache] Using cached features for predictions")
+                        # ===================================================
+
+                        if USE_CROSS_ASSETS:
+                            cross_df_map = ensure_klines_cover_map(cross_df_map, CROSS_SYMBOLS, BINANCE_INTERVAL, need_until_ms)
+                            stab_df_map  = ensure_klines_cover_map(stab_df_map,  STABLE_SYMBOLS, BINANCE_INTERVAL, need_until_ms)
+                            cross_feats_map = features_for_symbols(cross_df_map)
+                            stab_feats_map  = features_for_symbols(stab_df_map)
+
+                        if is_chop_at_time(feats, t_lock):
+                            bets[epoch] = dict(skipped=True, reason="chop", wait_polls=0, settled=False)
+                            print(f"[skip] epoch={epoch} (chop)")
+                            send_round_snapshot(
+                                prefix=f"⛔ <b>Skip</b> epoch={epoch} (болото ATR/CHOP)",
+                                extra_lines=[f"Причина: chop (низкая волатильность)."]
+                            )
+                            notify_ens_used(None, None, None, None, None, None, False, meta.mode)
+                            continue
+
+                        # --- базовая вероятность (как раньше)
+                        w_for_prob = wf.w if (wf is not None) else None
+                        P_up, P_dn, wf_phi_dict = prob_up_down_at_time(feats, t_lock, w_for_prob)
+
+                        # отладка амплитуды базовой вероятности
+                        try:
+                            phi_dbg = np.array([
+                                wf_phi_dict.get("phi_wf0", 0.0),
+                                wf_phi_dict.get("phi_wf1", 0.0),
+                                wf_phi_dict.get("phi_wf2", 0.0),
+                                wf_phi_dict.get("phi_wf3", 0.0),
+                            ], dtype=float)
+                            w_dbg = (wf.w if (wf is not None) else np.array([0.35, 0.20, 0.20, 0.25], dtype=float))
+                            z_up = float(np.dot(w_dbg, phi_dbg))
+                            print(f"[base] ||w||={np.linalg.norm(w_dbg):.3f} logit={z_up:+.4f} P_up_raw={P_up:.4f}")
+                        except Exception:
+                            log_exception("Unhandled exception")
+
+
+                        if USE_SUPER_SMOOTHER and p_ss is not None:
+                            P_up = float(np.clip(p_ss.update(P_up), 0.0, 1.0))
+                            P_dn = 1.0 - P_up
+                        else:
+                            p_up_ema = P_up if p_up_ema is None else (alpha * P_up + (1 - alpha) * p_up_ema)
+                            P_up = p_up_ema
+                            P_dn = 1.0 - P_up
+
+                        # --- NEW: microstructure/futures/pools/jumps/liquidity/time/gas/idio
+                        # ВАЖНО: вычисляем эти фичи ПЕРЕД NN-калибратором, чтобы они были доступны
+
+                        # 1) Микроструктура к lock-1s
+                        end_ms = int(t_lock.timestamp()*1000)
+                        micro_feats = micro.compute(end_ms)  # rel_spread, book_imb, microprice_delta, ofi_5s/15s/30s, ob_slope, mid
+
+                        # 2) Фьючерсы (refresh ≈ раз в 30с)
+                        fut.refresh()
+                        spot_mid = micro_feats.get("mid", float(kl_df["close"].iloc[-1]))
+                        fut_feats = fut.features(spot_mid)
+
+                        # 3) Пулы Prediction: копим наблюдения и извлекаем фичи к lock-1s
+                        pool.observe(epoch, now, rd.bull_amount, rd.bear_amount)
+                        pool.update_streak_from_rounds(lambda e: get_round(w3, c, e), cur)
+                        pool_feats = pool.features(epoch, rd.lock_ts)
+
+                        # 4) Волатильность/джампы (BV/RQ/RV) на окнах 20/60/120 баров
+                        RV20,BV20,RQ20,n20 = realized_metrics(kl_df["close"], 20)
+                        RV60,BV60,RQ60,n60 = realized_metrics(kl_df["close"], 60)
+                        RV120,BV120,RQ120,n120 = realized_metrics(kl_df["close"], 120)
+                        jump20 = jump_flag_from_rv_bv_rq(RV20,BV20,RQ20,n20, z_thr=3.0)
+                        jump60 = jump_flag_from_rv_bv_rq(RV60,BV60,RQ60,n60, z_thr=3.0)
+
+                        # 5) Ликвидность/импакт
+                        amihud = amihud_illiq(kl_df, win=20)
+                        kyle   = kyle_lambda(kl_df, win=20)
+
+                        # 6) Интрадей-профиль времени
+                        time_feats = intraday_time_features(t_lock)
+
+                        # 7) Кросс-активы: «очищенный» ретёрн и динамика беты
+                        btc_df = cross_df_map.get("BTCUSDT")
+                        eth_df = cross_df_map.get("ETHUSDT")
+                        idio = idio_features(kl_df, btc_df, eth_df, look_min=240)
+
+                        # 8) Газ — дельта/волатильность
+                        gas_gwei_now = float(get_gas_price_wei(w3))/1e9
+                        gas_hist.push(now, gas_gwei_now)
+                        gas_feats = gas_hist.features(now)
+
+                        # Сбор всех новых фич в единый вектор (фиксированный порядок ключей):
+                        addon_dict = {}
+                        addon_dict.update({
+                            "rel_spread": micro_feats.get("rel_spread", 0.0),
+                            "book_imb": micro_feats.get("book_imb", 0.0),
+                            "microprice_delta": micro_feats.get("microprice_delta", 0.0),
+                            "ofi_5s": micro_feats.get("ofi_5s", 0.0),
+                            "ofi_15s": micro_feats.get("ofi_15s", 0.0),
+                            "ofi_30s": micro_feats.get("ofi_30s", 0.0),
+                            "ob_slope": micro_feats.get("ob_slope", 0.0),
+                            "funding_sign": fut_feats.get("funding_sign", 0.0),
+                            "funding_timeleft": fut_feats.get("funding_timeleft", 0.0),
+                            "dOI_1m": fut_feats.get("dOI_1m", 0.0),
+                            "dOI_5m": fut_feats.get("dOI_5m", 0.0),
+                            "basis_now": fut_feats.get("basis_now", 0.0),
+                            "pool_logit": pool_feats.get("pool_logit", 0.0),
+                            "pool_logit_d30": pool_feats.get("pool_logit_d30", 0.0),
+                            "pool_logit_d60": pool_feats.get("pool_logit_d60", 0.0),
+                            "late_money_share": pool_feats.get("late_money_share", 0.0),
+                            "last_k_outcomes_mean": pool_feats.get("last_k_outcomes_mean", 0.0),
+                            "last_k_payout_median": pool_feats.get("last_k_payout_median", 0.0),
+                            "bv_over_rv_20": (BV20/max(1e-12, RV20)),
+                            "bv_over_rv_60": (BV60/max(1e-12, RV60)),
+                            "rq_norm_20": RQ20,
+                            "rq_norm_60": RQ60,
+                            "jump20": float(jump20),
+                            "jump60": float(jump60),
+                            "amihud_illq": amihud,
+                            "kyle_lambda": kyle,
+                            "resid_ret_1m": idio.get("resid_ret_1m", 0.0),
+                            "beta_sum": idio.get("beta_sum", 0.0),
+                            "beta_sum_d60": idio.get("beta_sum_d60", 0.0),
+                            "gas_d1m": gas_feats.get("gas_d1m", 0.0),
+                            "gas_vol5m": gas_feats.get("gas_vol5m", 0.0),
+                        })
+                        addon_dict.update(time_feats)
+
+                        # NN-калибратор поверх фич (старый)
+                        # NN-калибратор с расширенными признаками (НОВЫЙ)
+                        phi, i = None, _index_pad(feats["M_up"], t_lock)
+                        if NN_USE and i is not None:
+                            # Базовые фичи из основной модели
+                            M_diff = float(feats["M_up"].iloc[i] - feats["M_dn"].iloc[i])
+                            S_diff = float(feats["S_up"].iloc[i] - feats["S_dn"].iloc[i])
+                            B_diff = float(feats["B_up"].iloc[i] - feats["B_dn"].iloc[i])
+                            R_diff = float(feats["R_up"].iloc[i] - feats["R_dn"].iloc[i])
+                            
+                            # НОВЫЕ фичи из микроструктуры, пулов, фьючерсов и газа
+                            # Безопасное извлечение с fallback на 0.0
+                            def safe_get(d, k, default=0.0):
+                                if d is None or not isinstance(d, dict):
+                                    return default
+                                v = d.get(k, default)
+                                return float(v) if (v is not None and math.isfinite(float(v))) else default
+                            
+                            pool_logit_val = safe_get(pool_feats, "pool_logit", 0.0)
+                            pool_d30_val = safe_get(pool_feats, "pool_logit_d30", 0.0)
+                            book_imb_val = safe_get(micro_feats, "book_imb", 0.0)
+                            ofi_15s_val = safe_get(micro_feats, "ofi_15s", 0.0)
+                            basis_pct_val = safe_get(fut_feats, "basis_now", 0.0)
+                            
+                            # Газ: недавняя медиана (используем метод из GasHistory)
+                            gas_median_val = 0.0
+                            if gas_hist is not None:
+                                try:
+                                    recent_samples = [g for _, g in list(gas_hist.hist)[-20:]]
+                                    if recent_samples:
+                                        gas_median_val = float(np.median(recent_samples))
+                                except Exception:
+                                    gas_median_val = 0.0
+                            
+                            # Собираем вектор признаков (11 фичей + bias = 12)
+                            phi = np.array([
+                                M_diff,            # 0: momentum разность
+                                S_diff,            # 1: VWAP slope разность
+                                B_diff,            # 2: Keltner breakout разность
+                                R_diff,            # 3: Bollinger reversion разность
+                                pool_logit_val,    # 4: логит дисбаланса пулов
+                                pool_d30_val,      # 5: динамика пулов за 30 секунд
+                                book_imb_val,      # 6: дисбаланс стакана (bid vs ask)
+                                ofi_15s_val,       # 7: order flow imbalance за 15с
+                                basis_pct_val,     # 8: фьючерсный базис (%)
+                                gas_median_val,    # 9: медианная цена газа за 20 последних наблюдений
+                                1.0                # 10: bias (intercept)
+                            ], dtype=float)
+                            
+                            # Клиппинг экстремальных значений для стабильности
+                            phi = np.clip(phi, -10.0, 10.0)
+                            
+                            # Применяем калибратор
+                            if logreg is not None:
+                                try:
+                                    p_nncal = logreg.predict(phi)
+                                    # Blend с базовой вероятностью
+                                    P_up = (1.0 - BLEND_NN) * P_up + BLEND_NN * p_nncal
+                                    P_dn = 1.0 - P_up
+                                except Exception:
+                                    log_exception("NN calibrator prediction failed")
+
+                        # кросс-активы
+                        if USE_CROSS_ASSETS:
+                            zc_up1, zc_dn1 = cross_up_down_contrib(cross_feats_map, t_lock, CROSS_SYMBOLS, CROSS_W_MOM, CROSS_W_VWAP, CROSS_SHIFT_BARS)
+                            zc_up2, zc_dn2 = cross_up_down_contrib(stab_feats_map,  t_lock, STABLE_SYMBOLS, STABLE_W_MOM, STABLE_W_VWAP, CROSS_SHIFT_BARS)
+                            delta_logit = CROSS_ALPHA * ((zc_up1 + zc_up2) - (zc_dn1 + zc_dn2))
+                            P_up = from_logit(to_logit(P_up) + float(delta_logit))
+                            P_up = float(np.clip(P_up, 0.0, 1.0))
+                            P_dn = 1.0 - P_up
+
+                        P_up = elder_logit_adjust(kl_df, t_lock, P_up)
+                        P_dn = 1.0 - P_up
+
+                        # OU-добавки
+                        if OU_SKEW_USE and "Zs" in feats:
+                            j = _index_pad(feats["Zs"], t_lock)
+                            if j is not None and j > 0:
+                                z_prev = float(np.clip(feats["Zs"].iloc[j-1], -OU_SKEW_Z_CLIP, OU_SKEW_Z_CLIP))
+                                z_now  = float(np.clip(feats["Zs"].iloc[j],   -OU_SKEW_Z_CLIP, OU_SKEW_Z_CLIP))
+                                ou_skew.update_pair(z_prev, z_now)
+                                horizon_sec = max(1.0, rd.close_ts - rd.lock_ts)
+                                res = ou_skew.prob_above_zero(z_now, horizon_sec)
+                                if res is not None:
+                                    p_ou_up, strength = res
+                                    z_base = to_logit(P_up)
+                                    z_ou = to_logit(p_ou_up)
+                                    amp = float(np.clip((abs(z_now) - OU_SKEW_THR) / max(1e-6, OU_SKEW_THR), 0.0, 1.0))
+                                    lam = min(OU_SKEW_LAMBDA_MAX, strength) * amp
+                                    z_mix = (1.0 - lam) * z_base + lam * z_ou
+                                    P_up = from_logit(z_mix)
+                                    P_dn = 1.0 - P_up
+
+                        if LOGIT_OU_USE and logit_ou is not None:
+                            z_now = to_logit(P_up)
+                            logit_ou.update_mu(z_now)
+                            horizon_sec = max(1.0, rd.close_ts - rd.lock_ts)
+                            z_pred = logit_ou.predict_future(z_now, horizon_sec)
+                            P_up = from_logit(z_pred)
+                            P_dn = 1.0 - P_up
+
+                        addon_names = [
+                            "rel_spread","book_imb","microprice_delta","ofi_5s","ofi_15s","ofi_30s","ob_slope",
+                            "funding_sign","funding_timeleft","dOI_1m","dOI_5m","basis_now",
+                            "pool_logit","pool_logit_d30","pool_logit_d60","late_money_share",
+                            "last_k_outcomes_mean","last_k_payout_median",
+                            "bv_over_rv_20","bv_over_rv_60","rq_norm_20","rq_norm_60","jump20","jump60",
+                            "amihud_illq","kyle_lambda","resid_ret_1m","beta_sum","beta_sum_d60",
+                            "gas_d1m","gas_vol5m",
+                            "tod_sin","tod_cos","EU","US","ASIA",
+                            "dow_0","dow_1","dow_2","dow_3","dow_4","dow_5","dow_6"
+                        ]
+                        x_addon, _ = pack_vector(addon_dict, addon_names)
+
+                        # --- ТВОЙ СТАРЫЙ x_ml ---
+                        x_ml = ext_builder.build(kl_df, feats, t_lock)
+
+                        # --- КОНКАТЕНАЦИЯ ---
+                        x_ml = np.concatenate([x_ml, x_addon], axis=0)
+
+                        # ========== НОВОЕ: РАСШИРЕННЫЕ ФИЧИ ДЛЯ ЭКСПЕРТОВ ==========
+                        # Добавляем критически важные фичи которых не хватало
+                        additional_features = []
+
+                        try:
+                            # 1. БАЗОВАЯ ВЕРОЯТНОСТЬ (КРИТИЧНО!)
+                            # Эксперты должны видеть прогноз базовой модели
+                            additional_features.append(float(P_up))
+                            
+                            # 2. ЛАГИРОВАННЫЕ ЗНАЧЕНИЯ RSI
+                            # Позволяет экспертам видеть динамику индикатора
+                            if len(kl_df) >= 5:
+                                from ta_utils import rsi
+                                rsi_series = rsi(kl_df["close"], 14).fillna(50.0)
+                                if len(rsi_series) >= 5:
+                                    additional_features.append(float(rsi_series.iloc[-2]))   # RSI[-1]
+                                    additional_features.append(float(rsi_series.iloc[-5]))   # RSI[-4]
+                                else:
+                                    additional_features.extend([50.0, 50.0])  # fallback
+                            else:
+                                additional_features.extend([50.0, 50.0])
+                            
+                            # 3. MOMENTUM НА РАЗНЫХ ТАЙМФРЕЙМАХ
+                            # Дополняет momentum_1h фичей из ExtendedMLFeatures
+                            if len(kl_df) >= 15:
+                                close_now = float(kl_df["close"].iloc[-1])
+                                close_5m = float(kl_df["close"].iloc[-5])
+                                close_15m = float(kl_df["close"].iloc[-15])
+                                additional_features.append((close_now - close_5m) / max(1e-12, close_5m))    # momentum_5m
+                                additional_features.append((close_now - close_15m) / max(1e-12, close_15m))  # momentum_15m
+                            else:
+                                additional_features.extend([0.0, 0.0])
+                            
+                            # 4. РАССТОЯНИЕ ДО ЛОКАЛЬНЫХ ЭКСТРЕМУМОВ
+                            # Показывает где цена относительно недавних максимумов/минимумов
+                            if len(kl_df) >= 20:
+                                recent_high = float(kl_df["high"].iloc[-20:].max())
+                                recent_low = float(kl_df["low"].iloc[-20:].min())
+                                current_price = float(kl_df["close"].iloc[-1])
+                                price_range = max(1e-12, recent_high - recent_low)
+                                normalized_position = (current_price - recent_low) / price_range
+                                additional_features.append(float(normalized_position))  # price_position_20bar
+                            else:
+                                additional_features.append(0.5)
+                            
+                            # 5. ВОЛАТИЛЬНОСТЬ RSI
+                            # Показывает насколько прыгает RSI (стабильность сигнала)
+                            if len(kl_df) >= 15:
+                                from ta_utils import rsi
+                                rsi_series = rsi(kl_df["close"], 14).fillna(50.0)
+                                if len(rsi_series) >= 15:
+                                    rsi_vol = float(rsi_series.iloc[-15:].std())
+                                    additional_features.append(rsi_vol / 50.0)  # normalized_rsi_volatility
+                                else:
+                                    additional_features.append(0.0)
+                            else:
+                                additional_features.append(0.0)
+                            
+                            # 6. ВОЛАТИЛЬНОСТЬ ЦЕНЫ (КОЭФФИЦИЕНТ ВАРИАЦИИ)
+                            # Дополняет ATR нормализованной волатильностью returns
+                            if len(kl_df) >= 20:
+                                returns = kl_df["close"].pct_change().iloc[-20:]
+                                returns_std = float(returns.std())
+                                returns_mean = float(abs(returns.mean()))
+                                cv = returns_std / max(1e-12, returns_mean) if returns_mean > 0 else 0.0
+                                additional_features.append(float(np.clip(cv, 0.0, 5.0)))  # price_cv_20bar
+                            else:
+                                additional_features.append(0.0)
+                            
+                            # 7. КОНТЕКСТНЫЕ ФИЧИ ИЗ MARKET_FEATURES
+                            # Гарантируем что все контекстные фичи попадают в x_ml
+                            # (некоторые могут дублироваться с x_addon но это не критично)
+                            additional_features.append(float(market_features.get("trend_sign", 0.0)))
+                            additional_features.append(float(market_features.get("trend_abs", 0.0)))
+                            additional_features.append(float(market_features.get("vol_ratio", 0.0)))
+                            
+                            # Конвертируем в numpy и применяем очистку
+                            x_additional = np.array(additional_features, dtype=np.float32)
+                            x_additional = np.nan_to_num(x_additional, nan=0.0, posinf=5.0, neginf=-5.0)
+                            x_additional = np.clip(x_additional, -5.0, 5.0)
+                            
+                            # Финальная конкатенация
+                            x_ml = np.concatenate([x_ml, x_additional], axis=0)
+                            
+                            # Логируем размерность для отладки (только периодически)
+                            if epoch % 50 == 0:
+                                print(f"[experts] x_ml dimension: {x_ml.shape[0]} features "
+                                    f"(base={ext_builder.dim}, addon={len(addon_names)}, additional={len(additional_features)})")
+
+                        except Exception as e:
+                            print(f"[ERROR] Failed to add additional features: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            # В случае ошибки просто используем старый x_ml без дополнительных фичей
+                        # ========== КОНЕЦ РАСШИРЕННЫХ ФИЧЕЙ ==========
+
+                        # --- NEW: режим (ψ) для контекстного гейтинга
+                        # --- ОБНОВЛЕНИЕ: подаем снимок рынка в калькулятор ---
+                        try:
+                            current_price = float(kl_df["close"].iloc[-1])
+                            current_volume = float(kl_df["volume"].iloc[-1])
+                            
+                            # Получаем bid/ask данные напрямую из микроструктуры
+                            depth_snapshot = micro.fetch_depth(limit=5, ts_ms=end_ms)
+                            
+                            # Формируем снимок для MarketFeaturesCalculator
+                            snapshot = MarketSnapshot(
+                                timestamp=t_lock.timestamp(),
+                                price=current_price,
+                                volume=current_volume,
+                                bid_price=depth_snapshot.bid1 if depth_snapshot else None,
+                                ask_price=depth_snapshot.ask1 if depth_snapshot else None,
+                                bid_volume=depth_snapshot.bids[0][1] if (depth_snapshot and depth_snapshot.bids) else None,
+                                ask_volume=depth_snapshot.asks[0][1] if (depth_snapshot and depth_snapshot.asks) else None,
+                                funding_rate=fut.last_funding_rate if fut.last_funding_rate is not None else None,
+                                futures_price=fut.mark_price if fut.mark_price is not None else None
+                            )
+                            
+                            market_calc.update(snapshot)
+                            market_features = market_calc.calculate_features()
+                            
+                        except Exception as e:
+                            print(f"[ERROR] MarketFeaturesCalculator update failed: {e}")
+                            market_features = market_calc._default_features()
+
+                        # --- NEW: режим (ψ) для контекстного гейтинга ---
+                        # ВАЖНО: используем фичи из market_calc
+                        reg_ctx = {
+                            "trend_sign": market_features["trend_sign"],
+                            "trend_abs": market_features["trend_abs"],
+                            "vol_ratio": market_features["vol_ratio"],
+                            "jump_flag": market_features["jump_flag"],
+                            "ofi_sign": market_features["ofi_sign"],
+                            "book_imb": market_features["book_imb"],
+                            "basis_sign": market_features["basis_sign"],
+                            "funding_sign": market_features["funding_sign"],
+                        }
+
+
+                        # анти-дрожь фазы
+                        from meta_ctx import phase_from_ctx
+                        phase_raw = int(phase_from_ctx(reg_ctx))
+                        phase_stable = int(phase_filter.update(phase_raw, now_ts=int(t_lock.timestamp())))
+                        reg_ctx["phase_raw"] = phase_raw
+                        reg_ctx["phase"] = phase_stable  # ← использовать везде далее
+                        try:
+                            with open(ml_cfg.phase_state_path, "w") as f:
+                                json.dump({
+                                    "last_phase": int(phase_stable),
+                                    "last_change_ts": int(t_lock.timestamp()),
+                                }, f)
+                        except Exception:
+                            log_exception("Failed to save JSON")
+                       
+
+                        p_xgb, m_xgb = xgb_exp.proba_up(x_ml, reg_ctx=reg_ctx)
+                        p_rf,  m_rf  = rf_exp.proba_up(x_ml,  reg_ctx=reg_ctx)
+                        p_arf, m_arf = arf_exp.proba_up(x_ml, reg_ctx=reg_ctx)
+                        p_nn,  m_nn  = nn_exp.proba_up(x_ml,   reg_ctx=reg_ctx)
+
+
+
+                        p_base_before_ens = P_up
+                        p_final = meta.predict(p_xgb, p_rf, p_arf, p_nn, p_base_before_ens, reg_ctx=reg_ctx)
+                        ens_used = False
+                        
+                        if meta.mode == "ACTIVE" and p_final is not None:
+                            # УПРОЩЕНО: один уровень калибровки с hold-out валидацией
+                            p_meta_raw = float(np.clip(p_final, 0.0, 1.0))
+
+                            # Одна калибровка через rolling window с hold-out
+                            calib1 = globals().get("_CALIB_MGR")
+                            p_side_cal = float(calib1.transform(p_meta_raw)) if calib1 else p_meta_raw
+                            
+                            calib_src = "calib[roll/holdout]" if (calib1 and calib1.roll_cal) else "calib[off]"
+                            
+                            # Обновляем P_up калиброванным значением
+                            P_up = float(np.clip(p_side_cal, 0.0, 1.0))
+                            P_dn = 1.0 - P_up
+                            ens_used = True
+                            
+                            # Для совместимости с CSV логированием
+                            p_blend = P_up
+                            blend_w = 1.0
+                            p_meta2_raw = None  # отключено
+                            calib2_src = "disabled"
+
+
+                        # --- выбор стороны
+                        bet_up = P_up >= P_dn
+                        p_side_raw = P_up if bet_up else P_dn
+                        
+                        # === АДАПТИВНЫЙ Shrinkage: меньше для высокого края ===
+                        edge_est = abs(p_side_raw - 0.5)
+
+                        if edge_est > 0.10:  # очень уверенный прогноз
+                            shrinkage = 0.05  # 5% - почти не трогаем
+                        elif edge_est > 0.06:  # средняя уверенность
+                            shrinkage = 0.10  # 10%
+                        else:  # низкая уверенность
+                            shrinkage = 0.15  # 15%
+
+                        p_side = 0.5 + (p_side_raw - 0.5) * (1.0 - shrinkage)
+                        print(f"[shrink] p_raw={p_side_raw:.4f} → p_conservative={p_side:.4f} (Δ={p_side-p_side_raw:+.4f}, shrink={shrinkage:.2f})")
+                        
+                        side = "UP" if bet_up else "DOWN"
+
+
+
+                        # gas now
+                        # gas now
+                        gas_price_wei = 0
+                        try:
+                            gas_price_wei = get_gas_price_wei(w3)
+                            rpc_fail_streak = 0
+                        except Exception as e:
+                            print(f"[rpc ] gas_price failed: {e}")
+                            rpc_fail_streak += 1
+                            gas_price_wei = get_gas_price_with_fallback(w3)
+                            if rpc_fail_streak >= RPC_FAIL_MAX:
+                                try:
+                                    w3 = connect_web3()
+                                    c = get_prediction_contract(w3)
+                                    rpc_fail_streak = 0
+                                    print("[rpc ] reconnected successfully")
+                                except Exception as ee:
+                                    print(f"[rpc ] reconnect failed: {ee}")
+                            
+                        gas_bet_bnb_cur = _as_float(GAS_USED_BET * gas_price_wei / 1e18, 0.0)
+                        gas_claim_bnb_cur = _as_float(GAS_USED_CLAIM * gas_price_wei / 1e18, 0.0)
+
+                        # =============================
+                        # УЛУЧШЕННАЯ ОЦЕНКА r̂
+                        # =============================
+                        
+                        # Подготовка: обновить 2D-таблицу и газовые оценки
+                        r_med, gb_med, gc_med = last3_ev_estimates(CSV_PATH)
+                        r_med = _as_float(r_med, None)
+                        gb_med = _as_float(gb_med, None)
+                        gc_med = _as_float(gc_med, None)
+                        
+                        try:
+                            r2d.ingest_settled(CSV_PATH)
+                        except Exception:
+                            log_exception("Failed to ingest settled data")
+                        
+                        _now_ts = int(time.time())
+                        t_rem_s = max(0, int(_as_float(getattr(rd, "lock_ts", _now_ts), _now_ts) - _now_ts))
+                        if t_rem_s <= 2:
+                            bets[epoch] = dict(skipped=True, reason="late", wait_polls=0, settled=False)
+                            print(f"[late] epoch={epoch} missed betting window")
+                            notify_ens_used(None, None, None, None, None, None, False, meta.mode)
+                            continue
+                        pool_tot = _as_float(getattr(rd, "bull_amount", 0.0), 0.0) + _as_float(getattr(rd, "bear_amount", 0.0), 0.0)
+                        
+                        try:
+                            r2d.observe_epoch(epoch=int(epoch), t_rem_s=int(t_rem_s), pool_total_bnb=float(pool_tot))
+                        except Exception:
+                            log_exception("Failed to observe epoch")
+                        
+                        # НОВАЯ ФУНКЦИЯ из модуля: приоритет IMPLIED → историческим методам
+                        # НОВАЯ ФУНКЦИЯ из модуля: приоритет IMPLIED → историческим методам
+                        try:
+                            r_hat, r_hat_source = estimate_r_hat_improved(
+                                rd=rd,
+                                bet_up=bet_up,
+                                epoch=epoch,
+                                pool=pool,
+                                csv_path=CSV_PATH,
+                                kl_df=kl_df,
+                                treasury_fee=TREASURY_FEE,
+                                use_stress_r15=USE_STRESS_R15,
+                                r2d=r2d
+                            )
+                            r_hat = _as_float(r_hat, 1.90)
+                            r_hat_source = str(r_hat_source) if r_hat_source else "unknown"
+                        except Exception as e:
+                            print(f"[r_hat] estimate_r_hat_improved failed: {e}")
+                            r_hat = 1.90
+                            r_hat_source = "fallback_after_error"
+                        
+                        print(f"[r_hat] {r_hat:.4f} from {r_hat_source}")
+                        
+                        # Газовые оценки (без изменений)
+                        gb_hat = _as_float(gb_med if (gb_med is not None and math.isfinite(_as_float(gb_med))) else gas_bet_bnb_cur, 0.0)
+                        gc_hat = _as_float(gc_med if (gc_med is not None and math.isfinite(_as_float(gc_med))) else gas_claim_bnb_cur, 0.0)
+
+
+                        total_settled = settled_trades_count(CSV_PATH)
+                        has_recent = had_trade_in_last_hours(CSV_PATH, 1.0)
+                        bootstrap_phase = (total_settled < MIN_TRADES_FOR_DELTA)
+
+                        # Проверка минимальной ставки (используем адаптивный Kelly, без жёсткого cap3)
+                        if capital < min_bet_bnb * 1.5:
+                            bets[epoch] = dict(skipped=True, reason="capital_too_small", wait_polls=0, settled=False)
+                            print(f"[skip] epoch={epoch} (capital too small) cap={capital:.6f} minBet={min_bet_bnb:.6f}")
+                            send_round_snapshot(
+                                prefix=f"⛔ <b>Skip</b> epoch={epoch} (малый капитал)",
+                                extra_lines=[f"capital={capital:.6f} BNB, minBet={min_bet_bnb:.6f} BNB"]
+                            )
+                            notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
+                            continue
+
+                        # НОВОЕ: контекстная калибровка p → p_ctx
+                        # p_side здесь — «сырое» после ансамбля/сглаживаний; заменим его на p_ctx
+                        # p_side остается без дополнительной калибровки
+                        p_side = float(np.clip(p_side, 0.0, 1.0))
+
+                        if bootstrap_phase:
+                            # Более агрессивный подход после 200 сделок
+                            if n_trades >= 200:
+                                stake_pct = 0.015  # 1.5% если уже есть статистика
+                            else:
+                                stake_pct = 0.01   # 1% в начале
+                            
+                            stake = max(min_bet_bnb, stake_pct * capital)
+                            # cap3 удалён — используем только stake_pct
+                            kelly_half = None
+                        else:
+                            # --- Kelly по рынку (риск/выплата r̂): f* = (p*r̂ - 1) / (r̂ - 1) ---
+                            # --- Kelly по рынку (риск/выплата r̂): f* = (p*r̂ - 1) / (r̂ - 1) ---
+                            denom_r = max(1e-6, float(r_hat) - 1.0)
+                            f_kelly_base = float(max(0.0, (p_side * float(r_hat) - 1.0) / denom_r))
+                            if not math.isfinite(f_kelly_base):
+                                f_kelly_base = 0.0
+
+                            # калибровочная и волатильностная поправки — как и раньше
+                            calib_err = rolling_calib_error(CSV_PATH, n=200)   # ~ECE proxy
+                            calib_err = float(np.clip(calib_err, 0.0, 0.15))
+                            f_calib = float(np.clip(1.0 - 2.0*calib_err, 0.5, 1.0))
+                            if not math.isfinite(f_calib):
+                                f_calib = 1.0
+
+                            sigma_star = 0.01
+                            sigma_realized = realized_sigma_g(CSV_PATH, n=200)
+                            sigma_realized = max(sigma_realized, 1e-6)
+                            if not math.isfinite(sigma_realized):
+                                sigma_realized = 1e-6
+                            f_vol = float(np.clip(sigma_star / sigma_realized, 0.5, 2.0))
+
+                            # Вычисляем винрейт для адаптивного капа
+                            recent_wr = rolling_winrate_laplace(CSV_PATH, n=100, max_epoch_exclusive=epoch)
+                            if recent_wr is None:
+                                recent_wr = 0.53  # консервативный fallback
+
+                            # ============================================
+                            # === Kelly/10 с адаптивным капом ===
+                            # ============================================
+                            
+                            KELLY_DIVISOR = 10  # было 16
+                            
+                            # Вычисляем эффективный Kelly (base * calibration)
+                            f_eff = f_kelly_base * f_calib
+                            if not math.isfinite(f_eff):
+                                f_eff = 0.0
+                            
+                            # Применяем делитель (Kelly/10)
+                            f_eff_scaled = f_eff * (1.0 / float(KELLY_DIVISOR))
+                            
+                            # Адаптивный кап через функцию
+                            edge = p_side - (1.0 / r_hat)
+                            f_cap = adaptive_kelly_cap(
+                                edge=edge,
+                                recent_wr=recent_wr,
+                                calib_error=calib_err,
+                                vol_scale=f_vol
+                            )
+                            f_eff_scaled = min(f_eff_scaled, f_cap)
+                            
+                            # Применяем волатильность
+                            frac = float(np.clip(f_eff_scaled, 0.001, 0.025))  # макс 2.5% (обновлено из 1.5%)
+                            frac *= f_vol
+                            
+                            # Масштаб в просадке (без дополнительного множителя 0.5)
+                            try:
+                                dd_scale = _dd_scale_factor(CSV_PATH)
+                                frac *= dd_scale
+                                print(f"[kelly] f_base={f_kelly_base:.5f}, f_eff={f_eff:.5f}, "
+                                    f"f_scaled={f_eff_scaled:.5f}, edge={edge:.4f}, f_cap={f_cap:.5f}, "
+                                    f"recent_wr={recent_wr:.3f}, dd_scale={dd_scale:.3f}, final frac={frac:.5f}")
+                            except Exception:
+                                print(f"[kelly] f_base={f_kelly_base:.5f}, f_eff={f_eff:.5f}, "
+                                    f"f_scaled={f_eff_scaled:.5f}, edge={edge:.4f}, f_cap={f_cap:.5f}, "
+                                    f"recent_wr={recent_wr:.3f}, final frac={frac:.5f}")
+                            
+                            # Kelly для информации (совместимость с остальным кодом)
+                            kelly_half = f_eff_scaled  # для логов
+                            
+                            stake = max(min_bet_bnb, frac * capital)
+
+
+                        if stake <= 0 or capital < min_bet_bnb * 1.0:
+                            bets[epoch] = dict(skipped=True, reason="small_cap", wait_polls=0, settled=False)
+                            print(f"[skip] epoch={epoch} (capital too small) cap={capital:.6f} minBet={min_bet_bnb:.6f}")
+                            send_round_snapshot(
+                                prefix=f"⛔ <b>Skip</b> epoch={epoch} (малый капитал)",
+                                extra_lines=[f"capital={capital:.6f} BNB, minBet={min_bet_bnb:.6f} BNB"]
+                            )
+                            notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
+                            continue
+
+                        # === ПРОВЕРКА БАЛАНСА (PAPER/REAL MODE) ===
+                        wallet_balance = get_wallet_balance(w3, WALLET_ADDRESS, paper_capital=capital)
+                        
+                        # Резерв на флуктуации газа (только для REAL mode)
+                        BALANCE_RESERVE = 0.005 if not PAPER_TRADING else 0.0
+                        required_total = stake + gas_bet_bnb_cur + gas_claim_bnb_cur + BALANCE_RESERVE
+                        
+                        mode_label = "paper" if PAPER_TRADING else "real"
+                        
+                        if wallet_balance < required_total:
+                            bets[epoch] = dict(skipped=True, reason="insufficient_balance", wait_polls=0, settled=False)
+                            print(f"[skip] epoch={epoch} insufficient {mode_label} balance: need={required_total:.6f} have={wallet_balance:.6f}")
+                            send_round_snapshot(
+                                prefix=f"⛔ <b>Skip</b> epoch={epoch} (недостаточно {mode_label} баланса)",
+                                extra_lines=[
+                                    f"Требуется: {required_total:.6f} BNB",
+                                    f"Доступно: {wallet_balance:.6f} BNB",
+                                    f"Нехватка: {(required_total - wallet_balance):.6f} BNB",
+                                    f"Режим: {'📄 PAPER' if PAPER_TRADING else '💰 REAL'}"
+                                ]
+                            )
+                            notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
+                            continue
+                        
+                        # Корректируем stake вниз, если баланс близок к минимуму
+                        safe_stake = wallet_balance - gas_bet_bnb_cur - gas_claim_bnb_cur - BALANCE_RESERVE
+                        if safe_stake < stake:
+                            print(f"[balance] stake adjusted: {stake:.6f} → {safe_stake:.6f} ({mode_label} mode)")
+                            stake = safe_stake
+                        
+                        if stake < min_bet_bnb:
+                            bets[epoch] = dict(skipped=True, reason="stake_too_small_after_balance_check", wait_polls=0, settled=False)
+                            print(f"[skip] epoch={epoch} stake too small after {mode_label} balance adjustment: {stake:.6f} < {min_bet_bnb:.6f}")
+                            send_round_snapshot(
+                                prefix=f"⛔ <b>Skip</b> epoch={epoch} (ставка мала после коррекции {mode_label} баланса)",
+                                extra_lines=[
+                                    f"Скорректированная ставка: {stake:.6f} BNB",
+                                    f"Минимум: {min_bet_bnb:.6f} BNB",
+                                    f"Режим: {'📄 PAPER' if PAPER_TRADING else '💰 REAL'}"
+                                ]
+                            )
+                            notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
+                            continue
+
+
+                        
+                        override_reasons = []
+                        if bootstrap_phase:
+                            override_reasons.append("bootstrap меньше чем 500")
+                        if not has_recent:
+                            override_reasons.append("idle≥1h")
+                        # ОТКЛЮЧЕНО: meta≠ACTIVE (можно вернуть при необходимости)
+                        # if meta.mode != "ACTIVE":
+                        #     override_reasons.append("meta≠ACTIVE")
+
+                        # === АДАПТИВНАЯ δ: многофакторная стратегия ===
+                        if not bootstrap_phase and has_recent and meta.mode == "ACTIVE":
+                            # Получаем метрики производительности
+                            recent_wr = rolling_winrate_laplace(CSV_PATH, n=100, max_epoch_exclusive=epoch)
+                            calib_err = rolling_calib_error(CSV_PATH, n=200)
+                            n_trades_hour = count_trades_last_hour(CSV_PATH)
+                            
+                            # Вычисляем адаптивную дельту
+                            delta_eff = adaptive_delta_protect(
+                                recent_wr=recent_wr or 0.53,
+                                calib_error=calib_err or 0.05,
+                                n_trades=n_trades_hour or 25
+                            )
+                            
+                            print(f"[delta] adaptive: δ={delta_eff:.3f} | wr={recent_wr or 0.53:.2%} | calib_err={calib_err or 0.05:.3f} | trades/h={n_trades_hour or 25}")
+                        else:
+                            delta_eff = DELTA_PROTECT
+                            print(f"[delta] base: δ={delta_eff:.3f} (override mode)")
+
+                        # устойчивее проверка override-условий (частичные совпадения)
+                        critical_flags = ("bootstrap меньше чем 500", "idle≥1h")
+                        has_critical_override = bool(
+                            override_reasons and any(flag in r for r in override_reasons for flag in critical_flags)
+                        )
+
+                        # ============================================================
+                        # === EV-GATE: OR-логика с тремя путями прохождения фильтра ===
+                        # ============================================================
+                        
+                        # Инициализируем переменные для всех веток
+                        # Инициализируем переменные для всех веток
+                        q70_loss = 0.0
+                        q50_loss = 0.0
+                        margin_vs_market = 0.0
+                        p_thr = 0.0
+                        p_thr_ev = 0.0
+                        pass_reason = "NA"
+
+                        if has_critical_override:
+                            # === РЕЖИМ OVERRIDE: фиксированный порог ===
+                            p_thr = 0.51
+                            p_thr_src = f"fixed(0.51; {' & '.join(override_reasons)})"
+                            
+                            # Простая проверка для override
+                            if p_side < p_thr:
+                                bets[epoch] = dict(
+                                    skipped=True, reason="ev_gate_override",
+                                    p_side=p_side, p_thr=p_thr, p_thr_src=p_thr_src,
+                                    r_hat=r_hat, r_hat_source=r_hat_source,
+                                    gb_hat=gb_hat, gc_hat=gc_hat, stake=stake,
+                                    delta15=(_as_float(locals().get('delta15'), None) if USE_STRESS_R15 else None),
+                                    wait_polls=0, settled=False,
+                                    p_meta_raw=float(p_meta_raw) if 'p_meta_raw' in locals() else float('nan'),
+                                    calib_src=str(calib_src) if 'calib_src' in locals() else "calib[off]"
+                                )
+                                
+                                side_txt = "UP" if bet_up else "DOWN"
+                                print(f"[skip] epoch={epoch} side={side_txt} override p={p_side:.4f} < p_thr={p_thr:.4f} [{p_thr_src}]")
+                                
+                                # === Telegram notification ===
+                                try:
+                                    notify_ev_decision(
+                                        title="⛔ Skip (override)",
+                                        epoch=epoch,
+                                        side_txt=side_txt,
+                                        p_side=p_side,
+                                        p_thr=p_thr,
+                                        p_thr_src=p_thr_src,
+                                        r_hat=r_hat,
+                                        gb_hat=gb_hat,
+                                        gc_hat=gc_hat,
+                                        stake=stake,
+                                        delta15=(_as_float(locals().get('delta15'), None) if USE_STRESS_R15 else None),
+                                        extra_lines=[],
+                                        delta_eff=0.0,
+                                    )
+                                except Exception as e:
+                                    print(f"[tg ] notify skip failed: {e}")
+                                
+                                # === Snapshot ===
+                                send_round_snapshot(
+                                    prefix=f"⛔ <b>Skip</b> epoch={epoch} (override)",
+                                    extra_lines=[
+                                        f"side=<b>{side_txt}</b>, p={p_side:.4f} < p_thr={p_thr:.4f}",
+                                        f"Причина: {' & '.join(override_reasons)}"
+                                    ]
+                                )
+                                
+                                notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
+                                continue
+
+                        else:
+                            # === РЕЖИМ ПОЛНОЦЕННОЙ ПРОВЕРКИ: OR-логика ===
+                            
+                            # Вычисляем ВСЕ метрики заранее
+                            # Вычисляем ВСЕ метрики заранее (с защитой от None)
+                            try:
+                                q70_loss = loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.70)
+                                q70_loss = _as_float(q70_loss, 0.0)
+                            except Exception:
+                                q70_loss = 0.0
+                            
+                            try:
+                                q50_loss = loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.50)
+                                q50_loss = _as_float(q50_loss, 0.0)
+                            except Exception:
+                                q50_loss = 0.0
+
+                            try:
+                                q90_loss = loss_margin_q(csv_path=CSV_PATH, max_epoch_exclusive=epoch, q=0.90)
+                                q90_loss = _as_float(q90_loss, 0.0)
+                            except Exception:
+                                q90_loss = 0.0
+
+                            try:
+                                margin_vs_market = _as_float(p_side, 0.5) - (1.0 / max(1e-9, _as_float(r_hat, 1.9)))
+                            except Exception:
+                                margin_vs_market = 0.0
+                            
+                            try:
+                                p_thr_ev = p_thr_from_ev(
+                                    r_hat=_as_float(r_hat, 1.9),
+                                    stake=max(1e-9, _as_float(stake, 0.001)),
+                                    gb_hat=_as_float(gb_hat, 0.0),
+                                    gc_hat=_as_float(gc_hat, 0.0),
+                                    delta=_as_float(delta_eff, 0.0)
+                                )
+                                p_thr_ev = _as_float(p_thr_ev, 0.51)
+                            except Exception as e:
+                                print(f"[ev_gate] p_thr_from_ev failed: {e}")
+                                p_thr_ev = 0.51
+                            
+                            # p_thr для совместимости: p_thr + δ = p_thr_ev
+                            p_thr = float(max(0.0, p_thr_ev - float(delta_eff)))
+                            
+                            # Три пути прохождения фильтра (OR-логика):
+                            pass_ev_strong = (p_side >= (p_thr + delta_eff))
+                            pass_margin_q70 = (margin_vs_market >= q70_loss) and (p_side >= (p_thr + 0.5 * delta_eff))
+                            pass_margin_q50 = (margin_vs_market >= q50_loss) and (p_side >= (p_thr + 0.25 * delta_eff))
+                            
+                            # Определяем источник для логирования
+                            if pass_ev_strong:
+                                pass_reason = "EV_strong"
+                            elif pass_margin_q70:
+                                pass_reason = "margin_q70"
+                            elif pass_margin_q50:
+                                pass_reason = "margin_q50"
+                            else:
+                                pass_reason = "FAIL"
+                            
+                            # bnbusdrt6.py  (логирование pass_reason — безопасно к незаданным значениям)
+                            _safe_q70 = float(q70_loss) if isinstance(q70_loss, (int, float)) and math.isfinite(float(q70_loss)) else 0.0
+                            _safe_q50 = float(q50_loss) if isinstance(q50_loss, (int, float)) and math.isfinite(float(q50_loss)) else 0.0
+                            _safe_margin = float(margin_vs_market) if isinstance(margin_vs_market, (int, float)) and math.isfinite(float(margin_vs_market)) else 0.0
+                            _safe_r = float(r_hat) if isinstance(r_hat, (int, float)) and math.isfinite(float(r_hat)) else 1.0
+                            _safe_reason = pass_reason if isinstance(pass_reason, str) else "NA"
+
+                            p_thr_src = (f"EV|δ+gas; q70={_safe_q70:.4f}, q50={_safe_q50:.4f}; "
+                                        f"margin={_safe_margin:+.4f}; r̂={_safe_r:.3f}; "
+                                        f"pass={_safe_reason}")
+
+                            
+                            # === ПРОВЕРКА: хотя бы одно условие должно пройти ===
+                            if not (pass_ev_strong or pass_margin_q70 or pass_margin_q50):
+                                # SKIP: все фильтры провалены
+                                
+                                bets[epoch] = dict(
+                                    skipped=True, reason="ev_gate",
+                                    p_side=p_side, p_thr=p_thr, p_thr_src=p_thr_src,
+                                    r_hat=r_hat, r_hat_source=r_hat_source,
+                                    gb_hat=gb_hat, gc_hat=gc_hat, stake=stake,
+                                    delta15=(_as_float(locals().get('delta15'), None) if USE_STRESS_R15 else None),
+                                    wait_polls=0, settled=False,
+                                    p_meta_raw=float(p_meta_raw) if 'p_meta_raw' in locals() else float('nan'),
+                                    calib_src=str(calib_src) if 'calib_src' in locals() else "calib[off]"
+                                )
+                                
+                                side_txt = "UP" if bet_up else "DOWN"
+                                kelly_txt = "—"
+                                if 'kelly_half' in locals() and kelly_half is not None:
+                                    if isinstance(kelly_half, (int, float)) and math.isfinite(kelly_half):
+                                        kelly_txt = f"{kelly_half:.3f}"
+                                
+                                # === Telegram notification ===
+                                # === Telegram notification ===
+                                try:
+                                    _safe_margin = float(margin_vs_market) if isinstance(margin_vs_market, (int, float)) and math.isfinite(float(margin_vs_market)) else 0.0
+                                    _safe_q70 = float(q70_loss) if isinstance(q70_loss, (int, float)) and math.isfinite(float(q70_loss)) else 0.0
+                                    _safe_q50 = float(q50_loss) if isinstance(q50_loss, (int, float)) and math.isfinite(float(q50_loss)) else 0.0
+
+                                    notify_ev_decision(
+                                        title="⛔ Skip by EV gate",
+                                        epoch=epoch,
+                                        side_txt=side_txt,
+                                        p_side=p_side,
+                                        p_thr=p_thr,
+                                        p_thr_src=p_thr_src,
+                                        r_hat=r_hat,
+                                        gb_hat=gb_hat,
+                                        gc_hat=gc_hat,
+                                        stake=stake,
+                                        delta15=(_as_float(locals().get('delta15'), None) if USE_STRESS_R15 else None),
+                                        extra_lines=[
+                                            f"Kelly/2:   {kelly_txt}",
+                                            f"❌ EV strong: p={_as_float(p_side,0.0):.4f} < p_thr+δ={(_as_float(p_thr)+_as_float(delta_eff,0.0)):.4f}",
+                                            f"❌ Margin q70: margin={_safe_margin:+.4f} < q70={_safe_q70:.4f}",
+                                            f"❌ Margin q50: margin={_safe_margin:+.4f} < q50={_safe_q50:.4f}",
+                                        ],
+                                        delta_eff=delta_eff,
+                                    )
+                                except Exception as e:
+                                    print(f"[tg ] notify skip failed: {e}")
+
+                                
+                                # === Console log ===
+                                print(f"[skip] epoch={epoch} side={side_txt} EV-gate ALL FAIL | "
+                                    f"p={_as_float(p_side,0.0):.4f} p_thr+δ={(_as_float(p_thr)+_as_float(delta_eff,0.0)):.4f} | "
+                                    f"margin={float(margin_vs_market):+.4f} q70={float(q70_loss):.4f} q50={float(q50_loss):.4f} | "
+                                    f"r̂={float(r_hat):.3f} S={float(stake):.6f}")
+
+                                
+                                # === Snapshot ===
+                                # === Snapshot ===
+                                _delta15_str = None
+                                if USE_STRESS_R15 and (('delta15' in locals()) or ('delta15' in globals())):
+                                    _d15 = _as_float(delta15, float("nan"))
+                                    if math.isfinite(_d15):
+                                        _delta15_str = f"Δ15_med={(_d15/1e18 if _d15 > 1e6 else _d15):.4f} BNB"
+
+
+                                _safe_margin = float(margin_vs_market) if isinstance(margin_vs_market, (int, float)) and math.isfinite(float(margin_vs_market)) else 0.0
+                                _safe_q70 = float(q70_loss) if isinstance(q70_loss, (int, float)) and math.isfinite(float(q70_loss)) else 0.0
+                                _safe_q50 = float(q50_loss) if isinstance(q50_loss, (int, float)) and math.isfinite(float(q50_loss)) else 0.0
+                                extra = [
+                                    f"p_ctx={p_side:.4f} vs p_thr_ev={(p_thr + delta_eff):.4f} [{p_thr_src}]",
+                                    f"❌ EV strong: {p_side:.4f} < {(p_thr + delta_eff):.4f}",
+                                    f"❌ Margin q70: {_safe_margin:+.4f} < {_safe_q70:.4f}",
+                                    f"❌ Margin q50: {_safe_margin:+.4f} < {_safe_q50:.4f}",
+                                    f"r̂={r_hat:.3f} [{r_hat_source}], S={stake:.6f}, gb̂={gb_hat:.8f}, gĉ={gc_hat:.8f}",
+                                    _delta15_str,
+                                    f"gas_bet≈{gas_bet_bnb_cur:.8f} BNB",
+                                    (f"порог-оверрайды: {', '.join(override_reasons)}" if override_reasons else None),
+                                    f"Kelly/8={kelly_txt}",
+                                ]
+                                
+                                extra = [x for x in extra if x is not None]
+                                
+                                send_round_snapshot(
+                                    prefix=f"⛔ <b>Skip</b> epoch={epoch} (EV-gate)",
+                                    extra_lines=extra
+                                )
+                                
+                                notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, False, meta.mode)
+                                
+                                # === Теневой лог ===
+                                try:
+                                    gas_gwei_for_log = float(gas_gwei_now) if 'gas_gwei_now' in locals() else float(get_gas_price_wei(w3)) / 1e9
+                                    append_shadow_row(CSV_SHADOW_PATH, {
+                                        "settled_ts": "",
+                                        "epoch": epoch,
+                                        "side": side_txt,
+                                        "p_up": float(p_side if side_txt == "UP" else 1.0 - p_side),
+                                        "p_thr_used": float(p_thr),
+                                        "p_thr_src": str(p_thr_src),
+                                        "edge_at_entry": float("nan"),
+                                        "stake": float(stake),
+                                        "gas_bet_bnb": float(gas_bet_bnb_cur),
+                                        "gas_claim_bnb": float(gas_claim_bnb_cur),
+                                        "gas_price_bet_gwei": gas_gwei_for_log,
+                                        "gas_price_claim_gwei": gas_gwei_for_log,
+                                        "outcome": "", "pnl": "",
+                                        "capital_before": float(capital),
+                                        "capital_after": float(capital),
+                                        "lock_ts": "", "close_ts": "",
+                                        "lock_price": "", "close_price": "",
+                                        "payout_ratio": "", "up_won": ""
+                                    })
+                                except Exception as e:
+                                    print(f"[shadow] append failed: {e}")
+                                
+                                continue  # ← переход к следующему epoch
+
+                        # ============================================================
+                        # === ЕСЛИ ДОШЛИ СЮДА: ФИЛЬТР ПРОЙДЕН, РАЗМЕЩАЕМ СТАВКУ ===
+                        # ============================================================
+                        
+                        # --- считаем запас на входе
+                        # --- считаем запас на входе
+                        edge_at_entry = _as_float(p_side, 0.5) - (_as_float(p_thr, 0.5) + _as_float(delta_eff, 0.0))
+
+                        _safe_margin = float(margin_vs_market) if isinstance(margin_vs_market, (int, float)) and math.isfinite(float(margin_vs_market)) else 0.0
+                        print(f"[bet ] epoch={epoch} side={side} "
+                            f"p_side={_as_float(p_side,0.0):.3f} ≥ p_thr+δ={(_as_float(p_thr)+_as_float(delta_eff,0.0)):.3f} "
+                            f"edge@entry={edge_at_entry:+.4f} "
+                            f"Kelly/2={kelly_txt if 'kelly_txt' in locals() else '—'} r̂={r_hat:.3f} S={stake:.6f}")
+
+
+
+                        # --- сохранить контекст ставки
+                        phi_wf = np.array([
+                            wf_phi_dict.get("phi_wf0", 0.0),
+                            wf_phi_dict.get("phi_wf1", 0.0),
+                            wf_phi_dict.get("phi_wf2", 0.0),
+                            wf_phi_dict.get("phi_wf3", 0.0),
+                        ], dtype=float)
+
+                        # быстрый рефреш REST-логики (важно при перезапусках/ресторах)
+                        rest.update_from_stats(stats, cfg=rest_cfg)
+                        # перед постановкой ставки — проверяем REST
+                        if not rest.can_trade_now():
+                            print(f"[rest] ⏸ до {rest.rest_until_utc}")
+                            continue  # пропускаем этот эпизод/итерацию
+
+
+
+                        # --- считаем запас на входе
+                        # при ENTER:
+                        edge_at_entry = _as_float(p_side, 0.5) - (_as_float(p_thr, 0.5) + _as_float(delta_eff, 0.0))
+                        # безопасные значения для логирования
+                        _safe_margin = float(margin_vs_market) if isinstance(margin_vs_market, (int, float)) and math.isfinite(margin_vs_market) else 0.0
+                        _safe_q90 = float(q90_loss) if (('q90_loss' in locals()) or ('q90_loss' in globals())) and isinstance(q90_loss, (int, float)) and math.isfinite(q90_loss) else 0.0
+                        # предпочитаем p_thr_ev, если есть; иначе p_thr; иначе 0.0
+                        _safe_pthr = None
+                        if 'p_thr_ev' in locals() or 'p_thr_ev' in globals():
+                            _safe_pthr = p_thr_ev
+                        elif 'p_thr' in locals() or 'p_thr' in globals():
+                            _safe_pthr = p_thr
+                        _safe_pthr = float(_safe_pthr) if isinstance(_safe_pthr, (int, float)) and math.isfinite(_safe_pthr) else 0.0
+
+                        _safe_p = float(p_side) if isinstance(p_side, (int, float)) and math.isfinite(p_side) else 0.0
+                        _side_str = (str(side).upper() if ('side' in locals() or 'side' in globals()) else "NA")
+
+                        _safe_p = _as_float(p_side, 0.0)
+                        _safe_q70 = _as_float(q70_loss, 0.0)
+                        _safe_margin = _as_float(margin_vs_market, 0.0)
+                        print(f"[enter] side={_side_str} "
+                            f"p_ctx={_safe_p:.4f} ≥ p_thr+δ={_as_float(p_thr) + _as_float(delta_eff, 0.0):.4f} | "
+                            f"margin={_safe_margin:+.4f} ≥ q70={_safe_q70:.4f}")
+                        bets[epoch] = dict(
+                            placed=True, settled=False, wait_polls=0,
+                            time=now, t_lock=rd.lock_ts,
+                            bet_up=bool(bet_up),
+                            p_up=_as_float(P_up),
+                            p_side=_as_float(p_side),
+                            p_thr=_as_float(p_thr),
+                            p_thr_src=str(p_thr_src),
+                            r_hat=_as_float(r_hat, 1.0),
+                            r_hat_source=str(r_hat_source),
+                            gb_hat=_as_float(gb_hat, 0.0),
+                            gc_hat=_as_float(gc_hat, 0.0),
+                            kelly_half=(None if bootstrap_phase else _as_float(kelly_half, 0.0)),
+                            stake=_as_float(stake, 0.0),
+                            p_meta_raw=_as_float(locals().get("p_meta_raw")),
+                            p_meta2_raw=_as_float(locals().get("p_meta2_raw")),
+                            p_blend=_as_float(locals().get("p_blend")),
+                            blend_w=_as_float(locals().get("blend_w")),
+                            calib_src=str(locals().get("calib_src", "calib[off]")),
+                            gas_price_bet_wei=gas_price_wei, gas_bet_bnb=gas_bet_bnb_cur,
+                            edge_at_entry=edge_at_entry,
+                            delta15=(_as_float(delta15, None) if (USE_STRESS_R15 and 'delta15' in locals()) else None),
+                            delta_eff=_as_float(delta_eff, 0.0),
+                            phi=phi, phi_wf=phi_wf,
+                            ens=dict(
+                                x=x_ml.tolist(),
+                                p_xgb=(None if p_xgb is None else float(p_xgb)),
+                                p_rf=(None if p_rf is None else float(p_rf)),
+                                p_arf=(None if p_arf is None else float(p_arf)),
+                                p_nn=(None if p_nn is None else float(p_nn)),
+                                p_final=float(p_final) if p_final is not None else None,
+                                used=bool(ens_used),
+                                meta_mode=meta.mode,
+                                p_base=float(p_base_before_ens),
+                                reg_ctx=reg_ctx,
+                            ),
+                        )
+
+                        side = "UP" if bet_up else "DOWN"
+                        kelly_txt = ("—" if bootstrap_phase else f"{kelly_half:.3f}")
+
+                        print(f"[bet ] epoch={epoch} side={side} "
+                            f"... p_side={_as_float(p_side,0.0):.3f} ≥ p_thr+δ={(_as_float(p_thr)+_as_float(delta_eff,0.0)):.3f} ..."
+                            f"edge@entry={_as_float(edge_at_entry,0.0):+.4f} "
+                            f"Kelly/2={kelly_txt} r̂={_as_float(r_hat,1.0):.3f} S={_as_float(stake,0.0):.6f} gas_bet={_as_float(gas_bet_bnb_cur,0.0):.8f}BNB "
+                            f"(lock in {int(_as_float(rd.lock_ts,0)-_as_float(now,0))}s)")
+
+                        _delta15_str = None
+                        if USE_STRESS_R15 and 'delta15' in locals():
+                            _d15 = _as_float(delta15, float("nan"))
+                            if math.isfinite(_d15):
+                                _delta15_str = f"Δ15_med={(_d15/1e18 if _d15 > 1e6 else _d15):.4f} BNB"
+
+                        extra = [
+                            f"side=<b>{side}</b>, p={_as_float(p_side,0.0):.4f} ≥ p_thr+δ={(_as_float(p_thr)+_as_float(delta_eff,0.0)):.4f} [{p_thr_src}]",
+                            f"edge@entry={edge_at_entry:+.4f}",
+                            f"S={stake:.6f} BNB (адаптивный Kelly, макс 2.5%), gas_bet≈{gas_bet_bnb_cur:.8f} BNB",
+                            (_delta15_str if USE_STRESS_R15 else None),
+                        ]
+                        if override_reasons:
+                            extra.append(f"p_thr override: {', '.join(override_reasons)}")
+                        if not bootstrap_phase:
+                            extra.append(f"Kelly/2={kelly_half:.3f}")
+                        else:
+                            extra.append("Stake=1% bootstrap")
+
+                        extra = [x for x in extra if x is not None]
+                        send_round_snapshot(prefix=f"✅ <b>Bet</b> epoch={epoch}", extra_lines=extra)
+
+                        # ========== ВСТАВИТЬ СЮДА ==========
+                        # === ГЕНЕРАЦИЯ ОБЪЯСНЕНИЯ РЕШЕНИЯ META ===
+                        try:
+                            from meta_explainer import create_explanation_for_bet
+                            
+                            # Определяем текущий час UTC для time_of_day
+                            from datetime import datetime, timezone
+                            hour_utc = datetime.now(timezone.utc).hour
+                            if 0 <= hour_utc < 8:
+                                time_of_day = "asian"
+                            elif 8 <= hour_utc < 16:
+                                time_of_day = "european"
+                            elif 16 <= hour_utc < 24:
+                                time_of_day = "us"
+                            else:
+                                time_of_day = "quiet"
+                            
+                            # Определяем текущий streak из истории
+                            try:
+                                df_recent = _read_csv_df(CSV_PATH).tail(10)
+                                outcomes = df_recent[df_recent["outcome"].isin(["win", "loss"])]["outcome"].tolist()
+                                if outcomes:
+                                    last_outcome = outcomes[-1]
+                                    streak_count = 1
+                                    for i in range(len(outcomes)-2, -1, -1):
+                                        if outcomes[i] == last_outcome:
+                                            streak_count += 1
+                                        else:
+                                            break
+                                    current_streak = f"{streak_count}{'W' if last_outcome=='win' else 'L'}"
+                                else:
+                                    current_streak = "0"
+                            except Exception:
+                                current_streak = "0"
+                            
+                            # Определяем тренд из фич
+                            try:
+                                mom = feats.get("momentum_1h", 0) if hasattr(feats, 'get') else 0
+                                if mom > 0.02:
+                                    trend = "strong_up"
+                                elif mom > 0.005:
+                                    trend = "weak_up"
+                                elif mom < -0.02:
+                                    trend = "strong_down"
+                                elif mom < -0.005:
+                                    trend = "weak_down"
+                                else:
+                                    trend = "sideways"
+                            except Exception:
+                                trend = "sideways"
+                            
+                            # Собираем контекст
+                            context_for_explainer = {
+                                "volatility": "high" if feats.get("atr_norm", 0) > 0.015 else ("low" if feats.get("atr_norm", 0) < 0.005 else "medium"),
+                                "trend": trend,
+                                "volume": "high" if feats.get("volume_ratio", 1) > 1.5 else "normal",
+                                "time_of_day": time_of_day,
+                                "recent_streak": current_streak
+                            }
+                            
+                            # Получаем веса META (если доступны)
+                            meta_weights_dict = None
+                            if meta and hasattr(meta, 'w'):
+                                try:
+                                    weights_array = meta.w if isinstance(meta.w, np.ndarray) else np.array(meta.w)
+                                    if len(weights_array) >= 4:
+                                        # Нормализуем веса к сумме 1.0
+                                        weights_sum = weights_array[:4].sum()
+                                        if weights_sum > 0:
+                                            norm_weights = weights_array[:4] / weights_sum
+                                            meta_weights_dict = {
+                                                "xgb": float(norm_weights[0]),
+                                                "rf": float(norm_weights[1]),
+                                                "arf": float(norm_weights[2]),
+                                                "nn": float(norm_weights[3]),
+                                            }
+                                except Exception:
+                                    log_exception("Unhandled exception")
+                            
+                            # Конвертируем feats в dict (если это pandas Series)
+                            # Конвертируем feats в dict (если это pandas Series)
+                            feats_dict = {}
+                            try:
+                                if hasattr(feats, 'to_dict'):
+                                    feats_dict = feats.to_dict()
+                                elif isinstance(feats, dict):
+                                    feats_dict = feats
+                                else:
+                                    feats_dict = dict(feats)
+                            except Exception:
+                                feats_dict = {}
+
+                            # Вычисляем все недостающие индикаторы для объяснений
+                            try:
+                                if kl_df is not None and len(kl_df) > 0:
+                                    # 1. RSI (реальное значение, не нормализованное)
+                                    from ta_utils import rsi
+                                    rsi_series = rsi(kl_df["close"], 14).fillna(50.0)
+                                    feats_dict["rsi"] = float(rsi_series.iloc[-1])
+                                    
+                                    # 2. Momentum 1h (процентное изменение за последний час)
+                                    if len(kl_df) >= 60:
+                                        close_now = float(kl_df["close"].iloc[-1])
+                                        close_1h_ago = float(kl_df["close"].iloc[-60])
+                                        feats_dict["momentum_1h"] = (close_now - close_1h_ago) / close_1h_ago
+                                    else:
+                                        feats_dict["momentum_1h"] = 0.0
+                                    
+                                    # 3. ATR normalized (уже есть в feats как atr и atr_sma)
+                                    if "atr" in feats_dict and "atr_sma" in feats_dict:
+                                        atr_val = feats_dict.get("atr", 0)
+                                        atr_sma_val = feats_dict.get("atr_sma", 1)
+                                        if isinstance(atr_val, pd.Series):
+                                            atr_val = float(atr_val.iloc[-1]) if len(atr_val) > 0 else 0.0
+                                        if isinstance(atr_sma_val, pd.Series):
+                                            atr_sma_val = float(atr_sma_val.iloc[-1]) if len(atr_sma_val) > 0 else 1.0
+                                        feats_dict["atr_norm"] = float(atr_val / (atr_sma_val + 1e-12))
+                                    else:
+                                        feats_dict["atr_norm"] = 0.0
+                                    
+                                    # 4. BB Position (позиция цены в Bollinger Bands)
+                                    from ta_utils import sma, stdev
+                                    bb_basis = sma(kl_df["close"], BB_LEN)
+                                    bb_dev = stdev(kl_df["close"], BB_LEN)
+                                    bb_upper = bb_basis + 2.0 * bb_dev
+                                    bb_lower = bb_basis - 2.0 * bb_dev
+                                    close_now = float(kl_df["close"].iloc[-1])
+                                    bb_u = float(bb_upper.iloc[-1])
+                                    bb_l = float(bb_lower.iloc[-1])
+                                    if bb_u > bb_l:
+                                        feats_dict["bb_position"] = (close_now - bb_l) / (bb_u - bb_l)
+                                    else:
+                                        feats_dict["bb_position"] = 0.5
+                                    
+                                    # 5. Volume Ratio (текущий объем относительно среднего)
+                                    vol_usd = kl_df["volume"] * kl_df["close"]
+                                    vol_mean = sma(vol_usd, VOL_LEN)
+                                    vol_now = float(vol_usd.iloc[-1])
+                                    vol_avg = float(vol_mean.iloc[-1])
+                                    if vol_avg > 0:
+                                        feats_dict["volume_ratio"] = vol_now / vol_avg
+                                    else:
+                                        feats_dict["volume_ratio"] = 1.0
+                                else:
+                                    # Fallback к дефолтным значениям, если нет данных
+                                    feats_dict["rsi"] = 50.0
+                                    feats_dict["momentum_1h"] = 0.0
+                                    feats_dict["atr_norm"] = 0.0
+                                    feats_dict["bb_position"] = 0.5
+                                    feats_dict["volume_ratio"] = 1.0
+                            except Exception as e:
+                                print(f"[explainer] Feature calculation failed: {e}")
+                                feats_dict.setdefault("rsi", 50.0)
+                                feats_dict.setdefault("momentum_1h", 0.0)
+                                feats_dict.setdefault("atr_norm", 0.0)
+                                feats_dict.setdefault("bb_position", 0.5)
+                                feats_dict.setdefault("volume_ratio", 1.0)
+
+                            explanation = create_explanation_for_bet(
+                                p_final=float(p_final) if p_final is not None else float(p_side),
+                                p_xgb=float(p_xgb) if p_xgb is not None else None,
+                                p_rf=float(p_rf) if p_rf is not None else None,
+                                p_arf=float(p_arf) if p_arf is not None else None,
+                                p_nn=float(p_nn) if p_nn is not None else None,
+                                meta_weights=meta_weights_dict,
+                                features=feats_dict,
+                                context=context_for_explainer
+                            )
+                            
+                            # Отправляем объяснение в Telegram
+                            tg_send(f"📊 <b>Анализ решения (epoch {epoch})</b>\n\n{explanation}")
+                            
+                        except Exception as e:
+                            print(f"[explainer] failed: {e}")
+                        # ========== КОНЕЦ ВСТАВКИ ==========
+
+                        notify_ens_used(p_base_before_ens, p_xgb, p_rf, p_arf, p_nn, p_final, ens_used, meta.mode)
+
+                    elif now >= rd.lock_ts:
+                        bets[epoch] = dict(skipped=True, reason="late", wait_polls=0, settled=False)
+                        print(f"[late] epoch={epoch} missed betting window")
+                        send_round_snapshot(
+                            prefix=f"⛔ <b>Skip</b> epoch={epoch} (late)",
+                            extra_lines=["Причина: окно размещения закрыто."]
+                        )
+                        notify_ens_used(None, None, None, None, None, None, False, meta.mode)
+
+                # --- обработка закрытия/сеттла
+                b = bets.get(epoch)
+                if not b or b.get("settled"):
+                    continue
+
+                # пропущенные считаем финализированными сразу после close_ts
+                if b.get("skipped") and now > rd.close_ts:
+                    b["settled"] = True
+                    b["outcome"] = "skipped"
+                    send_round_snapshot(
+                        prefix=f"ℹ️ <b>Round</b> epoch={epoch} finalized (skip).",
+                        extra_lines=["Раунд завершён, пропуск подтверждён."]
+                    )
+                    continue
+
+                # обычный сеттл — когда oracleCalled
+                # обычный сеттл — когда oracleCalled
+                if rd.oracle_called:
+                    # обновим историю «поздних денег» по только что закрытому раунду
+                    # обновим историю «поздних денег» по только что закрытому раунду
+                    try:
+                        # ✳️ гарантируем снимок на самом lock_ts (после рестартов/лагов его могло не быть)
+                        pool.observe(epoch, rd.lock_ts, rd.bull_amount, rd.bear_amount)
+                        pool.finalize_epoch(epoch, rd.lock_ts)
+                    except Exception:
+                        log_exception("Failed to observe")
+                    # Фолбэк для газа на случай сбоя RPC — НЕ прерываем сеттл из-за газа
+                    fallback_wei = 0
+                    try:
+                        fallback_wei = int(float(b.get("gas_price_bet_wei", 0)) or 0)
+                    except Exception:
+                        fallback_wei = 0
+                    if fallback_wei <= 0:
+                        try:
+                            # если ранее где-то уже брали газ — используем его
+                            fallback_wei = int(gas_price_wei)  # может не существовать — ок
+                        except Exception:
+                            fallback_wei = 0
+
+                    try:
+                        gas_price_claim_wei = get_gas_price_wei(w3)
+                        rpc_fail_streak = 0
+                    except Exception as e:
+                        print(f"[rpc ] gas_price (claim) failed: {e}")
+                        rpc_fail_streak += 1
+                        # используем фолбэк вместо прерывания
+                        gas_price_claim_wei = fallback_wei if fallback_wei > 0 else 3_000_000_000
+                        if rpc_fail_streak >= RPC_FAIL_MAX:
+                            try:
+                                w3 = connect_web3()
+                                c = get_prediction_contract(w3)
+                                rpc_fail_streak = 0
+                                print("[rpc ] reconnected")
+                            except Exception as ee:
+                                print(f"[rpc ] reconnect failed: {ee}")
+                        # ВАЖНО: без continue — идём дальше к отправке исхода
+                    # ... далее формирование outcome/pnl и send_round_snapshot(...)
+
+
+                    outcome = None
+                    pnl = 0.0
+                    gas_claim_bnb = 0.0
+
+                    bet_up = bool(b.get("bet_up", False))
+                    stake = _as_float(b.get("stake", 0.0), 0.0)
+                    gas_bet_bnb = _as_float(b.get("gas_bet_bnb", 0.0), 0.0)
+
+                    lock_price = _as_float(getattr(rd, "lock_price", None), 0.0)
+                    close_price = _as_float(getattr(rd, "close_price", None), 0.0)
+
+                    up_won = close_price > lock_price
+                    down_won = close_price < lock_price
+                    draw = close_price == lock_price
+
+                    if NN_USE and logreg is not None and (not draw) and ("phi" in b):
+                        try:
+                            logreg.update(np.array(b["phi"], dtype=float), 1 if up_won else 0)
+                            logreg.save()
+                        except Exception:
+                            log_exception("Failed to save state")
+
+                    capital_before = capital
+                    
+                    # Вычисляем новый капитал БЕЗ изменения переменной capital
+                    if draw:
+                        gas_claim_bnb = _as_float(GAS_USED_CLAIM * gas_price_claim_wei / 1e18, 0.0)
+                        new_capital = capital - (gas_bet_bnb + gas_claim_bnb)
+                        pnl = -(gas_bet_bnb + gas_claim_bnb)
+                        outcome = "draw"
+                    else:
+                        ratio = _as_float(getattr(rd, "payout_ratio", None), 1.9)
+                        if ratio <= 1.0:
+                            ratio = 1.9
+                        
+                        if (bet_up and up_won) or ((not bet_up) and down_won):
+                            profit = stake * (ratio - 1.0)
+                            gas_claim_bnb = _as_float(GAS_USED_CLAIM * gas_price_claim_wei / 1e18, 0.0)
+                            new_capital = capital + profit - (gas_bet_bnb + gas_claim_bnb)
+                            pnl = profit - (gas_bet_bnb + gas_claim_bnb)
+                            outcome = "win"
+                        else:
+                            new_capital = capital - stake - gas_bet_bnb
+                            pnl = -stake - gas_bet_bnb
+                            outcome = "loss"
+
+                    b.update(dict(
+                        settled=True, outcome=outcome, pnl=pnl,
+                        gas_price_claim_wei=gas_price_claim_wei, gas_claim_bnb=gas_claim_bnb,
+                        capital_after=new_capital, payout_ratio=rd.payout_ratio
+                    ))
+                    side = "UP" if bet_up else "DOWN"
+                    print(f"[setl] epoch={epoch} side={side} outcome={outcome} pnl={pnl:+.6f} "
+                          f"cap={capital:.6f} ratio={rd.payout_ratio if rd.payout_ratio else float('nan'):.3f} up_won={up_won}")
+
+                    # Walk-Forward обновление (заморозка до 500 сделок)
+                    try:
+                        if WF_USE and ("phi_wf" in b) and (not draw):
+                            n_trades = _settled_trades_count(CSV_PATH)  # уже есть в файле
+                            if n_trades >= MIN_TRADES_FOR_DELTA:        # MIN_TRADES_FOR_DELTA = 500
+                                y_up = 1.0 if up_won else 0.0
+                                wf.update(np.array(b["phi_wf"], dtype=float), y_up)
+                                wf.save()
+                                print(f"[wf  ] updated weights = {wf.w}")
+                            else:
+                                # до 500 сделок WF не трогаем
+                                pass
+                    except Exception:
+                        log_exception("Failed to save state")
+
+
+                    # Ансамбль: апдейт экспертов и меты
+                    try:
+                        ens_info = b.get("ens") or {}   # ← если None → {}
+                        x_ml = np.array(ens_info.get("x", []), dtype=float)
+                        p_xgb = ens_info.get("p_xgb", None)
+                        p_rf  = ens_info.get("p_rf", None)
+                        p_arf = ens_info.get("p_arf", None)
+                        p_nn  = ens_info.get("p_nn", None)
+                        p_fin = ens_info.get("p_final", None)
+                        p_base = ens_info.get("p_base", None)
+                        used_flag = bool(ens_info.get("used", False))
+
+                        reg_ctx = (ens_info.get("reg_ctx", {}) or {})
+                        reg_ctx = dict(reg_ctx, epoch=int(epoch))  # ← добавили идентификатор раунда
+
+                        if not draw:
+                            y_up_int = 1 if up_won else 0
+
+                            # Сначала — МЕТА (не зависит от x_ml, чтобы опыт рос всегда)
+                            try:
+                                meta.record_result(
+                                    p_xgb=p_xgb,
+                                    p_rf=p_rf,
+                                    p_arf=p_arf,
+                                    p_nn=p_nn,
+                                    p_base=p_base,
+                                    y_up=y_up_int,
+                                    used_in_live=used_flag,
+                                    p_final_used=p_fin,
+                                    reg_ctx=reg_ctx
+                                )
+                            except Exception as e:
+                                print(f"[ens ] meta.record_result error: {e}")
+
+                            # ========== ТРЕКИНГ КАЧЕСТВА БАЗОВОЙ МОДЕЛИ ==========
+                            # Логируем качество базовой вероятности ДО мета-стекинга и калибровки
+                            try:
+                                if p_base is not None:
+                                    outcome_str = "UP" if up_won else "DOWN"
+                                    track_base_model_quality(p_base, outcome_str)
+                            except Exception:
+                                log_exception("track_base_model_quality call failed")
+                            # ======================================================
+
+
+                            # Затем — эксперты (по-прежнему только если x_ml валиден)
+                            try:
+                                x_ok = hasattr(x_ml, "size") and isinstance(x_ml.size, (int,)) and x_ml.size > 0
+
+                                if x_ok and xgb_exp.enabled:
+                                    xgb_exp.record_result(x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_xgb, reg_ctx=reg_ctx)
+                                    xgb_exp.maybe_train()
+
+                                if x_ok and rf_exp.enabled:
+                                    rf_exp.record_result( x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_rf,  reg_ctx=reg_ctx)
+                                    rf_exp.maybe_train()
+
+                                if x_ok and arf_exp.enabled:
+                                    arf_exp.record_result(x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_arf, reg_ctx=reg_ctx)
+
+                                if x_ok and nn_exp.enabled:
+                                    nn_exp.record_result( x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_nn,  reg_ctx=reg_ctx)
+                                    nn_exp.maybe_train()
+
+                            except Exception as e:
+                                print(f"[ens ] experts update error: {e}")
+
+
+
+                            # УПРОЩЕНО: обновляем только первый калибратор
+                            try:
+                                CM1 = globals().get("_CALIB_MGR")
+                                if CM1 and ("p_meta_raw" in b) and _is_finite_num(b["p_meta_raw"]):
+                                    CM1.update(_as_float(b["p_meta_raw"]), int(y_up_int), int(time.time()))
+                            except Exception:
+                                log_exception("Failed to update")
+
+
+
+
+
+                            s_x = xgb_exp.status(); s_r = rf_exp.status(); s_a = arf_exp.status(); s_n = nn_exp.status(); s_m = meta.status()
+                            tg_send("🧠 ENS updated:\n" +
+                                    _status_line("XGB", s_x) + "\n" +
+                                    _status_line("RF ", s_r) + "\n" +
+                                    _status_line("ARF", s_a) + "\n" +
+                                    _status_line("NN ",  s_n) + "\n" +
+                                    _status_line("META", s_m))
+                    except Exception as _e:
+                        print(f"[ens ] update error: {_e}")
+
+                    
+                    # после вычисления outcome/pnl
+                    try:
+                        side_txt = "UP" if bool(b.get("bet_up", False)) else "DOWN"
+                        status = "🏆 WIN" if up_won or down_won else "—"
+                        p_side = float(b.get("p_side", 0.0))
+                        p_thr  = float(b.get("p_thr",  0.0))
+                        p_thr_src = b.get("p_thr_src", "—")
+                        r_hat  = float(b.get("r_hat",  0.0))
+                        gb_hat = float(b.get("gb_hat", 0.0))
+                        gc_hat = float(b.get("gc_hat", 0.0))
+                        stake  = float(b.get("stake",  0.0))
+                        delta15 = b.get("delta15", None)
+                        delta_eff = float(b.get("delta_eff", 0.0))
+
+                        notify_ev_decision(
+                            title=f"{status} Settle",
+                            epoch=epoch,
+                            side_txt=side_txt,
+                            p_side=p_side,
+                            p_thr=p_thr,
+                            p_thr_src=p_thr_src,
+                            r_hat=r_hat,
+                            gb_hat=gb_hat,
+                            gc_hat=gc_hat,
+                            stake=stake,
+                            delta15=(delta15 if delta15 is not None else None),
+                            extra_lines=[
+                                f"outcome:   {'win' if (up_won or down_won) else 'draw'}",
+                                f"pnl:       {pnl:+.6f}  (BNB)",
+                            ],
+                            delta_eff=delta_eff,
+                        )
+                    except Exception as e:
+                        print(f"[tg ] notify settle failed: {e}")
+
+                    # CSV-лог
+                    row = {
+                        "settled_ts": int(time.time()),
+                        "epoch": epoch,
+                        "side": side,
+                        "p_up":           _as_float(b.get("p_up")),
+                        "p_meta_raw":     _as_float(b.get("p_meta_raw")),     # ← ДОБАВИЛИ
+                        "p_meta2_raw":    _as_float(b.get("p_meta2_raw")),    # ← NEW
+                        "p_blend":        _as_float(b.get("p_blend")),        # ← NEW
+                        "blend_w":        _as_float(b.get("blend_w")),        # ← NEW
+                        "calib_src":      str(b.get("calib_src", "")),
+                        "p_thr_used":     _as_float(b.get("p_thr")),
+                        "p_thr_src":      str(b.get("p_thr_src", "")),
+                        "edge_at_entry":  _as_float(b.get("edge_at_entry")),
+                        "stake":          _as_float(stake, 0.0),
+                        "gas_bet_bnb":    _as_float(gas_bet_bnb, 0.0),
+                        "gas_claim_bnb":  _as_float(gas_claim_bnb, 0.0),
+                        "gas_price_bet_gwei":   (_as_float(b.get("gas_price_bet_wei"), 0.0) / 1e9),
+                        "gas_price_claim_gwei": (_as_float(gas_price_claim_wei, 0.0) / 1e9),
+                        "outcome": outcome,
+                        "pnl": pnl,
+                        "capital_before": capital_before,
+                        "capital_after": new_capital,
+                        "lock_ts": rd.lock_ts,
+                        "close_ts": rd.close_ts,
+                        "lock_price": rd.lock_price,
+                        "close_price": rd.close_price,
+                        "payout_ratio": rd.payout_ratio if rd.payout_ratio else float('nan'),
+                        "up_won": bool(up_won),
+                        "r_hat_used": float(b.get("r_hat", float('nan'))),              # ← НОВОЕ
+                        "r_hat_source": str(b.get("r_hat_source", "")),                 # ← НОВОЕ
+                        "r_hat_error_pct": float('nan')                                 # ← заполним ниже
+                    }
+                    
+                    # Рассчитываем ошибку оценки r̂
+                    try:
+                        if rd.payout_ratio and b.get("r_hat"):
+                            r_actual = float(rd.payout_ratio)
+                            r_pred = float(b["r_hat"])
+                            if math.isfinite(r_actual) and math.isfinite(r_pred) and r_actual > 0:
+                                error_pct = abs(r_actual - r_pred) / r_actual * 100.0
+                                row["r_hat_error_pct"] = float(error_pct)
+                    except Exception:
+                        log_exception("Unhandled exception")
+
+                    capital = update_capital_atomic(capital_state, new_capital, now, row, csv_path=CSV_PATH)
+
+                    # --- Performance monitor: прокинем сделку
+                    try:
+                        if perf is not None:
+                            perf.on_trade_settled(row)
+                    except Exception as e:
+                        print(f"[perf] on_trade_settled failed: {e}")
+
+
+                    # обновляем статистику и состояние REST
+
+                    stats.reload()
+
+                    # --- Performance monitor: почасовой отчёт (без дублей)
+                    try:
+                        if perf is not None:
+                            perf.maybe_hourly_report(now_ts=int(time.time()), tg_send_fn=tg_send)
+                    except Exception as e:
+                        print(f"[perf] hourly report failed: {e}")
+
+                    # --- Ежедневный отчёт (отправляется не чаще 1р/сутки, около полуночи по UTC) ---
+                    # --- Ежедневный отчёт (отправляется не чаще 1р/сутки, около полуночи по UTC) ---
+                    # Запуск слушателя /report (гарантированно один раз)
+                    try:
+                        if (TG_TOKEN and TG_CHAT_ID):
+                            global _REPORT_THREAD
+                            if (_REPORT_THREAD is None) or (not _REPORT_THREAD.is_alive()):
+                                _REPORT_THREAD = start_report_listener(SESSION, TG_TOKEN, TG_CHAT_ID, CSV_PATH, tg_send)
+                                print("[tg] /report listener started")
+                        else:
+                            print("[tg] /report listener disabled (no TG_TOKEN/TG_CHAT_ID)")
+                    except Exception as e:
+                        print(f"[tg] /report listener failed: {e}")
+
+
+
+                    # Периодическая отправка суточного отчёта (как было)
+                    try:
+                        try_send_daily(CSV_PATH, tg_send)  # троттлинг/время внутри
+                    except Exception as e:
+                        print(f"[warn] daily_report failed: {e}")
+
+
+                    # Ежедневная проекция в 00:05 Europe/Berlin, не чаще 1 раза в день
+                    try:
+                        tm = datetime.now(PROJ_TZ)  # требуется: from datetime import datetime
+                        if tm.hour == 0 and tm.minute < 10 and _proj_mark_once(PROJ_STATE_PATH, tm.strftime("%Y-%m-%d")):
+                            txt = try_send_projection(
+                                CSV_PATH,
+                                tg_send,
+                                horizons=(30, 90, 365),
+                                start_cap=capital,
+                                threshold=35.0,
+                                lookback_days=30,
+                                n_paths=8000,
+                                block_len=3,
+                            )
+                            if not txt:
+                                print("[proj] send failed (tg_send returned falsy)")
+                    except Exception as e:
+                        print(f"[warn] projection failed: {e}")
+
+
+
+
+
+                    rest.notify_trade_executed()
+                    rest.update_from_stats(stats, cfg=rest_cfg)
+                    rest.save("rest_state.json")
+
+
+
+                    emo = "🟢" if outcome == "win" else ("🟡" if outcome == "draw" else "🔴")
+                    send_round_snapshot(
+                        prefix=f"{emo} <b>Settled</b> epoch={epoch}",
+                        extra_lines=[
+                            f"side=<b>{side}</b>, outcome=<b>{outcome}</b>, pnl={pnl:+.6f} BNB",
+                            f"cap_after={capital:.6f} BNB, ratio={rd.payout_ratio if rd.payout_ratio else float('nan'):.3f}"
+                        ]
+                    )
+                    stats_dict = compute_extended_stats_from_csv(CSV_PATH)
+                    print_stats(stats_dict)
+                    continue
+
+                # форс-сеттл по таймауту oracleCalled
+                if now > rd.close_ts:
+                    b["wait_polls"] = int(b.get("wait_polls", 0)) + 1
+                    wp = b["wait_polls"]
+                    if wp % WAIT_PRINT_EVERY == 0:
+                        print(f"[wait] epoch={epoch} waiting oracleCalled (closed, not finalized) polls={wp}/{MAX_WAIT_POLLS}")
+
+                    if wp >= MAX_WAIT_POLLS and b.get("placed"):
+                        lock_price_est = rd.lock_price
+                        if (not math.isfinite(lock_price_est)) or lock_price_est == 0:
+                            lock_price_est = nearest_close_price_ms(SYMBOL, (rd.lock_ts - 1) * 1000)
+
+                        close_price_est = nearest_close_price_ms(SYMBOL, rd.close_ts * 1000)
+                        if lock_price_est is None or close_price_est is None:
+                            print(f"[wait] epoch={epoch} forced settle postponed (no market price).")
+                            continue
+
+                        # форс-сеттл после таймаута ожидания oracleCalled
+                        fallback_wei = 0
+                        try:
+                            fallback_wei = int(float(b.get("gas_price_bet_wei", 0)) or 0)
+                        except Exception:
+                            fallback_wei = 0
+
+                        try:
+                            gas_price_claim_wei = get_gas_price_wei(w3)
+                            rpc_fail_streak = 0
+                        except Exception as e:
+                            print(f"[rpc ] gas_price (claim) failed: {e}")
+                            rpc_fail_streak += 1
+                            # берём фолбэк и НЕ прерываем обработку
+                            gas_price_claim_wei = fallback_wei if fallback_wei > 0 else 3_000_000_000
+                            if rpc_fail_streak >= RPC_FAIL_MAX:
+                                try:
+                                    w3 = connect_web3()
+                                    c = get_prediction_contract(w3)
+                                    rpc_fail_streak = 0
+                                    print("[rpc ] reconnected")
+                                except Exception as ee:
+                                    print(f"[rpc ] reconnect failed: {ee}")
+                        # ВАЖНО: без continue — идём дальше к отправке исхода
+                        # ... далее формирование outcome/pnl и send_round_snapshot("Forced settle", ...)
+
+
+                        bet_up = bool(b.get("bet_up", False))
+                        stake = float(b.get("stake", 0.0))
+                        gas_bet_bnb = float(b.get("gas_bet_bnb", 0.0))
+
+                        up_won = close_price_est > lock_price_est
+                        down_won = close_price_est < lock_price_est
+                        draw = close_price_est == lock_price_est
+
+                        if NN_USE and logreg is not None and (not draw) and ("phi" in b):
+                            try:
+                                logreg.update(np.array(b["phi"], dtype=float), 1 if up_won else 0)
+                                logreg.save()
+                            except Exception:
+                                log_exception("nn_calibrator: update/save failed")
+
+                        ratio_imp = implied_payout_ratio(bet_up, rd, TREASURY_FEE)
+                        ratio_use = ratio_imp if (ratio_imp is not None and math.isfinite(ratio_imp) and ratio_imp > 1.0) else 1.90
+
+                        capital_before = capital
+                        gas_claim_bnb = GAS_USED_CLAIM * gas_price_claim_wei / 1e18
+
+                        # Вычисляем новый капитал БЕЗ изменения переменной capital
+                        if draw:
+                            new_capital = capital - (gas_bet_bnb + gas_claim_bnb)
+                            pnl = -(gas_bet_bnb + gas_claim_bnb)
+                            outcome = "draw"
+                        else:
+                            if (bet_up and up_won) or ((not bet_up) and down_won):
+                                profit = stake * (ratio_use - 1.0)
+                                new_capital = capital + profit - (gas_bet_bnb + gas_claim_bnb)
+                                pnl = profit - (gas_bet_bnb + gas_claim_bnb)
+                                outcome = "win"
+                            else:
+                                new_capital = capital - stake - gas_bet_bnb
+                                pnl = -stake - gas_bet_bnb
+                                outcome = "loss"
+
+                        b.update(dict(
+                            settled=True, outcome=outcome, pnl=pnl,
+                            gas_price_claim_wei=gas_price_claim_wei, gas_claim_bnb=gas_claim_bnb,
+                            capital_after=new_capital, payout_ratio=ratio_use, forced=True
+                        ))
+                        side = "UP" if bet_up else "DOWN"
+                        print(f"[FORC] epoch={epoch} side={side} outcome={outcome} pnl={pnl:+.6f} cap={capital:.6f} "
+                              f"ratio_imp={ratio_use:.3f} lock_est={lock_price_est:.4f} close_est={close_price_est:.4f}")
+
+                        try:
+                            if WF_USE and ("phi_wf" in b) and (not draw):
+                                y_up = 1.0 if up_won else 0.0
+                                wf.update(np.array(b["phi_wf"], dtype=float), y_up)
+                                wf.save()
+                                print(f"[wf  ] updated weights = {wf.w}")
+                        except Exception:
+                            log_exception("Failed to save state")
+
+                        try:
+                            ens_info = b.get("ens") or {}
+                            x_ml = np.array(ens_info.get("x", []), dtype=float)
+                            p_xgb = ens_info.get("p_xgb", None)
+                            p_rf  = ens_info.get("p_rf", None)
+                            p_arf = ens_info.get("p_arf", None)
+                            p_nn  = ens_info.get("p_nn", None)
+                            p_fin = ens_info.get("p_final", None)
+                            p_base = ens_info.get("p_base", None)
+                            used_flag = bool(ens_info.get("used", False))
+
+                            reg_ctx = (ens_info.get("reg_ctx", {}) or {})
+                            reg_ctx = dict(reg_ctx, epoch=int(epoch))
+
+                            # ... внутри обработки settle
+                            if not draw:
+                                y_up_int = 1 if up_won else 0
+
+                                # 1) СНАЧАЛА — МЕТА. Всегда пытаемся заселить, даже если x_ml пустой или эксперты упадут.
+                                try:
+                                    meta.record_result(
+                                        p_xgb=p_xgb,
+                                        p_rf=p_rf,
+                                        p_arf=p_arf,
+                                        p_nn=p_nn,
+                                        p_base=p_base,
+                                        y_up=y_up_int,
+                                        used_in_live=used_flag,
+                                        p_final_used=p_fin,
+                                        reg_ctx=reg_ctx
+                                    )
+                                except Exception as e:
+                                    print(f"[ens ] meta.record_result error: {e}")
+
+                                # 2) ПОТОМ — эксперты. Ошибки не блокируют МЕТУ.
+                                try:
+                                    if xgb_exp.enabled and x_ml.size > 0:
+                                        xgb_exp.record_result(x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_xgb, reg_ctx=reg_ctx)
+                                        xgb_exp.maybe_train(reg_ctx=reg_ctx)
+
+                                    if rf_exp.enabled and x_ml.size > 0:
+                                        rf_exp.record_result(x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_rf, reg_ctx=reg_ctx)
+                                        rf_exp.maybe_train(reg_ctx=reg_ctx)
+
+                                    if arf_exp.enabled and x_ml.size > 0:
+                                        arf_exp.record_result(x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_arf, reg_ctx=reg_ctx)
+                                        # обучение ARF — внутри record_result()
+
+                                    if nn_exp.enabled and x_ml.size > 0:
+                                        nn_exp.record_result(x_ml, y_up=y_up_int, used_in_live=used_flag, p_pred=p_nn, reg_ctx=reg_ctx)
+                                        nn_exp.maybe_train(reg_ctx=reg_ctx)
+
+                                except Exception as e:
+                                    print(f"[ens ] experts update error: {e}")
+
+
+                                try:
+                                    LM = globals().get("_LM_META")
+                                    if LM:
+                                        LM.record_result(
+                                            p_xgb,
+                                            p_rf,
+                                            p_arf,
+                                            p_nn,
+                                            p_base=p_base,
+                                            y_up=y_up_int,
+                                            reg_ctx=reg_ctx,
+                                            used_in_live=used_flag
+                                        )
+                                except Exception:
+                                    log_exception("Unhandled exception")
+
+
+                                # УПРОЩЕНО: обновляем только первый калибратор
+                                try:
+                                    CM1 = globals().get("_CALIB_MGR")
+                                    if CM1 and ("p_meta_raw" in b) and _is_finite_num(b["p_meta_raw"]):
+                                        CM1.update(_as_float(b["p_meta_raw"]), int(y_up_int), int(time.time()))
+                                except Exception:
+                                    log_exception("Failed to update")
+
+
+                        except Exception as _e:
+                            print(f"[ens ] forced-settle update error: {_e}")
+
+                        row = {
+                            "settled_ts": int(time.time()),
+                            "epoch": epoch,
+                            "side": side,
+                            "p_up": float(b.get("p_up", float('nan'))),
+                            "p_meta_raw": float(b.get("p_meta_raw", float('nan'))),   # ← ДОБАВИЛИ
+                            "p_meta2_raw": float(b.get("p_meta2_raw", float('nan'))),  # ← NEW
+                            "p_blend":     float(b.get("p_blend",     float('nan'))),  # ← NEW
+                            "blend_w":     float(b.get("blend_w",     float('nan'))),  # ← NEW
+                            "calib_src":  str(b.get("calib_src", "")), 
+                            "p_thr_used": float(b.get("p_thr", float('nan'))),
+                            "p_thr_src":  str(b.get("p_thr_src", "")),
+                            "edge_at_entry": float(b.get("edge_at_entry", float('nan'))),                            
+                            "stake": stake,
+                            "gas_bet_bnb": gas_bet_bnb,
+                            "gas_claim_bnb": gas_claim_bnb,
+                            "gas_price_bet_gwei": float(b.get("gas_price_bet_wei", 0.0)) / 1e9,
+                            "gas_price_claim_gwei": gas_price_claim_wei / 1e9,
+                            "outcome": outcome,
+                            "pnl": pnl,
+                            "capital_before": capital_before,
+                            "capital_after": new_capital,
+                            "lock_ts": rd.lock_ts,
+                            "close_ts": rd.close_ts,
+                            "lock_price": lock_price_est if rd.lock_price == 0 else rd.lock_price,
+                            "close_price": close_price_est,
+                            "payout_ratio": ratio_use,
+                            "payout_ratio": ratio_use,
+                            "up_won": bool(up_won),
+                            "r_hat_used": float(b.get("r_hat", float('nan'))),
+                            "r_hat_source": str(b.get("r_hat_source", "")),
+                            "r_hat_error_pct": float('nan')
+                        }
+                        
+                        # Ошибка для forced settlement
+                        try:
+                            if ratio_use and b.get("r_hat"):
+                                r_actual = float(ratio_use)
+                                r_pred = float(b["r_hat"])
+                                if math.isfinite(r_actual) and math.isfinite(r_pred) and r_actual > 0:
+                                    error_pct = abs(r_actual - r_pred) / r_actual * 100.0
+                                    row["r_hat_error_pct"] = float(error_pct)
+                        except Exception:
+                            log_exception("Unhandled exception")
+
+                        capital = update_capital_atomic(capital_state, new_capital, now, row)
+
+                        # --- Performance monitor: прокинем сделку
+                        try:
+                            if perf is not None:
+                                perf.on_trade_settled(row)
+                        except Exception as e:
+                            print(f"[perf] on_trade_settled failed: {e}")
+
+
+                        # обновляем статистику и состояние REST
+
+                        stats.reload()
+
+                        # --- Performance monitor: почасовой отчёт (без дублей)
+                        try:
+                            if perf is not None:
+                                perf.maybe_hourly_report(now_ts=int(time.time()), tg_send_fn=tg_send)
+                        except Exception as e:
+                            print(f"[perf] hourly report failed: {e}")
+
+                        # --- Ежедневный отчёт (отправляется не чаще 1р/сутки, около полуночи по UTC) ---
+                        try:
+                            try_send_daily(CSV_PATH, tg_send)  # троттлинг/время внутри
+                        except Exception as e:
+                            print(f"[warn] daily_report failed: {e}")
+
+                        try:
+                            # шлём реже: например, по понедельникам в 00:05 UTC
+                            tm = datetime.now(timezone.utc) 
+                            if tm.weekday() == 0 and tm.hour == 0 and tm.minute < 10:
+                                try_send_projection(CSV_PATH, tg_send,
+                                                    horizons=(30, 90, 365),
+                                                    start_cap=capital,  # если знаешь текущий
+                                                    threshold=35.0,
+                                                    lookback_days=30,
+                                                    n_paths=8000,
+                                                    block_len=3)
+                        except Exception as e:
+                            print(f"[warn] projection failed: {e}")
+
+                        rest.notify_trade_executed()
+                        rest.update_from_stats(stats, cfg=rest_cfg)
+                        rest.save("rest_state.json")
+
+
+
+                        send_round_snapshot(
+                            prefix=f"⚠️ <b>Forced settle</b> epoch={epoch}",
+                            extra_lines=[
+                                f"Причина: oracleCalled нет {wp} проверок подряд.",
+                                f"side=<b>{side}</b>, outcome=<b>{outcome}</b>, pnl={pnl:+.6f} BNB",
+                                f"lock≈{(lock_price_est if rd.lock_price == 0 else rd.lock_price):.4f}, close≈{close_price_est:.4f}, ratio≈{ratio_use:.3f}"
+                            ]
+                        )
+
+                        stats_dict = compute_extended_stats_from_csv(CSV_PATH)
+                        print_stats(stats_dict)
+                        continue
+
+            _prune_bets(bets, keep_settled_last=500, keep_other_last=200)
+
+            # мягкий сборщик мусора раз в ~10 минут (снижает фрагментацию)
+            try:
+                import gc
+                if (now - _last_gc) >= 600:
+                    gc.collect()
+                    _last_gc = now
+            except Exception:
+                log_exception("Failed to import gc")
+
+            time.sleep(1.0)
+
+
+        except KeyboardInterrupt:
+            print("\n[stop] Ctrl+C")  # не дергаем сеть здесь, просто выходим
+            break
+        except Exception as e:
+            print(f"[warn] {type(e).__name__}: {e}")
+            time.sleep(2.0)
+
+
+def _normalize_existing_csvs():
+    """Аккуратно привести оба файла к нужной схеме"""
+    for _p in (CSV_PATH, CSV_SHADOW_PATH):
+        if os.path.exists(_p):
+            try:
+                # ✅ Убрали dtype="string" - читаем с автоопределением типов
+                raw = pd.read_csv(_p, encoding="utf-8-sig", keep_default_na=True)
+                
+                # ✅ Сразу заменяем все варианты NA на np.nan
+                raw = raw.fillna(np.nan)
+                
+                # Дополнительная зачистка строковых представлений
+                for col in raw.select_dtypes(include=["object"]).columns:
+                    raw[col] = raw[col].replace({
+                        "<NA>": np.nan, "NaN": np.nan, "nan": np.nan, 
+                        "None": np.nan, "": np.nan
+                    })
+                
+                # Мягко приводим типы к целевой схеме
+                _df = _coerce_csv_dtypes(raw)
+                
+                # Финальная зачистка перед сохранением
+                _df = _df.fillna(np.nan)
+                
+                _df.to_csv(_p, index=False, encoding="utf-8-sig")
+            except Exception as e:
+                print(f"[warn] CSV normalize failed for {_p}: {e!r}")
+
+
+
+if __name__ == "__main__":
+    ensure_csv_header(CSV_PATH)
+    _normalize_existing_csvs()
+
+    upgrade_csv_schema_if_needed(CSV_PATH)
+    upgrade_csv_schema_if_needed(CSV_SHADOW_PATH)
+
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        print("⚠️ Bot stopped (KeyboardInterrupt).")
+        try:
+            tg_send("⚠️ Bot stopped (KeyboardInterrupt).", html=False)
+        except Exception:
+            log_exception("Failed to send Telegram notification")
+    except Exception as e:
+        # пишем стек в GGG/errors.log и даём процессу завершиться с кодом ошибки
+        log_exception("Fatal error in main()")
+        try:
+            tg_send("🔴 Bot crashed: см. GGG/errors.log", html=False)
+        except Exception:
+            log_exception("Failed to send Telegram notification")
+        raise
