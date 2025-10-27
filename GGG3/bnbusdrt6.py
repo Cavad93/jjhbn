@@ -655,14 +655,14 @@ TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 # RPC
 # RPC - расширенный список с резервными узлами
 RPC_URLS = [
+    "https://bsc-rpc.publicnode.com",      # ← САМЫЙ СТАБИЛЬНЫЙ
+    "https://bsc.meowrpc.com",             # ← MEV-защита
+    "https://binance.llamarpc.com",        # ← Хороший резерв
     "https://bsc-dataseed.bnbchain.org",
     "https://bsc-dataseed1.bnbchain.org",
     "https://bsc-dataseed2.bnbchain.org",
     "https://bsc-dataseed3.bnbchain.org",
     "https://bsc-dataseed4.bnbchain.org",
-    "https://bsc-rpc.publicnode.com",
-    "https://bsc.meowrpc.com",
-    "https://binance.llamarpc.com",
 ]
 RPC_REQUEST_KW = {"timeout": 12}  # увеличен до 12 секунд для стабильности
 
@@ -8809,6 +8809,7 @@ def main_loop():
                     continue
 
                 # пропущенные считаем финализированными сразу после close_ts
+                # пропущенные считаем финализированными сразу после close_ts
                 if b.get("skipped") and now > rd.close_ts:
                     b["settled"] = True
                     b["outcome"] = "skipped"
@@ -8819,12 +8820,33 @@ def main_loop():
                     continue
 
                 # обычный сеттл — когда oracleCalled
-                # обычный сеттл — когда oracleCalled
                 if rd.oracle_called:
-                    # обновим историю «поздних денег» по только что закрытому раунду
-                    # обновим историю «поздних денег» по только что закрытому раунду
+                    # КРИТИЧНО: проверяем флаг skipped перед settlement
+                    if b.get("skipped"):
+                        # Раунд был пропущен (cooling/chop/late/etc) - не обрабатываем
+                        b["settled"] = True
+                        b["outcome"] = "skipped"
+                        print(f"[skip] epoch={epoch} finalized as skipped (reason: {b.get('reason', 'unknown')})")
+                        send_round_snapshot(
+                            prefix=f"ℹ️ <b>Round</b> epoch={epoch} finalized (skip).",
+                            extra_lines=[f"Причина пропуска: {b.get('reason', 'unknown')}"]
+                        )
+                        continue
+                    
+                    # КРИТИЧНО: проверяем что ставка действительно была размещена
+                    if not b.get("placed"):
+                        # Нет ставки - не можем делать settlement
+                        print(f"[warn] epoch={epoch} oracle_called but no bet placed - skipping settlement")
+                        b["settled"] = True
+                        b["outcome"] = "skipped"
+                        send_round_snapshot(
+                            prefix=f"⚠️ <b>Round</b> epoch={epoch} - no bet placed",
+                            extra_lines=["Раунд закрыт без ставки"]
+                        )
+                        continue
+                    
+                    # обновим историю «поздних денег»
                     try:
-                        # ✳️ гарантируем снимок на самом lock_ts (после рестартов/лагов его могло не быть)
                         pool.observe(epoch, rd.lock_ts, rd.bull_amount, rd.bear_amount)
                         pool.finalize_epoch(epoch, rd.lock_ts)
                     except Exception:
@@ -9198,6 +9220,11 @@ def main_loop():
                         print(f"[wait] epoch={epoch} waiting oracleCalled (closed, not finalized) polls={wp}/{MAX_WAIT_POLLS}")
 
                     if wp >= MAX_WAIT_POLLS and b.get("placed"):
+                        if b.get("skipped"):
+                            print(f"[skip] epoch={epoch} forced settle cancelled (was skipped)")
+                            b["settled"] = True
+                            b["outcome"] = "skipped"
+                            continue
                         lock_price_est = rd.lock_price
                         if (not math.isfinite(lock_price_est)) or lock_price_est == 0:
                             lock_price_est = nearest_close_price_ms(SYMBOL, (rd.lock_ts - 1) * 1000)
