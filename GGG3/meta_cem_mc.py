@@ -404,8 +404,16 @@ class MetaCEMMC:
                     if p is not None
                 ])
                 p_base_str = f"{p_base:.4f}" if p_base is not None else "None"
-                print(f"[MetaCEMMC] Input check: {available_preds}/4 experts available, "
-                    f"p_base={p_base_str}, phase={ph}")
+                
+                # Улучшенное логирование с предупреждением
+                if available_preds == 0:
+                    print(f"[MetaCEMMC] ⚠️ CRITICAL: {available_preds}/4 experts available, "
+                        f"p_base={p_base_str}, phase={ph}")
+                    print(f"[MetaCEMMC] ⚠️ This may indicate RPC/Binance data issues. "
+                        f"Using fallback mode with forced phi.")
+                else:
+                    print(f"[MetaCEMMC] Input check: {available_preds}/4 experts available, "
+                        f"p_base={p_base_str}, phase={ph}")
 
             # Пытаемся построить фичи обычным способом
             x_orig = self._phi(p_xgb, p_rf, p_arf, p_nn, p_base, reg_ctx)
