@@ -334,6 +334,7 @@ class MetaNeuralCEM:
         # ===== БУФЕРЫ ДАННЫХ =====
         self.buf_ph: Dict[int, List[Tuple]] = {p: [] for p in range(self.P)}
         self.seen_ph: Dict[int, int] = {p: 0 for p in range(self.P)}
+        self.new_since_train_ph: Dict[int, int] = {p: 0 for p in range(self.P)}
         
         # Пути к CSV с данными фаз
         self._phase_csv_paths: Dict[int, str] = {}
@@ -571,9 +572,11 @@ class MetaNeuralCEM:
                 return
             
             # Сохраняем пример
+            # Сохраняем пример
             self._append_example(ph, x_features, x_context, int(y_up))
             self.seen_ph[ph] = int(self.seen_ph.get(ph, 0)) + 1
-            
+            self.new_since_train_ph[ph] = self.new_since_train_ph.get(ph, 0) + 1
+
             # Обновление метрик
             if p_final_used is not None:
                 p_for_gate = p_final_used
@@ -662,9 +665,34 @@ class MetaNeuralCEM:
     # ========== ОБУЧЕНИЕ CMA-ES ==========
     
     def _phase_ready(self, ph: int) -> bool:
-        """Проверка готовности фазы к обучению"""
+        """Проверка готовности фазы к обучению с адаптивной частотой"""
         min_samples = int(getattr(self.cfg, "meta_min_train", 150))
-        return self.seen_ph.get(ph, 0) >= min_samples
+        base_retrain = int(getattr(self.cfg, "meta_retrain_every", 50))
+        
+        # Адаптивная частота на основе сложности модели
+        net = self.networks.get(ph)
+        if net is not None:
+            n_params = len(net.get_weights_flat())
+            # Для ~5000 параметров: 50 × 3 = 150
+            # Для ~1500 параметров: 50 × 1 = 50
+            multiplier = max(1, n_params // 1500)  # 🔥 ОПТИМАЛЬНЫЙ ДЕЛИТЕЛЬ
+            retrain_every = base_retrain * multiplier
+        else:
+            retrain_every = base_retrain
+        
+        seen = self.seen_ph.get(ph, 0)
+        new_since_last_train = self.new_since_train_ph.get(ph, 0)
+        
+        if seen < min_samples:
+            return False
+        
+        if new_since_last_train < retrain_every:
+            return False
+        
+        print(f"[MetaNeural] Phase {ph} ready: {new_since_last_train} new samples "
+            f"(threshold={retrain_every}, params={n_params if net else 'N/A'})")
+        
+        return True
     
     def _train_phase(self, ph: int):
         """Обучение нейросети для фазы через CMA-ES"""
@@ -750,9 +778,12 @@ class MetaNeuralCEM:
                         pass
         
         # Устанавливаем лучшие веса
+        # Устанавливаем лучшие веса
         best_w = np.array(es.result.xbest, dtype=float)
         net.set_weights_from_flat(best_w)
-        
+
+        self.new_since_train_ph[ph] = 0
+
         print(f"[MetaNeural] ✅ CMA-ES converged for phase {ph}")
     
     def _train_cem(self, ph: int, X_feat: np.ndarray, X_ctx: np.ndarray, y: np.ndarray):
@@ -802,6 +833,9 @@ class MetaNeuralCEM:
                 print(f"[MetaNeural] CEM iter {iteration}: best={best_loss:.6f}")
         
         net.set_weights_from_flat(best_w)
+
+        self.new_since_train_ph[ph] = 0
+
         print(f"[MetaNeural] ✅ CEM converged for phase {ph}")
     
     def _evaluate_weights(
@@ -1056,6 +1090,7 @@ class MetaNeuralCEM:
                 "shadow_hits": self.shadow_hits,
                 "active_hits": self.active_hits,
                 "seen_ph": {str(k): v for k, v in self.seen_ph.items()},
+                "new_since_train_ph": {str(k): v for k, v in self.new_since_train_ph.items()},
                 "cv_metrics": {str(k): v for k, v in self.cv_metrics.items()},
                 "validation_passed": {str(k): v for k, v in self.validation_passed.items()},
             }
@@ -1091,6 +1126,11 @@ class MetaNeuralCEM:
             
             seen_ph = state.get("seen_ph", {})
             self.seen_ph = {int(k): int(v) for k, v in seen_ph.items()}
+            
+            self.new_since_train_ph = {p: 0 for p in range(self.P)}
+            new_since_train = state.get("new_since_train_ph", {})
+            if new_since_train:
+                self.new_since_train_ph = {int(k): int(v) for k, v in new_since_train.items()}
             
             cv_metrics = state.get("cv_metrics", {})
             self.cv_metrics = {int(k): v for k, v in cv_metrics.items()}
