@@ -570,8 +570,7 @@ class MetaNeuralCEM:
             if x_features is None or x_context is None:
                 # Пропускаем пример если нет фичей
                 return
-            
-            # Сохраняем пример
+
             # Сохраняем пример
             self._append_example(ph, x_features, x_context, int(y_up))
             self.seen_ph[ph] = int(self.seen_ph.get(ph, 0)) + 1
@@ -776,8 +775,7 @@ class MetaNeuralCEM:
                         )
                     except Exception:
                         pass
-        
-        # Устанавливаем лучшие веса
+
         # Устанавливаем лучшие веса
         best_w = np.array(es.result.xbest, dtype=float)
         net.set_weights_from_flat(best_w)
