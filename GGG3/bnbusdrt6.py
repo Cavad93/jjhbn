@@ -444,7 +444,12 @@ import threading  # ← добавили
 _CALIB_P_META = deque(maxlen=20000)  # p_meta_raw до калибровки
 _CALIB_Y_META = deque(maxlen=20000)  # outcome: 1=win, 0=loss
 
-TG_TOKEN: Final[str] = os.getenv("TG_TOKEN", "").strip()
+# --- Telegram configuration ---
+# Определяем TELEGRAM_* переменные ДО использования в tg_enabled()
+TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID   = os.getenv("TG_CHAT_ID", "").strip()
+TELEGRAM_ENABLED   = True
+
 # Важно: для чатов/каналов ID может быть отрицательным (например, -100...).
 def _env_int(name: str, default: int = 0) -> int:
     try:
@@ -453,7 +458,9 @@ def _env_int(name: str, default: int = 0) -> int:
     except Exception:
         return default
 
-TG_CHAT_ID: Final[int] = _env_int("TG_CHAT_ID", 0)
+# Aliases для совместимости (используются в некоторых местах кода)
+TG_TOKEN: Final[str] = TELEGRAM_BOT_TOKEN or os.getenv("TG_TOKEN", "").strip()
+TG_CHAT_ID: Final[int] = _env_int("TG_CHAT_ID", 0) if not TELEGRAM_CHAT_ID else int(TELEGRAM_CHAT_ID) if TELEGRAM_CHAT_ID.isdigit() else 0
 TG_API: Final[str] = f"https://api.telegram.org/bot{TG_TOKEN}"
 
 _REPORT_THREAD = None  # поток слушателя /report; поднимаем максимум один
@@ -638,19 +645,13 @@ CROSS_W_VWAP = 0.12
 STABLE_W_MOM = 0.06
 STABLE_W_VWAP = 0.04
 
-TELEGRAM_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID   = os.getenv("TG_CHAT_ID", "").strip()
-
-TELEGRAM_ENABLED   = True
+# Telegram настройки уже определены выше (строки 449-464)
+# Удалены дублирующие определения TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ENABLED
+# и повторные присваивания TG_TOKEN, TG_CHAT_ID, TG_API
 
 TG_MUTE_AFTER      = 3       # после скольких фейлов уходим в mute
 TG_COOLDOWN_S      = 300     # базовый кулдаун (сек) до следующей пробы
 TG_PROBE_EVERY_S   = 30      # в mute: как часто «прощупывать» линию
-
-# мост к старым именам, которые использует tg_send()
-TG_TOKEN = TELEGRAM_BOT_TOKEN
-TG_CHAT_ID = TELEGRAM_CHAT_ID
-TG_API = f"https://api.telegram.org/bot{TG_TOKEN}"
 
 # RPC
 # RPC - расширенный список с резервными узлами
