@@ -2751,7 +2751,7 @@ class MLConfig:
     min_ready: int = 80
     enter_wr: float = 0.58      # ✅ БЫЛО 3.0 (300%!) - теперь 58%
     exit_wr: float = 0.52       # ✅ БЫЛО 1.0 (100%) - теперь 52%
-    retrain_every: int = 40
+    retrain_every: int = 150
     max_memory: int = 10000          # ИЗМЕНЕНО: было 5000
     train_window: int = 10000        # ИЗМЕНЕНО: было 1500
 
@@ -2797,7 +2797,7 @@ class MLConfig:
     nn_l2: float = 0.0005
     nn_epochs: int = 1
     nn_batch_size: int = 128 
-    nn_retrain_every: int = 100
+    nn_retrain_every: int = 200
     nn_calib_every: int = 200
     nn_cal_path: str = "nn_cal.pkl"  # Путь для калибратора
     nn_calibration_method: str = "temperature"  # Метод калибровки (temperature хорош для NN)
