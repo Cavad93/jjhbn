@@ -643,6 +643,10 @@ class MetaNeuralCEM:
                 except Exception as e:
                     print(f"[MetaNeural] ❌ Training failed for ph={ph}: {e}")
                     traceback.print_exc()
+            elif self.new_since_train_ph[ph] >= int(getattr(self.cfg, "meta_retrain_every", 50)):
+                # КРИТИЧЕСКОЕ: Сброс счетчика даже если не готовы к обучению
+                # Иначе счетчик будет расти бесконечно до достижения min_samples
+                self.new_since_train_ph[ph] = 0
             
             # Переключение режимов
             self._maybe_flip_modes()
