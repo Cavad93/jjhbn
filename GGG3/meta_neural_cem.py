@@ -695,19 +695,24 @@ class MetaNeuralCEM:
     
     def _train_phase(self, ph: int):
         """Обучение нейросети для фазы через CMA-ES"""
+        # КРИТИЧЕСКОЕ: Сброс счетчика ДО проверки данных
+        # Иначе при недостаточных данных счетчик не сбросится и обучение будет триггериться постоянно
+        self.new_since_train_ph[ph] = 0
+
         # Загрузка данных
         X_feat_list, X_ctx_list, y_list = self._load_phase_data(ph)
-        
+
         if len(X_feat_list) < 150:
+            print(f"[MetaNeural] ⚠️ Phase {ph}: insufficient data for training ({len(X_feat_list)} < 150), skipping")
             return
-        
+
         X_feat = np.array(X_feat_list, dtype=float)
         X_ctx = np.array(X_ctx_list, dtype=float)
         y = np.array(y_list, dtype=float)
-        
+
         # Выбор алгоритма
         use_cma = getattr(self.cfg, "meta_use_cma_es", True) and HAVE_CMA
-        
+
         if use_cma:
             self._train_cma_es(ph, X_feat, X_ctx, y)
         else:
@@ -780,8 +785,6 @@ class MetaNeuralCEM:
         best_w = np.array(es.result.xbest, dtype=float)
         net.set_weights_from_flat(best_w)
 
-        self.new_since_train_ph[ph] = 0
-
         print(f"[MetaNeural] ✅ CMA-ES converged for phase {ph}")
     
     def _train_cem(self, ph: int, X_feat: np.ndarray, X_ctx: np.ndarray, y: np.ndarray):
@@ -829,10 +832,8 @@ class MetaNeuralCEM:
             
             if iteration % 5 == 0:
                 print(f"[MetaNeural] CEM iter {iteration}: best={best_loss:.6f}")
-        
-        net.set_weights_from_flat(best_w)
 
-        self.new_since_train_ph[ph] = 0
+        net.set_weights_from_flat(best_w)
 
         print(f"[MetaNeural] ✅ CEM converged for phase {ph}")
     
