@@ -778,11 +778,11 @@ class MetaCEMMC:
         X_list, y_list, sample_weights = self._load_phase_buffer_from_disk(ph)
         if len(X_list) < int(getattr(self.cfg, "meta_min_train", 100)):
             return
-        
+
         X = np.array(X_list, dtype=float)
         y = np.array(y_list, dtype=float)
         sample_weights = np.array(sample_weights, dtype=float)
-        
+
         # ИСПРАВЛЕНО: правильная проверка на ненулевую сумму весов
         weights_sum = sample_weights.sum()
         if weights_sum > 0:
@@ -792,10 +792,28 @@ class MetaCEMMC:
             # Если все веса нулевые - используем равные веса
             sample_weights = np.ones_like(sample_weights)
 
+        # ИСПРАВЛЕНИЕ: Вызываем обучение (было пропущено!)
+        print(f"[MetaCEMMC] 🚀 Training phase {ph} with {len(X)} samples")
+
+        # Выбираем алгоритм: CMA-ES если доступен, иначе CEM
+        use_cma = getattr(self.cfg, "meta_use_cma_es", True) and HAVE_CMA
+
+        if use_cma:
+            print(f"[MetaCEMMC] Using CMA-ES for phase {ph}")
+            weights = self._train_cma_es(X, y, ph, sample_weights=sample_weights)
+        else:
+            print(f"[MetaCEMMC] Using CEM for phase {ph} (CMA-ES not available)")
+            weights = self._train_cem(X, y, ph=ph, sample_weights=sample_weights)
+
+        # Сохраняем обученные веса
+        self.w_ph[ph] = weights
+        print(f"[MetaCEMMC] ✅ Phase {ph} training completed, weights shape: {weights.shape}")
+
     def _train_cem(
         self,
         X: np.ndarray,
         y: np.ndarray,
+        ph: Optional[int] = None,
         n_iter: int = 50,
         pop_size: int = 100,
         elite_frac: float = 0.2,
@@ -804,7 +822,7 @@ class MetaCEMMC:
         """Cross-Entropy Method оптимизация с полной визуализацией"""
         D = X.shape[1]
         n_elite = max(1, int(pop_size * elite_frac))
-        
+
         # ДОБАВЛЕНО: валидация и приведение типов
         if sample_weights is not None:
             sample_weights = np.asarray(sample_weights, dtype=float)
@@ -814,16 +832,17 @@ class MetaCEMMC:
                 sample_weights = np.ones(len(y), dtype=float)
         else:
             sample_weights = np.ones(len(y), dtype=float)
-        
+
         mu = np.zeros(D)
         sigma = np.ones(D) * 2.0
-        
+
         clip_val = float(getattr(self.cfg, "meta_w_clip", 8.0))
         best_loss = float('inf')
         best_w = mu.copy()
-        
-        # Получаем текущую фазу
-        ph = getattr(self, "_last_phase", 0)
+
+        # Получаем текущую фазу (используем переданную или fallback)
+        if ph is None:
+            ph = getattr(self, "_last_phase", 0)
         
         # КРИТИЧЕСКОЕ: Инициализация визуализатора ДО начала обучения
         viz_enabled = False
@@ -968,7 +987,22 @@ class MetaCEMMC:
             print(f"[MetaCEMMC] 📊 Check training_data.json - should have {min(n_iter, 10 + (n_iter-10)//5)} META points")
         elif not viz_enabled:
             print(f"[MetaCEMMC] ⚠️ Training completed without visualization")
-        
+
+        # НОВОЕ: Генерация графика обучения
+        if HAVE_PLOTTING and len(loss_history) > 0:
+            try:
+                iters = list(range(1, len(loss_history) + 1))
+                self._emit_report(
+                    ph=ph,
+                    algo="CEM",
+                    iters=iters,
+                    best=loss_history,
+                    median=None,  # У CEM нет median fitness
+                    sigma=sigma_history
+                )
+            except Exception as e:
+                print(f"[MetaCEMMC] ⚠️ Failed to generate CEM report: {e}")
+
         return best_w
 
     def _train_cma_es(self, X: np.ndarray, y: np.ndarray, ph: int, sample_weights: Optional[np.ndarray] = None) -> np.ndarray:
@@ -976,7 +1010,7 @@ class MetaCEMMC:
         CMA-ES оптимизация (более продвинутая версия) с визуализацией
         """
         if not HAVE_CMA:
-            return self._train_cem(X, y, sample_weights=sample_weights)
+            return self._train_cem(X, y, ph=ph, sample_weights=sample_weights)
 
         D = X.shape[1]
         sigma0 = 2.0
@@ -1456,24 +1490,35 @@ class MetaCEMMC:
         if not HAVE_PLOTTING or plot_cma_like is None:
             return
         try:
+            # Получаем директорию из конфига или используем дефолтную
+            report_dir = getattr(self.cfg, 'meta_report_dir', 'meta_reports')
+
             fig_path = plot_cma_like(
                 iters=iters,
                 best=best,
                 median=median,
                 sigma=sigma,
                 phase=ph,
-                algo=algo or "CMA-ES"
+                algo=algo or "CMA-ES",
+                out_dir=report_dir
             )
-            
+
+            print(f"[MetaCEMMC] 📊 Training report saved: {fig_path}")
+
+            # Отправляем в Telegram если настроено
             if send_telegram_photo and os.path.isfile(fig_path):
                 token = getattr(self.cfg, 'tg_bot_token', '')
                 chat_id = getattr(self.cfg, 'tg_chat_id', '')
                 if token and chat_id:
-                    send_telegram_photo(token, chat_id, fig_path, caption=f"META {algo} phase {ph}")
-                try:
-                    os.remove(fig_path)
-                except Exception:
-                    pass
+                    success = send_telegram_photo(token, chat_id, fig_path, caption=f"META {algo} phase {ph}")
+                    if success:
+                        print(f"[MetaCEMMC] ✅ Report sent to Telegram")
+                    else:
+                        print(f"[MetaCEMMC] ⚠️ Failed to send report to Telegram")
+
+            # ИСПРАВЛЕНО: НЕ удаляем файл, чтобы пользователь мог его просмотреть
+            # Файл останется в папке meta_reports для дальнейшего анализа
+
         except Exception as e:
             print(f"[MetaCEMMC] Report failed: {e.__class__.__name__}: {e}")
 
