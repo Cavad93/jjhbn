@@ -173,6 +173,26 @@ def fetch_historical_prices_batch(start_time, end_time, interval='5m'):
     print(f"\n✅ Загружено {len(all_prices):,} свечей")
     return all_prices
 
+def _ema(series, n):
+    """Exponential Moving Average"""
+    alpha = 2.0 / (n + 1)
+    ema_vals = np.zeros(len(series))
+    ema_vals[0] = series[0]
+    for i in range(1, len(series)):
+        ema_vals[i] = alpha * series[i] + (1 - alpha) * ema_vals[i-1]
+    return ema_vals
+
+def _macd_hist(closes, fast=12, slow=26, sig=9):
+    """MACD Histogram calculation"""
+    if len(closes) < slow:
+        return 0.0
+
+    ema_fast = _ema(closes, fast)
+    ema_slow = _ema(closes, slow)
+    macd = ema_fast - ema_slow
+    signal = _ema(macd, sig)
+    hist = macd - signal
+    return hist[-1]
 
 def calculate_features_from_prices(price_window):
     """Расчет фич (импорт из оригинального файла)"""
@@ -216,6 +236,50 @@ def calculate_features_from_prices(price_window):
     atr = np.mean(tr[-14:]) if len(tr) >= 14 else 0
     atr_norm = atr / closes[-1] if closes[-1] > 0 else 0
 
+    # ATR SMA (для vol_ratio как в meta_ctx.py)
+    if len(tr) >= 34:
+        atr_series = []
+        for i in range(14, len(tr) + 1):
+            atr_series.append(np.mean(tr[i-14:i]))
+        atr_sma = np.mean(atr_series[-20:])
+    else:
+        atr_sma = atr
+
+    # ========== TREND & VOL RATIO (КАК В META_CTX.PY) ==========
+    # Resample to 15min for MACD histogram
+    if len(closes) >= 15 * 3:
+        closes_15m = []
+        for i in range(14, len(closes), 15):
+            closes_15m.append(closes[i])
+        closes_15m = np.array(closes_15m)
+
+        if len(closes_15m) >= 30:
+            macd_hist_vals = []
+            for i in range(26, len(closes_15m)):
+                h = _macd_hist(closes_15m[:i+1])
+                macd_hist_vals.append(h)
+
+            if len(macd_hist_vals) > 0:
+                macd_hist_current = macd_hist_vals[-1]
+                window = min(100, len(macd_hist_vals))
+                hist_window = np.array(macd_hist_vals[-window:])
+                hist_std = np.std(hist_window) if len(hist_window) > 1 else 0.0
+
+                trend_sign = 1.0 if macd_hist_current > 0 else (-1.0 if macd_hist_current < 0 else 0.0)
+                trend_abs = 0.0 if hist_std == 0.0 else min(3.0, max(0.0, abs(macd_hist_current) / hist_std))
+            else:
+                trend_sign = 0.0
+                trend_abs = 0.0
+        else:
+            trend_sign = 0.0
+            trend_abs = 0.0
+    else:
+        trend_sign = 0.0
+        trend_abs = 0.0
+
+    # vol_ratio из ATR (как в meta_ctx.py:155)
+    vol_ratio = min(5.0, max(0.0, atr / atr_sma)) if atr_sma > 0 else 0.0
+
     # Возвращаем основные фичи (сокращенная версия для скорости)
     return {
         'momentum_5m': float(momentum_5),
@@ -232,7 +296,9 @@ def calculate_features_from_prices(price_window):
         'volume': float(volumes[-1]),
         'atr': float(atr),
         'atr_norm': float(atr_norm),
-        'vol_ratio': float(volatility / volatility_20 if volatility_20 > 0 else 1.0),
+        'trend_sign': float(trend_sign),
+        'trend_abs': float(trend_abs),
+        'vol_ratio': float(vol_ratio),
         'normalized_position': float((closes[-1] - lows[-1]) / max(1e-12, highs[-1] - lows[-1])),
     }
 
@@ -319,19 +385,19 @@ def collect_data_fast(w3, contract, n_rounds=1000, output_file='historical_data_
         close_price = round_data['closePrice'] / 1e8
         outcome = 1 if close_price > lock_price else 0
 
-        volatility = features.get('volatility', 0)
-        if volatility < 0.005:
-            phase = 0
-        elif volatility < 0.01:
-            phase = 1
-        elif volatility < 0.015:
-            phase = 2
-        elif volatility < 0.02:
-            phase = 3
-        elif volatility < 0.03:
-            phase = 4
+        # Определяем фазу рынка (КАК В META_CTX.PY:260-282)
+        # VOL_THRESHOLD = 1.3
+        trend_sign = features.get('trend_sign', 0)
+        vol_ratio = features.get('vol_ratio', 0)
+
+        high_vol = (vol_ratio >= 1.3)
+
+        if trend_sign > 0:
+            phase = 1 if high_vol else 0  # bull_high or bull_low
+        elif trend_sign < 0:
+            phase = 3 if high_vol else 2  # bear_high or bear_low
         else:
-            phase = 5
+            phase = 5 if high_vol else 4  # flat_high or flat_low
 
         processed_data.append({
             'epoch': round_data['epoch'],
