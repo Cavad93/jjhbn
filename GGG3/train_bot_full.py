@@ -48,6 +48,7 @@ except Exception as e:
 # Импорт бота (обязательно)
 from bnbusdrt6 import MLConfig, _as_float
 from meta_neural_cem import MetaNeuralCEM
+from prepare_training_features import prepare_features_exact
 
 # ВАЖНО: Эксперты импортируем динамически, т.к. они могут быть недоступны
 HAVE_XGB = False
@@ -162,7 +163,7 @@ def collect_real_data(start_date: str = START_DATE) -> Optional[List[Dict]]:
         return None
 
 
-def prepare_features(round_data: Dict) -> np.ndarray:
+def prepare_features_legacy(round_data: Dict) -> np.ndarray:
     """
     Подготовка вектора из 58 фич для экспертов
 
@@ -303,6 +304,20 @@ def prepare_features(round_data: Dict) -> np.ndarray:
     return x_raw
 
 
+# ГЛАВНАЯ ФУНКЦИЯ: Используем ТОЧНОЕ соответствие live боту
+def prepare_features(round_data: Dict) -> np.ndarray:
+    """
+    ТОЧНАЯ копия фич из live бота (68 фич)
+
+    Вызывает prepare_features_exact() из prepare_training_features.py
+    который создает ТЕ ЖЕ фичи что и bnbusdrt6.py
+
+    Returns:
+        np.ndarray: 68 фич (14 base + 43 addon + 11 additional)
+    """
+    return prepare_features_exact(round_data)
+
+
 def train_experts(
     rounds: List[Dict],
     cfg: MLConfig,
@@ -332,10 +347,15 @@ def train_experts(
     print(f"\n🔍 Проверка размерности фич...")
     sample_features = prepare_features(train_rounds[0])
     print(f"  Размерность: {sample_features.shape[0]} фич")
-    if sample_features.shape[0] != 58:
-        print(f"  ⚠️  ПРЕДУПРЕЖДЕНИЕ: Ожидалось 58 фич, получено {sample_features.shape[0]}")
+    print(f"  Структура:")
+    print(f"    • ext_builder: 14 фич (базовые + взаимодействия)")
+    print(f"    • addon:       43 фичи (микроструктура, funding, gas, time)")
+    print(f"    • additional:  11 фич (P_up, RSI lags, momentum...)")
+    if sample_features.shape[0] != 68:
+        print(f"  ⚠️  ПРЕДУПРЕЖДЕНИЕ: Ожидалось 68 фич, получено {sample_features.shape[0]}")
+        print(f"  ⚠️  Обучение может работать неправильно!")
     else:
-        print(f"  ✅ Размерность корректна: 58 фич")
+        print(f"  ✅ Размерность КОРРЕКТНА: 68 фич (точное соответствие live боту)")
 
     # Инициализация экспертов
     experts = {}

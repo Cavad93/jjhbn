@@ -238,7 +238,20 @@ def calculate_simple_features(prices_window):
 
     volatility_lag5 = np.std(closes[-15:-5]) / np.mean(closes[-15:-5]) if len(closes) >= 15 else volatility
 
-    # ========== ИТОГОВЫЙ СЛОВАРЬ (32 фичи из OHLCV) ==========
+    # ========== РАСШИРЕННЫЕ ФИЧИ ДЛЯ ПОЛНОГО СООТВЕТСТВИЯ ==========
+
+    # Time features (8)
+    # В историческом режиме заполняем нулями, т.к. нет timestamp контекста
+    tod_sin = 0.0
+    tod_cos = 1.0
+    EU = 0.0
+    US = 0.0
+    ASIA = 0.0
+    dow_0, dow_1, dow_2, dow_3, dow_4, dow_5, dow_6 = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    # ИТОГОВЫЙ СЛОВАРЬ
+    # Содержит максимум фич извлекаемых из OHLCV
+    # Недоступные фичи (order book, funding, gas) заполнятся 0 в prepare_features_exact()
     return {
         # Базовые индикаторы (14)
         'momentum_5m': float(momentum_5),
@@ -279,9 +292,26 @@ def calculate_simple_features(prices_window):
         'price_range': float(highs[-1] - lows[-1]),
         'hl_ratio': float(highs[-1] / lows[-1]) if lows[-1] > 0 else 1.0,
         'volume_ma': float(np.mean(volumes[-10:])),
+
+        # Normalized position (1)
+        'normalized_position': float((closes[-1] - lows[-1]) / max(1e-12, highs[-1] - lows[-1])),
+
+        # Time features (13) - заполняются нулями в историческом режиме
+        'tod_sin': tod_sin,
+        'tod_cos': tod_cos,
+        'EU': EU,
+        'US': US,
+        'ASIA': ASIA,
+        'dow_0': dow_0,
+        'dow_1': dow_1,
+        'dow_2': dow_2,
+        'dow_3': dow_3,
+        'dow_4': dow_4,
+        'dow_5': dow_5,
+        'dow_6': dow_6,
     }
-    # ИТОГО: 32 фичи из OHLCV
-    # Остальные 26 (order book, funding, gas и т.д.) будут заполнены 0 в prepare_features()
+    # ИТОГО: ~46 фич из OHLCV + time features
+    # Остальные (order book, funding, gas, P_up) будут заполнены дефолтами в prepare_features_exact()
 
 def collect_data(w3, contract, n_rounds=1000, output_file='historical_data.json'):
     """Основная функция сбора данных"""
