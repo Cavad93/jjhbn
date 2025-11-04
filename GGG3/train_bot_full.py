@@ -163,32 +163,142 @@ def collect_real_data(start_date: str = START_DATE) -> Optional[List[Dict]]:
 
 
 def prepare_features(round_data: Dict) -> np.ndarray:
-    """Подготовка вектора фич из данных раунда"""
+    """
+    Подготовка вектора из 58 фич для экспертов
+
+    Структура:
+    1-14:  Базовые технические индикаторы
+    15-26: Рыночная микроструктура
+    27-35: Производные и взаимодействия
+    36-44: Временные лаги и тренды
+    45-52: Контекстные фичи рынка
+    53-58: Дополнительные кросс-фичи
+    """
     features = round_data.get('features', {})
 
-    # Базовые фичи
+    # ========== 1-14: БАЗОВЫЕ ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ ==========
     momentum_5 = _as_float(features.get('momentum_5m', 0), 0)
     momentum_10 = _as_float(features.get('momentum_10m', 0), 0)
+    momentum_15 = _as_float(features.get('momentum_15m', 0), 0)
     volatility = _as_float(features.get('volatility', 0), 0)
     vol_z = _as_float(features.get('vol_zscore', 0), 0)
     rsi = _as_float(features.get('rsi', 50), 50)
+    rsi_lag1 = _as_float(features.get('rsi_lag1', 50), 50)
+    rsi_lag5 = _as_float(features.get('rsi_lag5', 50), 50)
     close = _as_float(features.get('close', 0), 0)
+    high = _as_float(features.get('high', close), close)
+    low = _as_float(features.get('low', close), close)
+    volume = _as_float(features.get('volume', 0), 0)
+    atr = _as_float(features.get('atr', 0), 0)
+    atr_norm = _as_float(features.get('atr_norm', 1), 1)
+
+    # ========== 15-26: РЫНОЧНАЯ МИКРОСТРУКТУРА ==========
     bull_amt = _as_float(round_data.get('bull_amount', 0), 0)
     bear_amt = _as_float(round_data.get('bear_amount', 0), 0)
+    pool_total = bull_amt + bear_amt
+    pool_ratio = bull_amt / max(1e-12, bear_amt)
+    pool_imbalance = (bull_amt - bear_amt) / max(1e-12, pool_total)
 
-    # Расширенные фичи
+    book_imb = _as_float(features.get('book_imb', 0), 0)
+    microprice = _as_float(features.get('microprice', 0), 0)
+    spread = _as_float(features.get('spread', 0), 0)
+    rel_spread = _as_float(features.get('rel_spread', 0), 0)
+
+    ofi_5s = _as_float(features.get('ofi_5s', 0), 0)
+    ofi_15s = _as_float(features.get('ofi_15s', 0), 0)
+    ofi_30s = _as_float(features.get('ofi_30s', 0), 0)
+
+    # ========== 27-35: ПРОИЗВОДНЫЕ И ВЗАИМОДЕЙСТВИЯ ==========
+    volatility_sq = volatility ** 2
+    momentum_vol = momentum_5 * volatility
+    rsi_deviation = abs(rsi - 50.0) / 50.0
+
+    # Нормализованная позиция в канале
+    price_range = max(1e-12, high - low)
+    price_position = (close - low) / price_range if price_range > 0 else 0.5
+
+    # Волатильность RSI
+    rsi_volatility = _as_float(features.get('rsi_volatility', 0), 0)
+
+    # Коэффициент вариации доходности
+    returns_cv = _as_float(features.get('returns_cv', 0), 0)
+
+    # Trend strength
+    trend_sign = _as_float(features.get('trend_sign', 0), 0)
+    trend_abs = _as_float(features.get('trend_abs', 0), 0)
+    vol_ratio = _as_float(features.get('vol_ratio', 1), 1)
+
+    # ========== 36-44: ВРЕМЕННЫЕ ЛАГИ И ТРЕНДЫ ==========
+    close_lag1 = _as_float(features.get('close_lag1', close), close)
+    close_lag5 = _as_float(features.get('close_lag5', close), close)
+    close_lag15 = _as_float(features.get('close_lag15', close), close)
+
+    returns_1 = (close - close_lag1) / max(1e-12, close_lag1)
+    returns_5 = (close - close_lag5) / max(1e-12, close_lag5)
+    returns_15 = (close - close_lag15) / max(1e-12, close_lag15)
+
+    volume_lag1 = _as_float(features.get('volume_lag1', volume), volume)
+    volume_change = (volume - volume_lag1) / max(1e-12, volume_lag1)
+
+    volatility_lag5 = _as_float(features.get('volatility_lag5', volatility), volatility)
+
+    # ========== 45-52: КОНТЕКСТНЫЕ ФИЧИ РЫНКА ==========
+    funding_rate = _as_float(features.get('funding_rate', 0), 0)
+    funding_sign = np.sign(funding_rate)
+    basis_pct = _as_float(features.get('basis_pct', 0), 0)
+    basis_sign = np.sign(basis_pct)
+
+    gas_price = _as_float(features.get('gas_price', 0), 0)
+    gas_norm = gas_price / max(1e-12, _as_float(features.get('gas_median', 1), 1))
+
+    jump_flag = _as_float(features.get('jump_flag', 0), 0)
+    late_money_share = _as_float(features.get('late_money_share', 0), 0)
+
+    # ========== 53-58: ДОПОЛНИТЕЛЬНЫЕ КРОСС-ФИЧИ ==========
+    # Взаимодействия ключевых фичей
+    momentum_rsi = momentum_5 * (rsi / 50.0)
+    volatility_volume = volatility * np.log1p(volume)
+    trend_vol_interaction = trend_sign * vol_ratio
+    pool_vol_interaction = pool_imbalance * volatility
+    ofi_trend = ofi_15s * trend_sign
+    momentum_ofi = momentum_5 * ofi_15s
+
+    # ========== СБОРКА ВЕКТОРА (58 ФИЧ) ==========
     x_raw = np.array([
-        momentum_5,
-        momentum_10,
-        volatility,
-        vol_z,
-        rsi,
-        close,
-        bull_amt,
-        bear_amt,
-        volatility ** 2,  # vol^2
-        momentum_5 * volatility,  # momentum * vol
+        # 1-14: Базовые индикаторы
+        momentum_5, momentum_10, momentum_15,
+        volatility, vol_z,
+        rsi, rsi_lag1, rsi_lag5,
+        close, high, low, volume,
+        atr, atr_norm,
+
+        # 15-26: Микроструктура (12 фич)
+        bull_amt, bear_amt, pool_total, pool_ratio, pool_imbalance,
+        book_imb, microprice, spread, rel_spread,
+        ofi_5s, ofi_15s, ofi_30s,
+
+        # 27-35: Производные (9 фич)
+        volatility_sq, momentum_vol, rsi_deviation,
+        price_position, rsi_volatility, returns_cv,
+        trend_sign, trend_abs, vol_ratio,
+
+        # 36-44: Временные лаги (9 фич)
+        close_lag1, close_lag5, close_lag15,
+        returns_1, returns_5, returns_15,
+        volume_lag1, volume_change, volatility_lag5,
+
+        # 45-52: Контекст рынка (8 фич)
+        funding_rate, funding_sign, basis_pct, basis_sign,
+        gas_price, gas_norm, jump_flag, late_money_share,
+
+        # 53-58: Кросс-фичи (6 фич)
+        momentum_rsi, volatility_volume, trend_vol_interaction,
+        pool_vol_interaction, ofi_trend, momentum_ofi,
     ], dtype=np.float64)
+
+    # Защита от NaN/Inf
+    x_raw = np.nan_to_num(x_raw, nan=0.0, posinf=10.0, neginf=-10.0)
+    x_raw = np.clip(x_raw, -10.0, 10.0)
 
     return x_raw
 
@@ -217,6 +327,15 @@ def train_experts(
     print(f"  Всего:    {len(rounds):,}")
     print(f"  Обучение: {len(train_rounds):,}")
     print(f"  Тест:     {len(test_rounds):,}")
+
+    # ========== ВАЛИДАЦИЯ ФИЧЕЙ ==========
+    print(f"\n🔍 Проверка размерности фич...")
+    sample_features = prepare_features(train_rounds[0])
+    print(f"  Размерность: {sample_features.shape[0]} фич")
+    if sample_features.shape[0] != 58:
+        print(f"  ⚠️  ПРЕДУПРЕЖДЕНИЕ: Ожидалось 58 фич, получено {sample_features.shape[0]}")
+    else:
+        print(f"  ✅ Размерность корректна: 58 фич")
 
     # Инициализация экспертов
     experts = {}
@@ -343,6 +462,8 @@ def train_meta(
     n_params = len(meta.networks[0].get_weights_flat()) if meta.networks else 0
     print(f"🔧 META Neural инициализирован")
     print(f"  Параметров: {n_params:,}")
+    print(f"  Входы: 5 предсказаний экспертов + контекст")
+    print(f"  Внутренняя размерность: 18 → 36D feature engineering")
 
     # Разделение данных
     n_train = int(len(rounds) * split)
@@ -471,27 +592,140 @@ def train_meta(
 
 
 def save_models(experts: Dict, meta: Optional[MetaNeuralCEM], output_dir: str = "trained_models"):
-    """Сохраняет модели"""
+    """Сохраняет все обученные модели"""
     print(f"\n{'='*70}")
     print("СОХРАНЕНИЕ МОДЕЛЕЙ")
     print(f"{'='*70}\n")
 
     os.makedirs(output_dir, exist_ok=True)
-
     print(f"💾 Директория: {output_dir}")
     print(f"\n📝 Сохранение экспертов...")
 
-    # Экспертов сохранять сложнее - они имеют внутренние методы
-    # Сохраним хотя бы их стейты для демонстрации
-    for name in experts.keys():
-        print(f"  - {name}: (требует реализации save)")
+    saved_count = 0
+    failed_count = 0
 
-    # META
+    # Сохранение экспертов
+    for name, expert in experts.items():
+        try:
+            # Разные эксперты имеют разные методы сохранения
+            if name == "XGBoost":
+                # XGBoost сохраняет через свой внутренний метод
+                expert_dir = os.path.join(output_dir, "xgb")
+                os.makedirs(expert_dir, exist_ok=True)
+
+                # Сохраняем модели по фазам
+                for ph in range(expert.P):
+                    if expert.booster_ph.get(ph) is not None:
+                        model_path = os.path.join(expert_dir, f"xgb_ph{ph}.model")
+                        expert.booster_ph[ph].save_model(model_path)
+                        print(f"  ✅ {name} phase {ph}: {model_path}")
+
+                # Сохраняем глобальную модель
+                if expert.booster is not None:
+                    global_path = os.path.join(expert_dir, "xgb_global.model")
+                    expert.booster.save_model(global_path)
+                    print(f"  ✅ {name} global: {global_path}")
+
+                saved_count += 1
+
+            elif name == "RandomForest":
+                # RandomForest использует pickle
+                expert_dir = os.path.join(output_dir, "rf")
+                os.makedirs(expert_dir, exist_ok=True)
+
+                # Сохраняем модели по фазам
+                for ph in range(expert.P):
+                    if expert.clf_ph.get(ph) is not None:
+                        model_path = os.path.join(expert_dir, f"rf_ph{ph}.pkl")
+                        with open(model_path, 'wb') as f:
+                            pickle.dump(expert.clf_ph[ph], f)
+                        print(f"  ✅ {name} phase {ph}: {model_path}")
+
+                # Сохраняем глобальную модель
+                if expert.clf is not None:
+                    global_path = os.path.join(expert_dir, "rf_global.pkl")
+                    with open(global_path, 'wb') as f:
+                        pickle.dump(expert.clf, f)
+                    print(f"  ✅ {name} global: {global_path}")
+
+                saved_count += 1
+
+            elif name == "ARF":
+                # River ARF сохраняет через pickle
+                expert_dir = os.path.join(output_dir, "arf")
+                os.makedirs(expert_dir, exist_ok=True)
+
+                if expert.clf is not None:
+                    model_path = os.path.join(expert_dir, "arf_model.pkl")
+                    with open(model_path, 'wb') as f:
+                        pickle.dump(expert.clf, f)
+                    print(f"  ✅ {name}: {model_path}")
+
+                saved_count += 1
+
+            elif name == "NN":
+                # NN сохраняет через свой метод save()
+                expert_dir = os.path.join(output_dir, "nn")
+                os.makedirs(expert_dir, exist_ok=True)
+
+                # Сохраняем модели по фазам
+                for ph in range(expert.P):
+                    if ph in expert.nets_ph and expert.nets_ph[ph] is not None:
+                        model_path = os.path.join(expert_dir, f"nn_ph{ph}.pkl")
+                        expert.nets_ph[ph].save(model_path)
+                        print(f"  ✅ {name} phase {ph}: {model_path}")
+
+                # Сохраняем глобальную модель
+                if expert.net_global is not None:
+                    global_path = os.path.join(expert_dir, "nn_global.pkl")
+                    expert.net_global.save(global_path)
+                    print(f"  ✅ {name} global: {global_path}")
+
+                saved_count += 1
+
+        except Exception as e:
+            print(f"  ❌ {name}: ошибка сохранения - {e}")
+            failed_count += 1
+
+    # Сохранение META Neural
     if meta:
-        print(f"  - META Neural: (требует реализации save)")
+        try:
+            meta_dir = os.path.join(output_dir, "meta")
+            os.makedirs(meta_dir, exist_ok=True)
 
-    print(f"\n✅ Модели готовы к сохранению")
-    print(f"💡 Для полного сохранения нужно вызвать методы save() экспертов")
+            # Сохраняем каждую фазовую нейросеть
+            for ph, network in meta.networks.items():
+                if network is not None:
+                    net_path = os.path.join(meta_dir, f"meta_net_ph{ph}.pkl")
+                    with open(net_path, 'wb') as f:
+                        pickle.dump(network, f)
+                    print(f"  ✅ META Neural phase {ph}: {net_path}")
+
+            # Сохраняем состояние META
+            meta_state = {
+                "mode": meta.mode,
+                "seen_ph": meta.seen_ph,
+                "wins_ph": meta.wins_ph,
+                "total_ph": meta.total_ph
+            }
+            state_path = os.path.join(meta_dir, "meta_state.json")
+            with open(state_path, 'w') as f:
+                json.dump(meta_state, f, indent=2)
+            print(f"  ✅ META state: {state_path}")
+
+            saved_count += 1
+
+        except Exception as e:
+            print(f"  ❌ META Neural: ошибка сохранения - {e}")
+            failed_count += 1
+
+    # Итог
+    print(f"\n{'='*70}")
+    print(f"✅ Успешно сохранено: {saved_count} моделей")
+    if failed_count > 0:
+        print(f"❌ Ошибок: {failed_count}")
+    print(f"📁 Директория: {os.path.abspath(output_dir)}")
+    print(f"{'='*70}\n")
 
 
 def main():
