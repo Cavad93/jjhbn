@@ -25,9 +25,9 @@ from meta_neural_cem import MetaNeuralCEM
 
 class TestConfig:
     def __init__(self):
-        self.meta_nn_hidden = [32, 16]  # БОЛЬШЕ нейронов для сложных паттернов
-        self.meta_retrain_every = 80  # Обучение каждые 80 примеров
-        self.meta_min_train = 150  # Минимум для первого обучения
+        self.meta_nn_hidden = [8]  # ✅ Очень маленькая сеть: ~500 параметров
+        self.meta_retrain_every = 150  # Обучение каждые 150 примеров (больше данных)
+        self.meta_min_train = 300  # Минимум 300 примеров для первого обучения
         self.meta_use_cma_es = True  # ✅ ВКЛЮЧАЕМ CMA-ES - лучший алгоритм!
         self.meta_cem_iters = 50  # Не используется для CMA-ES
         self.meta_cem_pop = 30  # Не используется для CMA-ES
@@ -179,15 +179,15 @@ def main():
         print("  3. Разброс >0.4 → Случайность (50/50)")
         print("  4. Остальное → Слабая корреляция со средним")
 
-        # ================== ФАЗА 1: ОБУЧЕНИЕ (500 примеров) ==================
+        # ================== ФАЗА 1: ОБУЧЕНИЕ (2000 примеров) ==================
         print("\n" + "="*70)
-        print("ФАЗА 1: ОБУЧЕНИЕ НА 500 ПРИМЕРАХ")
+        print("ФАЗА 1: ОБУЧЕНИЕ НА 2000 ПРИМЕРАХ ([8] сеть ~500 параметров)")
         print("="*70)
 
         training_outcomes = []
         training_preds_before = []
 
-        for i in range(500):
+        for i in range(2000):
             # Контролируемая генерация: 30% high_up, 30% low_down, 20% spread, 20% random
             rand = np.random.rand()
             if rand < 0.30:
@@ -230,8 +230,8 @@ def main():
                 reg_ctx={'phase': 0}
             )
 
-            if (i + 1) % 100 == 0:
-                print(f"  📝 Записано {i+1}/500 примеров...")
+            if (i + 1) % 200 == 0:
+                print(f"  📝 Записано {i+1}/2000 примеров...")
 
         print(f"\n✅ Обучение завершено: {meta.seen_ph[0]} примеров")
         print(f"  🔄 Счетчик new_since_train_ph[0]: {meta.new_since_train_ph[0]}")
