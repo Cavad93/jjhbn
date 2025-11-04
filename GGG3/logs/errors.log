@@ -1,1 +1,37 @@
-﻿
+﻿2025-11-04 21:00:31,175 | ERROR | 6862 | MainThread | errors | Uncaught exception
+Traceback (most recent call last):
+  File "/home/user/jjhbn/GGG3/training_visualizer.py", line 290, in _save_data
+    print(f"[TrainingVisualizer] Data saved: "
+BrokenPipeError: [Errno 32] Broken pipe
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/user/jjhbn/GGG3/bnbusdrt6.py", line 5977, in record_result
+    viz.record_expert_metrics(
+  File "/home/user/jjhbn/GGG3/training_visualizer.py", line 142, in record_expert_metrics
+    self._save_data()
+  File "/home/user/jjhbn/GGG3/training_visualizer.py", line 306, in _save_data
+    print(f"[TrainingVisualizer] Failed to save data: {e.__class__.__name__}: {e}")
+BrokenPipeError: [Errno 32] Broken pipe
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/user/jjhbn/GGG3/train_bot_full.py", line 535, in main
+    experts = train_experts(rounds, cfg, split=0.8)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/jjhbn/GGG3/train_bot_full.py", line 265, in train_experts
+    expert.record_result(
+  File "/home/user/jjhbn/GGG3/bnbusdrt6.py", line 6002, in record_result
+    print(f"[NN] ERROR: Failed to send metrics to visualizer: {e}")
+BrokenPipeError: [Errno 32] Broken pipe
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/user/jjhbn/GGG3/train_bot_full.py", line 568, in <module>
+    main()
+  File "/home/user/jjhbn/GGG3/train_bot_full.py", line 562, in main
+    print(f"\n❌ ОШИБКА: {e}")
+BrokenPipeError: [Errno 32] Broken pipe

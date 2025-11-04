@@ -1,9 +1,9 @@
 {
   "levels": {
-    "XGB": 10,
-    "RF": 10,
-    "ARF": 9,
-    "NN": 13,
+    "XGB": 0,
+    "RF": 0,
+    "ARF": 0,
+    "NN": 0,
     "META": 0
   },
   "last_notified": {
