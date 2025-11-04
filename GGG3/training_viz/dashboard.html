@@ -5,6 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🤖 Training Dashboard - Experts & META</title>
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <!--
+    ⚠️ ВАЖНО: Для корректной работы откройте дашборд через HTTP сервер!
+    
+    Выполните в терминале:
+    cd training_viz && python -m http.server 8000
+    
+    Затем откройте в браузере: http://localhost:8000/dashboard.html
+    
+    (Файл не будет работать через file:// из-за CORS ограничений)
+    -->
     <style>
         * {
             margin: 0;
@@ -173,7 +183,6 @@
             to { opacity: 1; transform: translateY(0); }
         }
         
-        /* НОВОЕ: Стили для эволюции */
         #evolutionContainer {
             display: flex;
             justify-content: space-around;
@@ -309,7 +318,6 @@
             </div>
         </div>
         
-        <!-- НОВОЕ: Блок эволюции -->
         <div class="card" style="margin-bottom: 20px;">
             <h2>🧬 Evolution Progress - From Cell to Human</h2>
             <div id="evolutionContainer">
@@ -419,7 +427,6 @@
     <script>
         let lastDataTimestamp = 0;
         
-        // Эволюционные стадии (упрощенная версия для JS)
         const EVOLUTION_STAGES = [
             {level: 0, emoji: "🧪", name: "Химический суп", min: 0.0, max: 0.35},
             {level: 1, emoji: "🧬", name: "РНК молекула", min: 0.35, max: 0.38},
@@ -621,13 +628,11 @@
                     
                     const stage = getStageFromAccuracy(latest.accuracy);
                     
-                    // Обновляем UI
                     elem.querySelector('.evo-level').textContent = `Lvl ${stage.level}`;
                     elem.querySelector('.evo-organism').textContent = stage.emoji;
                     elem.querySelector('.evo-description').textContent = stage.name;
                     elem.querySelector('.evo-progress-fill').style.width = `${stage.level}%`;
                     
-                    // Анимация эволюции при изменении
                     if (elem.dataset.lastLevel && parseInt(elem.dataset.lastLevel) < stage.level) {
                         elem.classList.add('evolving');
                         setTimeout(() => elem.classList.remove('evolving'), 1000);
@@ -742,9 +747,8 @@
             }
         }
         
-        // Автообновление каждые 2 секунды
         setInterval(loadData, 2000);
-        loadData();  // Загрузка при старте
+        loadData();
     </script>
 </body>
 </html>
