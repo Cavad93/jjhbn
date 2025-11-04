@@ -151,40 +151,137 @@ def fetch_historical_prices(start_time, end_time, interval='5m'):
         return {}
 
 def calculate_simple_features(prices_window):
-    """Упрощенный расчет фич (без полного бота)"""
+    """
+    Расширенный расчет фич из OHLCV данных
+
+    Генерирует максимум фич из доступных исторических данных.
+    Недоступные фичи (order book, funding, gas) будут заполнены нулями в prepare_features().
+    """
     if len(prices_window) < 20:
         return None
 
+    opens = np.array([p['open'] for p in prices_window])
+    highs = np.array([p['high'] for p in prices_window])
+    lows = np.array([p['low'] for p in prices_window])
     closes = np.array([p['close'] for p in prices_window])
     volumes = np.array([p['volume'] for p in prices_window])
 
-    # Momentum
+    # ========== БАЗОВЫЕ ИНДИКАТОРЫ ==========
+
+    # Momentum на разных таймфреймах
     momentum_5 = (closes[-1] - closes[-5]) / closes[-5] if len(closes) >= 5 else 0
     momentum_10 = (closes[-1] - closes[-10]) / closes[-10] if len(closes) >= 10 else 0
+    momentum_15 = (closes[-1] - closes[-15]) / closes[-15] if len(closes) >= 15 else 0
 
     # Volatility
     volatility = np.std(closes[-10:]) / np.mean(closes[-10:]) if len(closes) >= 10 else 0
+    volatility_20 = np.std(closes[-20:]) / np.mean(closes[-20:]) if len(closes) >= 20 else 0
 
     # Volume Z-score
     vol_mean = np.mean(volumes[-20:])
     vol_std = np.std(volumes[-20:])
     vol_zscore = (volumes[-1] - vol_mean) / vol_std if vol_std > 0 else 0
 
-    # RSI упрощенный
-    deltas = np.diff(closes[-14:])
-    gains = deltas[deltas > 0].sum()
-    losses = -deltas[deltas < 0].sum()
-    rs = gains / losses if losses > 0 else 1
-    rsi = 100 - (100 / (1 + rs))
+    # RSI (текущий и лаги)
+    def calc_rsi(prices, period=14):
+        deltas = np.diff(prices[-period-1:])
+        gains = deltas[deltas > 0].sum()
+        losses = -deltas[deltas < 0].sum()
+        rs = gains / losses if losses > 0 else 1
+        return 100 - (100 / (1 + rs))
 
+    rsi = calc_rsi(closes, 14)
+    rsi_lag1 = calc_rsi(closes[:-1], 14) if len(closes) > 15 else rsi
+    rsi_lag5 = calc_rsi(closes[:-5], 14) if len(closes) > 19 else rsi
+
+    # ATR (Average True Range)
+    tr = np.maximum(highs[1:] - lows[1:],
+                    np.abs(highs[1:] - closes[:-1]),
+                    np.abs(lows[1:] - closes[:-1]))
+    atr = np.mean(tr[-14:]) if len(tr) >= 14 else 0
+    atr_norm = atr / closes[-1] if closes[-1] > 0 else 0
+
+    # ========== ПРОИЗВОДНЫЕ ==========
+
+    # RSI volatility
+    rsi_values = []
+    for i in range(max(0, len(closes) - 20), len(closes)):
+        if i >= 14:
+            rsi_values.append(calc_rsi(closes[:i+1], 14))
+    rsi_volatility = np.std(rsi_values) if len(rsi_values) > 1 else 0
+
+    # Returns coefficient of variation
+    returns = np.diff(closes[-20:]) / closes[-20:-1]
+    returns_cv = np.std(returns) / np.abs(np.mean(returns)) if np.abs(np.mean(returns)) > 1e-12 else 0
+    returns_cv = min(returns_cv, 5.0)  # Клипируем экстремумы
+
+    # Trend indicators
+    ema_short = closes[-1]  # упрощенно
+    ema_long = np.mean(closes[-20:])
+    trend_sign = 1.0 if ema_short > ema_long else -1.0
+    trend_abs = abs(ema_short - ema_long) / ema_long if ema_long > 0 else 0
+
+    vol_ratio = volatility / volatility_20 if volatility_20 > 0 else 1.0
+
+    # ========== ВРЕМЕННЫЕ ЛАГИ ==========
+
+    close_lag1 = closes[-2] if len(closes) >= 2 else closes[-1]
+    close_lag5 = closes[-6] if len(closes) >= 6 else closes[-1]
+    close_lag15 = closes[-16] if len(closes) >= 16 else closes[-1]
+
+    returns_1 = (closes[-1] - close_lag1) / close_lag1 if close_lag1 > 0 else 0
+    returns_5 = (closes[-1] - close_lag5) / close_lag5 if close_lag5 > 0 else 0
+    returns_15 = (closes[-1] - close_lag15) / close_lag15 if close_lag15 > 0 else 0
+
+    volume_lag1 = volumes[-2] if len(volumes) >= 2 else volumes[-1]
+    volume_change = (volumes[-1] - volume_lag1) / volume_lag1 if volume_lag1 > 0 else 0
+
+    volatility_lag5 = np.std(closes[-15:-5]) / np.mean(closes[-15:-5]) if len(closes) >= 15 else volatility
+
+    # ========== ИТОГОВЫЙ СЛОВАРЬ (32 фичи из OHLCV) ==========
     return {
-        'momentum_5m': momentum_5,
-        'momentum_10m': momentum_10,
-        'volatility': volatility,
-        'vol_zscore': vol_zscore,
-        'rsi': rsi,
-        'close': closes[-1]
+        # Базовые индикаторы (14)
+        'momentum_5m': float(momentum_5),
+        'momentum_10m': float(momentum_10),
+        'momentum_15m': float(momentum_15),
+        'volatility': float(volatility),
+        'vol_zscore': float(vol_zscore),
+        'rsi': float(rsi),
+        'rsi_lag1': float(rsi_lag1),
+        'rsi_lag5': float(rsi_lag5),
+        'close': float(closes[-1]),
+        'high': float(highs[-1]),
+        'low': float(lows[-1]),
+        'volume': float(volumes[-1]),
+        'atr': float(atr),
+        'atr_norm': float(atr_norm),
+
+        # Производные (6)
+        'rsi_volatility': float(rsi_volatility),
+        'returns_cv': float(returns_cv),
+        'trend_sign': float(trend_sign),
+        'trend_abs': float(trend_abs),
+        'vol_ratio': float(vol_ratio),
+        'volatility_20': float(volatility_20),
+
+        # Временные лаги (9)
+        'close_lag1': float(close_lag1),
+        'close_lag5': float(close_lag5),
+        'close_lag15': float(close_lag15),
+        'returns_1': float(returns_1),
+        'returns_5': float(returns_5),
+        'returns_15': float(returns_15),
+        'volume_lag1': float(volume_lag1),
+        'volume_change': float(volume_change),
+        'volatility_lag5': float(volatility_lag5),
+
+        # Дополнительные (3)
+        'price_range': float(highs[-1] - lows[-1]),
+        'hl_ratio': float(highs[-1] / lows[-1]) if lows[-1] > 0 else 1.0,
+        'volume_ma': float(np.mean(volumes[-10:])),
     }
+    # ИТОГО: 32 фичи из OHLCV
+    # Остальные 26 (order book, funding, gas и т.д.) будут заполнены 0 в prepare_features()
 
 def collect_data(w3, contract, n_rounds=1000, output_file='historical_data.json'):
     """Основная функция сбора данных"""
