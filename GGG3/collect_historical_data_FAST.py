@@ -361,6 +361,36 @@ def calculate_features_from_prices(price_window):
     }
 
 
+def get_nearest_price(prices_dict, target_ts, tolerance=150):
+    """
+    Находит ближайшую свечу к target_ts в пределах tolerance секунд
+
+    Args:
+        prices_dict: Словарь {timestamp: price_data}
+        target_ts: Целевой timestamp
+        tolerance: Максимальное отклонение в секундах (по умолчанию 2.5 минуты)
+
+    Returns:
+        price_data или None если не найдено в пределах tolerance
+    """
+    best_ts = None
+    best_diff = float('inf')
+
+    # Ищем в окне ±tolerance
+    for ts in range(target_ts - tolerance, target_ts + tolerance + 1, 60):  # Шаг 60 для скорости
+        if ts in prices_dict:
+            diff = abs(ts - target_ts)
+            if diff < best_diff:
+                best_diff = diff
+                best_ts = ts
+
+    # Если нашли в пределах tolerance, возвращаем
+    if best_ts is not None and best_diff <= tolerance:
+        return prices_dict[best_ts]
+
+    return None
+
+
 def collect_data_fast(w3, contract, n_rounds=1000, output_file='historical_data_fast.json', use_date_filter=True):
     """
     БЫСТРЫЙ сбор данных с параллелизмом
@@ -429,20 +459,29 @@ def collect_data_fast(w3, contract, n_rounds=1000, output_file='historical_data_
 
     prices = fetch_historical_prices_batch(min_ts - 3600, max_ts + 3600)
 
+    # Создаем отсортированный список timestamp для быстрого поиска
+    sorted_price_ts = sorted(prices.keys())
+    print(f"📌 Диапазон цен: {datetime.fromtimestamp(sorted_price_ts[0]).strftime('%Y-%m-%d %H:%M')} - {datetime.fromtimestamp(sorted_price_ts[-1]).strftime('%Y-%m-%d %H:%M')}")
+
     # ========== ФАЗА 3: ОБРАБОТКА РАУНДОВ С ФИЧАМИ ==========
     print(f"\n📊 Обработка раундов с фичами...")
     processed_data = []
+    skipped_no_prices = 0
 
     for i, round_data in enumerate(rounds):
         lock_ts = round_data['lockTimestamp']
 
-        # Получаем окно цен
+        # Получаем окно цен (используем nearest-neighbor matching)
         price_window = []
-        for ts in range(lock_ts - 1200, lock_ts, 300):
-            if ts in prices:
-                price_window.append(prices[ts])
+        target_timestamps = list(range(lock_ts - 1200, lock_ts, 300))
+
+        for target_ts in target_timestamps:
+            nearest_price = get_nearest_price(prices, target_ts, tolerance=180)
+            if nearest_price is not None:
+                price_window.append(nearest_price)
 
         if len(price_window) < 3:
+            skipped_no_prices += 1
             continue
 
         features = calculate_features_from_prices(price_window)
@@ -480,9 +519,15 @@ def collect_data_fast(w3, contract, n_rounds=1000, output_file='historical_data_
         })
 
         if (i + 1) % 1000 == 0:
-            print(f"  Обработано: {i+1:,}/{len(rounds):,}", end='\r')
+            print(f"  Обработано: {i+1:,}/{len(rounds):,} (с фичами: {len(processed_data):,}, пропущено: {skipped_no_prices:,})", end='\r')
 
     print(f"\n✅ Обработано {len(processed_data):,} раундов с фичами")
+    print(f"⚠️  Пропущено (нет цен): {skipped_no_prices:,}")
+
+    if len(processed_data) == 0:
+        print("\n❌ ОШИБКА: Ни один раунд не обработан с фичами!")
+        print("   Проверьте выравнивание временных меток между раундами и Binance свечами")
+        return None
 
     # Сохранение
     print(f"\n💾 Сохранение в {output_file}...")
@@ -493,7 +538,8 @@ def collect_data_fast(w3, contract, n_rounds=1000, output_file='historical_data_
                 'total_rounds': len(processed_data),
                 'start_epoch': processed_data[0]['epoch'] if processed_data else 0,
                 'end_epoch': processed_data[-1]['epoch'] if processed_data else 0,
-                'method': 'fast_parallel'
+                'method': 'fast_parallel',
+                'skipped_no_prices': skipped_no_prices
             },
             'rounds': processed_data
         }, f, indent=2)
@@ -502,12 +548,23 @@ def collect_data_fast(w3, contract, n_rounds=1000, output_file='historical_data_
 
     # Статистика
     outcomes = [r['outcome'] for r in processed_data]
+    phases = [r['phase'] for r in processed_data]
+
     print(f"\n{'='*60}")
     print("СТАТИСТИКА")
     print(f"{'='*60}")
     print(f"Всего раундов: {len(processed_data):,}")
     print(f"UP:   {sum(outcomes):,} ({sum(outcomes)/len(outcomes)*100:.1f}%)")
     print(f"DOWN: {len(outcomes) - sum(outcomes):,} ({(1-sum(outcomes)/len(outcomes))*100:.1f}%)")
+
+    # Распределение по фазам
+    print(f"\nРаспределение по фазам рынка:")
+    phase_names = ['bull_low', 'bull_high', 'bear_low', 'bear_high', 'flat_low', 'flat_high']
+    for ph in range(6):
+        count = sum(1 for p in phases if p == ph)
+        if count > 0:
+            pct = count / len(phases) * 100
+            print(f"  Phase {ph} ({phase_names[ph]:10s}): {count:6,} ({pct:5.1f}%)")
 
     return processed_data
 
