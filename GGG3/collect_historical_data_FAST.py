@@ -39,7 +39,7 @@ PREDICTION_ADDR = "0x18B2A687610328590Bc8F2e5fEdDe3b582A49cdA"
 BINANCE_API = "https://api.binance.com/api/v3/klines"
 
 # ОПТИМИЗАЦИЯ: Параллелизм
-MAX_WORKERS = 20  # Количество параллельных потоков
+MAX_WORKERS = 50  # Количество параллельных потоков (увеличено с 20)
 BATCH_SIZE = 100  # Батчинг по 100 раундов
 SLEEP_BETWEEN_BATCHES = 0.5  # Короткий sleep между батчами
 
