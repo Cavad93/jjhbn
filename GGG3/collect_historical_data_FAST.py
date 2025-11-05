@@ -520,12 +520,14 @@ def main():
             abi=PREDICTION_ABI
         )
 
+        # ВАЖНО: Контракт BNB/USD Prediction V2 начался ПОСЛЕ 2022-01-01
+        # Поэтому собираем ВСЕ данные с epoch 1 (не фильтруем по дате)
         data = collect_data_fast(
             w3,
             contract,
-            n_rounds=500000,  # Цель: 500k валидных раундов (с 2022-01-01)
-            output_file='pancakeswap_historical_2022_FAST.json',
-            use_date_filter=True  # Начинаем с 2022-01-01
+            n_rounds=500000,  # Цель: 500k валидных раундов
+            output_file='pancakeswap_historical_all_FAST.json',
+            use_date_filter=False  # Собираем ВСЁ с epoch 1
         )
 
         if data and len(data) >= 1000:
