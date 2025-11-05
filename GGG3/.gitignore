@@ -1,0 +1,5 @@
+# META test temporary files
+meta_neural_phase_*.csv
+meta_test_state.json
+meta_test_state.json.bak
+.tmp_*
