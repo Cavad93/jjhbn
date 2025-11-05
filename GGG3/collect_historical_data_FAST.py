@@ -8,6 +8,7 @@
 3. Минимальный sleep (0.01s вместо 0.1s)
 4. Переиспользование одного контракта
 5. Кэширование цен из Binance
+6. Бинарный поиск start_epoch по timestamp
 
 СКОРОСТЬ: ~485k раундов за 1-2 часа (вместо 72)
 """
@@ -21,6 +22,10 @@ from typing import List, Dict, Optional
 import requests
 import numpy as np
 from web3 import Web3, HTTPProvider
+
+# ДАТА СТАРТА (с какого момента собираем данные)
+START_DATE = "2022-01-01"
+START_TIMESTAMP = int(datetime.fromisoformat(START_DATE).timestamp())
 
 # Настройки
 RPC_URLS = [
@@ -86,6 +91,59 @@ def connect_web3():
             print(f"  ❌ Не удалось: {str(e)[:50]}")
             continue
     raise Exception("Не удалось подключиться ни к одному BSC RPC")
+
+
+def find_start_epoch_by_timestamp(contract, target_timestamp: int, current_epoch: int) -> int:
+    """
+    Бинарный поиск для нахождения первого epoch с lockTimestamp >= target_timestamp
+
+    Args:
+        contract: Web3 контракт PancakeSwap Prediction
+        target_timestamp: Целевой timestamp (например, 2022-01-01)
+        current_epoch: Текущий epoch контракта
+
+    Returns:
+        Epoch номер, с которого начинать сбор данных
+    """
+    print(f"\n🔍 Поиск start_epoch для {datetime.fromtimestamp(target_timestamp).strftime('%Y-%m-%d')}...")
+
+    left = 1
+    right = current_epoch
+    result = 1
+
+    # Бинарный поиск
+    while left <= right:
+        mid = (left + right) // 2
+
+        try:
+            round_data = contract.functions.rounds(mid).call()
+            lock_timestamp = round_data[2]  # lockTimestamp
+
+            if lock_timestamp >= target_timestamp:
+                result = mid
+                right = mid - 1  # Ищем еще раньше
+            else:
+                left = mid + 1  # Ищем позже
+
+            # Прогресс (каждые большие шаги)
+            if (right - left) % 10000 == 0:
+                date_str = datetime.fromtimestamp(lock_timestamp).strftime('%Y-%m-%d %H:%M')
+                print(f"  Проверка epoch {mid:,} (дата: {date_str})...", end='\r')
+
+        except Exception as e:
+            # Если раунд не существует, ищем позже
+            left = mid + 1
+
+    # Проверяем результат
+    try:
+        round_data = contract.functions.rounds(result).call()
+        lock_timestamp = round_data[2]
+        date_str = datetime.fromtimestamp(lock_timestamp).strftime('%Y-%m-%d %H:%M')
+        print(f"\n✅ Найден start_epoch: {result:,} (дата: {date_str})")
+    except Exception:
+        print(f"\n⚠️  Используем start_epoch: {result:,}")
+
+    return result
 
 
 def fetch_round_batch(contract, epochs: List[int]) -> List[Optional[Dict]]:
@@ -303,13 +361,16 @@ def calculate_features_from_prices(price_window):
     }
 
 
-def collect_data_fast(w3, contract, n_rounds=1000, output_file='historical_data_fast.json'):
+def collect_data_fast(w3, contract, n_rounds=1000, output_file='historical_data_fast.json', use_date_filter=True):
     """
     БЫСТРЫЙ сбор данных с параллелизмом
+
+    Args:
+        use_date_filter: Если True, начинает с START_DATE (2022-01-01), иначе с (current - n_rounds)
     """
     print(f"\n{'='*60}")
     print(f"БЫСТРЫЙ СБОР ИСТОРИЧЕСКИХ ДАННЫХ")
-    print(f"Цель: {n_rounds:,} раундов")
+    print(f"Цель: {n_rounds:,} валидных раундов")
     print(f"Потоков: {MAX_WORKERS}, Батч: {BATCH_SIZE}")
     print(f"{'='*60}\n")
 
@@ -317,10 +378,17 @@ def collect_data_fast(w3, contract, n_rounds=1000, output_file='historical_data_
     current_epoch = contract.functions.currentEpoch().call()
     print(f"📍 Текущий epoch: {current_epoch:,}")
 
-    start_epoch = max(1, current_epoch - n_rounds - 100)
+    # Определяем start_epoch
+    if use_date_filter:
+        start_epoch = find_start_epoch_by_timestamp(contract, START_TIMESTAMP, current_epoch)
+    else:
+        start_epoch = max(1, current_epoch - n_rounds - 100)
+
     end_epoch = current_epoch - 10
 
-    print(f"📥 Загрузка раундов {start_epoch:,} - {end_epoch:,}...\n")
+    total_to_check = end_epoch - start_epoch + 1
+    print(f"\n📥 Загрузка раундов {start_epoch:,} - {end_epoch:,}")
+    print(f"   Всего для проверки: {total_to_check:,} раундов\n")
 
     # ========== ФАЗА 1: ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА РАУНДОВ ==========
     all_epochs = list(range(start_epoch, end_epoch + 1))
@@ -455,8 +523,9 @@ def main():
         data = collect_data_fast(
             w3,
             contract,
-            n_rounds=485000,  # Собираем ВСЁ
-            output_file='pancakeswap_historical_485k_FAST.json'
+            n_rounds=500000,  # Цель: 500k валидных раундов (с 2022-01-01)
+            output_file='pancakeswap_historical_2022_FAST.json',
+            use_date_filter=True  # Начинаем с 2022-01-01
         )
 
         if data and len(data) >= 1000:
