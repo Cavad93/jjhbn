@@ -50,20 +50,31 @@ REM Откройте .env в Блокноте
 notepad .env
 ```
 
-**Минимальная конфигурация** (для начала):
+**Минимальная конфигурация** (для paper trading):
 
 ```ini
-# Обязательные настройки:
-BINANCE_API_KEY=your_api_key_here
-BINANCE_SECRET_KEY=your_secret_key_here
-USE_TESTNET=true
-
-# Опциональные (можно оставить пустыми):
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
+# ⚙️ ГЛАВНАЯ НАСТРОЙКА - Paper trading с реальными данными рынка
 PAPER_TRADING_MODE=true
 PAPER_INITIAL_BALANCE=10000
+USE_TESTNET=false
+
+# 🔑 API КЛЮЧИ (НЕ НУЖНЫ ДЛЯ PAPER TRADING!)
+# Бот использует ПУБЛИЧНЫЕ API для реальных данных рынка
+# Оставьте пустыми:
+BINANCE_API_KEY=
+BINANCE_SECRET_KEY=
+
+# 📱 TELEGRAM (опционально, можно оставить пустыми):
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 ```
+
+✅ **Готово!** Вам НЕ нужны API ключи Binance для paper trading!
+
+Бот будет:
+- Получать реальные данные рынка через публичные API
+- Вести виртуальную торговлю ($10,000 начальный капитал)
+- Работать без доступа к вашему аккаунту Binance
 
 **Сохраните файл**: Файл → Сохранить, затем закройте Блокнот
 

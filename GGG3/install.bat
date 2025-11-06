@@ -235,22 +235,24 @@ echo %BLUE%=====================================================================
 echo.
 echo %GREEN%Что дальше?%NC%
 echo.
-echo 1. Настройте .env файл:
+echo %GREEN%[ГОТОВО К ЗАПУСКУ!]%NC% Для paper trading API ключи НЕ нужны!
+echo.
+echo 1. %YELLOW%[ОПЦИОНАЛЬНО]%NC% Проверьте .env файл:
 echo    notepad .env
 echo.
-echo 2. Добавьте ваши Binance API ключи:
-echo    - BINANCE_API_KEY
-echo    - BINANCE_SECRET_KEY
+echo    %GREEN%Для paper trading оставьте как есть:%NC%
+echo    - PAPER_TRADING_MODE=true
+echo    - USE_TESTNET=false (для реальных данных рынка!)
+echo    - BINANCE_API_KEY= (пустое)
+echo    - BINANCE_SECRET_KEY= (пустое)
 echo.
-echo 3. (Опционально) Настройте Telegram уведомления:
-echo    - TELEGRAM_BOT_TOKEN
-echo    - TELEGRAM_CHAT_ID
-echo.
-echo 4. Запустите бота в paper trading режиме:
+echo 2. Запустите бота в paper trading режиме:
 echo    start_bot.bat
 echo.
-echo 5. В другом окне следите за логами:
+echo 3. В другом окне следите за логами:
 echo    tail_logs.bat
+echo.
+echo %BLUE%[i]%NC% API ключи нужны ТОЛЬКО для live trading (реальные деньги)
 echo.
 echo %YELLOW%ВАЖНО:%NC%
 echo    - Начните с PAPER TRADING режима
