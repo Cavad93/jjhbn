@@ -32,6 +32,10 @@ models/saved/*.pt
 models/saved/*.json
 !models/saved/.gitkeep
 
+# Portfolio state files
+portfolio/reinvestment_state.json
+portfolio/*_state.json
+
 # IDE
 .vscode/
 .idea/
