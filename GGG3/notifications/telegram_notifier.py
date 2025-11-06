@@ -131,6 +131,9 @@ class TelegramNotifier:
                 - p_up: Вероятность роста (META)
                 - ev: Expected Value
                 - predictions: Предсказания экспертов (опционально)
+                - reserve_fund: Резервный фонд (опционально)
+                - trading_capital: Торговый капитал (опционально)
+                - total_equity: Общий капитал (опционально)
         """
         symbol = position_data.get('symbol', 'UNKNOWN')
         direction = position_data.get('direction', 'UNKNOWN')
@@ -165,6 +168,20 @@ class TelegramNotifier:
 🎯 P(up): {p_up:.1%}
 💰 EV: {ev:+.2%}
         """.strip()
+
+        # Добавляем информацию о резервном фонде (если есть)
+        reserve_fund = position_data.get('reserve_fund')
+        trading_capital = position_data.get('trading_capital')
+        total_equity = position_data.get('total_equity')
+
+        if reserve_fund is not None and trading_capital is not None:
+            text += f"\n\n<b>💼 Капитал:</b>"
+            text += f"\n  • Торговый: ${trading_capital:,.2f}"
+            text += f"\n  • Резервный: ${reserve_fund:,.2f}"
+            if total_equity is not None:
+                text += f"\n  • Общий: ${total_equity:,.2f}"
+                reserve_pct = (reserve_fund / total_equity * 100) if total_equity > 0 else 0
+                text += f"\n  • Резерв: {reserve_pct:.1f}% от капитала"
 
         # Добавляем предсказания экспертов если есть
         predictions = position_data.get('predictions')

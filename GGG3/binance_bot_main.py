@@ -474,9 +474,16 @@ class BinanceTradingBot:
             capital = self.exchange.get_balance('USDT')
 
             # Apply reinvestment if enabled (paper trading only)
+            reserve_fund = None
+            trading_capital = None
+            total_equity = None
+
             if self.paper_mode and self.reinvestment and self.reinvestment.enabled:
                 reinvest_result = self.reinvestment.calculate_daily_reinvestment(capital)
                 capital = reinvest_result['trading_capital']
+                reserve_fund = reinvest_result['reserve_fund']
+                trading_capital = reinvest_result['trading_capital']
+                total_equity = reinvest_result['total_equity']
 
                 # Log reserve fund info
                 if reinvest_result['reinvested']:
@@ -571,6 +578,15 @@ class BinanceTradingBot:
                     'ev': opportunity['ev'],
                     'predictions': opportunity.get('predictions', {})
                 }
+
+                # Добавляем информацию о резервном фонде (если доступно)
+                if reserve_fund is not None:
+                    position_data['reserve_fund'] = reserve_fund
+                if trading_capital is not None:
+                    position_data['trading_capital'] = trading_capital
+                if total_equity is not None:
+                    position_data['total_equity'] = total_equity
+
                 self.telegram.notify_position_opened(position_data)
 
         except Exception as e:
