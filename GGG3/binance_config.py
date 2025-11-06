@@ -342,16 +342,36 @@ TELEGRAM_ALERTS_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 # Типы уведомлений
 TELEGRAM_ALERT_TYPES = {
+    # Бот
+    'bot_started': True,          # Старт бота
+    'bot_stopped': True,          # Остановка бота
+
+    # Позиции
     'position_opened': True,      # Открыта новая позиция
     'position_closed': True,      # Закрыта позиция
     'tp_hit': True,               # Достигнут TP
     'sl_hit': True,               # Достигнут SL
-    'error': True,                # Критическая ошибка
+
+    # Риск-менеджмент
+    'trailing_stop': True,        # Активирован trailing stop
+    'black_swan': True,           # Black swan event
+    'night_mode': True,           # Night mode активирован/деактивирован
+
+    # Портфель
+    'rebalance': True,            # Ребалансировка портфеля
+
+    # Обучение
+    'online_learning': False,     # Online learning (может быть шумно)
+    'model_retrained': False,     # Модель переобучена (может быть шумно)
+
+    # Статистика
     'daily_summary': True,        # Ежедневная сводка
     'weekly_summary': True,       # Еженедельная сводка
+
+    # Предупреждения
     'balance_milestone': True,    # Достигнут баланс milestone
     'drawdown_warning': True,     # Предупреждение о просадке
-    'model_retrained': False,     # Модель переобучена (может быть шумно)
+    'error': True,                # Критическая ошибка
 }
 
 # Время отправки ежедневной сводки (UTC)

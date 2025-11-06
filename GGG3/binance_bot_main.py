@@ -59,6 +59,9 @@ from risk.night_mode import NightModeManager
 # Paper trading
 from paper_trading.paper_exchange import PaperExchange
 
+# Notifications
+from notifications.telegram_notifier import TelegramNotifier
+
 # Logging
 logging.basicConfig(
     level=config.LOG_LEVEL,
@@ -137,6 +140,13 @@ class BinanceTradingBot:
         self.black_swan = BlackSwanProtection()
         self.night_mode = NightModeManager()
 
+        # Telegram notifier
+        self.telegram = TelegramNotifier(
+            bot_token=config.TELEGRAM_BOT_TOKEN,
+            chat_id=config.TELEGRAM_CHAT_ID,
+            enabled=config.TELEGRAM_ALERTS_ENABLED
+        )
+
         # Statistics
         self.total_closed_trades = len(self.position_manager.closed_positions)
         self.stats = {
@@ -147,6 +157,14 @@ class BinanceTradingBot:
 
         print("\n✅ Bot initialized successfully\n")
         print("="*80)
+
+        # Send bot started notification
+        if config.TELEGRAM_ALERT_TYPES.get('bot_started', True):
+            self.telegram.notify_bot_started(
+                paper_mode=self.paper_mode,
+                initial_capital=config.PAPER_INITIAL_BALANCE if self.paper_mode else 0.0,
+                max_positions=config.MAX_POSITIONS
+            )
 
     def _load_experts(self) -> Dict:
         """Загружает ML экспертов"""
@@ -287,13 +305,46 @@ class BinanceTradingBot:
         """
 
         # Защитные режимы
-        if self.black_swan.check_black_swan_event():
-            print("⚠️  BLACK SWAN EVENT: Skipping new entries")
+        is_black_swan = self.black_swan.check_black_swan_event()
+        if is_black_swan:
+            print("⚠️  BLACK SWAN EVENT: Closing all positions and skipping new entries")
+
+            # Закрываем все открытые позиции
+            open_positions = list(self.position_manager.get_all_open())
+            positions_closed = len(open_positions)
+
+            for position in open_positions:
+                self.close_position_manual(position)
+
+            # Send Telegram notification
+            if config.TELEGRAM_ALERT_TYPES.get('black_swan', True):
+                # Получаем процент падения BTC (если доступно)
+                btc_drop = 5.0  # TODO: получить реальное значение из black_swan
+                self.telegram.notify_black_swan_triggered(
+                    btc_drop=btc_drop,
+                    positions_closed=positions_closed
+                )
+
             return
 
-        if self.night_mode.is_night_mode_active():
+        # Night mode
+        is_night_mode = self.night_mode.is_night_mode_active()
+        if is_night_mode:
             print("🌙 NIGHT MODE: Reducing activity")
-            # Не блокируем полностью, но будем более осторожны
+
+            # Send Telegram notification (только при первой проверке в night mode)
+            # Используем hasattr для отслеживания состояния
+            if not hasattr(self, '_night_mode_notified') or not self._night_mode_notified:
+                if config.TELEGRAM_ALERT_TYPES.get('night_mode', True):
+                    max_pos = self.night_mode.get_max_positions()
+                    self.telegram.notify_night_mode_activated(max_positions=max_pos)
+                    self._night_mode_notified = True
+        else:
+            # Деактивация night mode
+            if hasattr(self, '_night_mode_notified') and self._night_mode_notified:
+                if config.TELEGRAM_ALERT_TYPES.get('night_mode', True):
+                    self.telegram.notify_night_mode_deactivated()
+                    self._night_mode_notified = False
 
         # Получаем все торгуемые пары
         print("Fetching all USDT pairs...")
@@ -358,7 +409,20 @@ class BinanceTradingBot:
             # Открываем позицию
             self.open_position(opp)
 
-        print(f"\n  Portfolio status: {len(self.position_manager.get_all_open())}/{config.MAX_POSITIONS} positions")
+        final_positions = len(self.position_manager.get_all_open())
+        print(f"\n  Portfolio status: {final_positions}/{config.MAX_POSITIONS} positions")
+
+        # Send Telegram notification
+        if config.TELEGRAM_ALERT_TYPES.get('rebalance', True):
+            # Подсчитываем изменения (приблизительно)
+            # В идеале нужно считать до и после, но это упрощенная версия
+            stats = {
+                'closed_positions': 0,  # TODO: track actual count
+                'opened_positions': 0,  # TODO: track actual count
+                'total_positions': final_positions,
+                'top_opportunities': top_opportunities[:5]  # Top 5
+            }
+            self.telegram.notify_rebalance_stats(stats)
 
     # ========================================================================
     # POSITION MANAGEMENT
@@ -470,6 +534,22 @@ class BinanceTradingBot:
             print(f"  Size:   ${position_size_usd:.2f}")
             print(f"  ✅ Position opened")
 
+            # Send Telegram notification
+            if config.TELEGRAM_ALERT_TYPES.get('position_opened', True):
+                position_data = {
+                    'symbol': symbol,
+                    'direction': direction,
+                    'entry_price': current_price,
+                    'position_size': position_size_usd,
+                    'leverage': config.LEVERAGE,
+                    'tp_price': tp_price,
+                    'sl_price': sl_price,
+                    'p_up': opportunity['p_up'],
+                    'ev': opportunity['ev'],
+                    'predictions': opportunity.get('predictions', {})
+                }
+                self.telegram.notify_position_opened(position_data)
+
         except Exception as e:
             logger.error(f"Error opening position {symbol}: {e}", exc_info=True)
             print(f"  ❌ Error: {e}")
@@ -512,6 +592,13 @@ class BinanceTradingBot:
                 new_sl = self.trailing_stop.check_trailing_stop(position, current_price)
                 if new_sl is not None:
                     print(f"[{position.symbol}] Trailing stop: SL {position.sl_price:.2f} → {new_sl:.2f}")
+
+                    # Рассчитываем прибыль
+                    if position.direction == 'LONG':
+                        profit_pct = ((current_price - position.entry_price) / position.entry_price) * 100
+                    else:
+                        profit_pct = ((position.entry_price - current_price) / position.entry_price) * 100
+
                     # Обновляем SL
                     self.exchange.cancel_order(position.symbol, position.sl_order_id)
                     sl_order = self.exchange.create_stop_market_order(
@@ -522,6 +609,16 @@ class BinanceTradingBot:
                     )
                     position.sl_order_id = sl_order['id']
                     position.sl_price = new_sl
+
+                    # Send Telegram notification
+                    if config.TELEGRAM_ALERT_TYPES.get('trailing_stop', True):
+                        self.telegram.notify_trailing_stop_activated(
+                            symbol=position.symbol,
+                            direction=position.direction,
+                            current_price=current_price,
+                            new_sl=new_sl,
+                            profit_pct=profit_pct
+                        )
 
                 # Проверяем timeout
                 duration_hours = (datetime.now() - position.entry_time).total_seconds() / 3600
@@ -574,6 +671,21 @@ class BinanceTradingBot:
         # Сбрасываем trailing stop
         self.trailing_stop.reset_position(position.symbol)
 
+        # Send Telegram notification
+        if config.TELEGRAM_ALERT_TYPES.get('position_closed', True):
+            position_data = {
+                'symbol': position.symbol,
+                'direction': position.direction,
+                'entry_price': position.entry_price,
+                'exit_price': exit_price,
+                'position_size': position.position_value,
+                'pnl': position.pnl,
+                'pnl_percent': position.pnl_pct,
+                'exit_reason': exit_reason,
+                'holding_time': f"{duration:.1f}h"
+            }
+            self.telegram.notify_position_closed(position_data)
+
     def close_position_manual(self, position: Position):
         """Ручное закрытие позиции (для таймаута или замены)"""
         try:
@@ -606,6 +718,11 @@ class BinanceTradingBot:
         print("\nShutting down...")
         self.position_manager.save_to_file()
         print("✅ Positions saved")
+
+        # Send bot stopped notification
+        if config.TELEGRAM_ALERT_TYPES.get('bot_stopped', True):
+            self.telegram.notify_bot_stopped(reason="Manual shutdown")
+
         print("✅ Bot stopped")
 
 
