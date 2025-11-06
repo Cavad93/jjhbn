@@ -1,5 +1,40 @@
+# Environment variables (ВАЖНО: не коммитьте секреты!)
+.env
+.env.local
+*.key
+credentials.json
+
 # META test temporary files
 meta_neural_phase_*.csv
 meta_test_state.json
 meta_test_state.json.bak
 .tmp_*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Logs
+logs/
+*.log
+
+# Data
+data/
+*.db
+*.sqlite
+
+# Models
+models/saved/*.pkl
+models/saved/*.pt
+models/saved/*.json
+!models/saved/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

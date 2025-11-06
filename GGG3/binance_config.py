@@ -6,13 +6,25 @@
 ВАЖНО:
 - По умолчанию используется paper trading (виртуальные деньги)
 - Для реальной торговли установите PAPER_TRADING_MODE = False
-- API ключи загружаются из переменных окружения
+- API ключи загружаются из переменных окружения или .env файла
 """
 
 import os
 from pathlib import Path
 from typing import Dict, List, Any
 import logging
+
+# Загрузка переменных окружения из .env файла (если существует)
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).parent / '.env'
+    if env_path.exists():
+        load_dotenv(env_path)
+        logger = logging.getLogger(__name__)
+        logger.info(f"Loaded environment variables from {env_path}")
+except ImportError:
+    # python-dotenv не установлен - используем только export переменные
+    pass
 
 logger = logging.getLogger(__name__)
 

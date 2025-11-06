@@ -19,12 +19,30 @@
 
 ### 3. Настройте переменные окружения
 
+**СПОСОБ 1: Через .env файл (рекомендуется)**
+
+```bash
+# Скопируйте пример
+cp .env.example .env
+
+# Отредактируйте .env и добавьте ваши токены
+nano .env
+```
+
+В файле `.env`:
+```bash
+TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
+TELEGRAM_CHAT_ID=123456789
+```
+
+**СПОСОБ 2: Через export (временно, на текущую сессию)**
+
 ```bash
 export TELEGRAM_BOT_TOKEN="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
 export TELEGRAM_CHAT_ID="123456789"
 ```
 
-Или добавьте в `.bashrc` / `.zshrc`:
+**СПОСОБ 3: Через .bashrc (постоянно)**
 
 ```bash
 echo 'export TELEGRAM_BOT_TOKEN="your_token_here"' >> ~/.bashrc
