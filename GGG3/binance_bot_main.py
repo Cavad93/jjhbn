@@ -38,6 +38,7 @@ from binance_api.client import BinanceClient
 
 # Portfolio
 from portfolio.position_manager import PositionManager, Position
+from portfolio.reinvestment import ReinvestmentManager
 
 # Strategy
 from strategy.coin_selector import CoinSelector
@@ -139,6 +140,16 @@ class BinanceTradingBot:
         self.trailing_stop = TrailingStopManager()
         self.black_swan = BlackSwanProtection()
         self.night_mode = NightModeManager()
+
+        # Reinvestment manager (только для paper trading)
+        if paper_mode:
+            self.reinvestment = ReinvestmentManager(
+                initial_capital=config.PAPER_INITIAL_BALANCE,
+                enabled=getattr(config, 'AUTO_REINVEST_ENABLED', True)
+            )
+            print(f"  Reinvestment: Enabled (50% profit → reserve)")
+        else:
+            self.reinvestment = None
 
         # Telegram notifier
         self.telegram = TelegramNotifier(
@@ -462,6 +473,18 @@ class BinanceTradingBot:
             # Размер позиции (Kelly)
             capital = self.exchange.get_balance('USDT')
 
+            # Apply reinvestment if enabled (paper trading only)
+            if self.paper_mode and self.reinvestment and self.reinvestment.enabled:
+                reinvest_result = self.reinvestment.calculate_daily_reinvestment(capital)
+                capital = reinvest_result['trading_capital']
+
+                # Log reserve fund info
+                if reinvest_result['reinvested']:
+                    print(f"  [Reinvest] Daily profit: ${reinvest_result['daily_profit']:.2f}")
+                    print(f"  [Reinvest] To reserve: ${reinvest_result['to_reserve']:.2f}")
+                    print(f"  [Reinvest] Trading capital: ${capital:.2f}")
+                    print(f"  [Reinvest] Reserve fund: ${reinvest_result['reserve_fund']:.2f}")
+
             position_size_usd = calculate_kelly_position_size(
                 capital=capital,
                 ev=opportunity['ev'],
@@ -718,6 +741,10 @@ class BinanceTradingBot:
         print("\nShutting down...")
         self.position_manager.save_to_file()
         print("✅ Positions saved")
+
+        # Print reinvestment summary if enabled
+        if self.paper_mode and self.reinvestment:
+            self.reinvestment.print_summary()
 
         # Send bot stopped notification
         if config.TELEGRAM_ALERT_TYPES.get('bot_stopped', True):
