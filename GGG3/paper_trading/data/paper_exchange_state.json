@@ -1,0 +1,156 @@
+{
+  "balance": 1072.49,
+  "initial_capital": 1000.0,
+  "positions": {
+    "PAPER_A5B638BCF3F3": {
+      "order_id": "PAPER_A5B638BCF3F3",
+      "symbol": "XRPUSDT",
+      "side": "LONG",
+      "amount": 166.67,
+      "entry_price": 0.60,
+      "entry_time": 1699329600,
+      "tp_order_id": "PAPER_TP_12345",
+      "sl_order_id": "PAPER_SL_12345",
+      "metadata": {
+        "entry_snapshot": {
+          "features": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+          "predictions": {
+            "p_xgb": 0.65,
+            "p_rf": 0.62,
+            "p_arf": 0.64
+          },
+          "ev": 0.0625,
+          "direction": "LONG",
+          "timestamp": 1699329600
+        }
+      }
+    },
+    "PAPER_B7C849DDE4E4": {
+      "order_id": "PAPER_B7C849DDE4E4",
+      "symbol": "LTCUSDT",
+      "side": "SHORT",
+      "amount": 14.71,
+      "entry_price": 68.00,
+      "entry_time": 1699333200,
+      "tp_order_id": "PAPER_TP_12346",
+      "sl_order_id": "PAPER_SL_12346",
+      "metadata": {
+        "entry_snapshot": {
+          "features": [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+          "predictions": {
+            "p_xgb": 0.38,
+            "p_rf": 0.35,
+            "p_arf": 0.36
+          },
+          "ev": 0.0450,
+          "direction": "SHORT",
+          "timestamp": 1699333200
+        }
+      }
+    },
+    "PAPER_C8D950EEF5F5": {
+      "order_id": "PAPER_C8D950EEF5F5",
+      "symbol": "BTCUSDT",
+      "side": "LONG",
+      "amount": 0.0222,
+      "entry_price": 45123.45,
+      "entry_time": 1699336800,
+      "tp_order_id": "PAPER_TP_12347",
+      "sl_order_id": "PAPER_SL_12347",
+      "metadata": {
+        "entry_snapshot": {
+          "features": [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+          "predictions": {
+            "p_xgb": 0.68,
+            "p_rf": 0.65,
+            "p_arf": 0.67
+          },
+          "ev": 0.0700,
+          "direction": "LONG",
+          "timestamp": 1699336800
+        }
+      }
+    }
+  },
+  "orders": {
+    "PAPER_TP_12345": {
+      "order_id": "PAPER_TP_12345",
+      "symbol": "XRPUSDT",
+      "side": "SELL",
+      "order_type": "LIMIT",
+      "amount": 166.67,
+      "price": 0.6108,
+      "position_id": "PAPER_A5B638BCF3F3",
+      "status": "ACTIVE"
+    },
+    "PAPER_SL_12345": {
+      "order_id": "PAPER_SL_12345",
+      "symbol": "XRPUSDT",
+      "side": "SELL",
+      "order_type": "STOP",
+      "amount": 166.67,
+      "price": 0.5928,
+      "position_id": "PAPER_A5B638BCF3F3",
+      "status": "ACTIVE"
+    },
+    "PAPER_TP_12346": {
+      "order_id": "PAPER_TP_12346",
+      "symbol": "LTCUSDT",
+      "side": "BUY",
+      "order_type": "LIMIT",
+      "amount": 14.71,
+      "price": 66.64,
+      "position_id": "PAPER_B7C849DDE4E4",
+      "status": "ACTIVE"
+    },
+    "PAPER_SL_12346": {
+      "order_id": "PAPER_SL_12346",
+      "symbol": "LTCUSDT",
+      "side": "BUY",
+      "order_type": "STOP",
+      "amount": 14.71,
+      "price": 69.36,
+      "position_id": "PAPER_B7C849DDE4E4",
+      "status": "ACTIVE"
+    },
+    "PAPER_TP_12347": {
+      "order_id": "PAPER_TP_12347",
+      "symbol": "BTCUSDT",
+      "side": "SELL",
+      "order_type": "LIMIT",
+      "amount": 0.0222,
+      "price": 46308.63,
+      "position_id": "PAPER_C8D950EEF5F5",
+      "status": "ACTIVE"
+    },
+    "PAPER_SL_12347": {
+      "order_id": "PAPER_SL_12347",
+      "symbol": "BTCUSDT",
+      "side": "SELL",
+      "order_type": "STOP",
+      "amount": 0.0222,
+      "price": 44333.33,
+      "position_id": "PAPER_C8D950EEF5F5",
+      "status": "ACTIVE"
+    }
+  },
+  "equity_history": [
+    {"timestamp": 1699286400, "equity": 1000.0, "balance": 1000.0},
+    {"timestamp": 1699290000, "equity": 1005.30, "balance": 1000.0},
+    {"timestamp": 1699293600, "equity": 1012.45, "balance": 1000.0},
+    {"timestamp": 1699297200, "equity": 1025.00, "balance": 1025.0},
+    {"timestamp": 1699300800, "equity": 1050.00, "balance": 1025.0},
+    {"timestamp": 1699304400, "equity": 1043.20, "balance": 1033.3},
+    {"timestamp": 1699308000, "equity": 1056.70, "balance": 1033.3},
+    {"timestamp": 1699311600, "equity": 1060.00, "balance": 1043.8},
+    {"timestamp": 1699315200, "equity": 1065.50, "balance": 1043.8},
+    {"timestamp": 1699318800, "equity": 1070.30, "balance": 1054.3},
+    {"timestamp": 1699322400, "equity": 1075.80, "balance": 1064.3},
+    {"timestamp": 1699326000, "equity": 1072.49, "balance": 1064.59},
+    {"timestamp": 1699329600, "equity": 1080.00, "balance": 1064.59},
+    {"timestamp": 1699333200, "equity": 1085.20, "balance": 1072.49},
+    {"timestamp": 1699336800, "equity": 1090.50, "balance": 1072.49}
+  ],
+  "slippage": 0.0005,
+  "commission": 0.001
+}

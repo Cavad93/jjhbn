@@ -1,0 +1,15 @@
+{
+  "top_10_coins": [
+    {"symbol": "BTCUSDT", "direction": "LONG", "ev": 0.0812, "p_up": 0.632},
+    {"symbol": "ETHUSDT", "direction": "LONG", "ev": 0.0654, "p_up": 0.626},
+    {"symbol": "BNBUSDT", "direction": "SHORT", "ev": 0.0587, "p_up": 0.374},
+    {"symbol": "XRPUSDT", "direction": "LONG", "ev": 0.0625, "p_up": 0.625},
+    {"symbol": "SOLUSDT", "direction": "LONG", "ev": 0.0562, "p_up": 0.622},
+    {"symbol": "ADAUSDT", "direction": "SHORT", "ev": 0.0525, "p_up": 0.379},
+    {"symbol": "DOTUSDT", "direction": "LONG", "ev": 0.0500, "p_up": 0.620},
+    {"symbol": "MATICUSDT", "direction": "SHORT", "ev": 0.0475, "p_up": 0.381},
+    {"symbol": "LINKUSDT", "direction": "LONG", "ev": 0.0450, "p_up": 0.618},
+    {"symbol": "AVAXUSDT", "direction": "LONG", "ev": 0.0425, "p_up": 0.617}
+  ],
+  "last_update": 1699336800
+}
