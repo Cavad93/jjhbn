@@ -39,13 +39,23 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Импортируем наш PaperExchange
 from paper_trading.paper_exchange import PaperExchange, get_binance_price, get_binance_kline
 
-# Попытка импорта ML модулей (могут отсутствовать некоторые)
+# Импорт обученных моделей экспертов
 try:
-    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-    from river.ensemble import AdaptiveRandomForestClassifier
-    import xgboost as xgb
-except ImportError:
-    print("WARNING: Some ML libraries not available. Install: xgboost, scikit-learn, river")
+    from models.experts import XGBoostExpert, RandomForestExpert, AdaptiveRFExpert, NeuralNetworkExpert
+    HAVE_EXPERTS = True
+except ImportError as e:
+    print(f"WARNING: Failed to import experts: {e}")
+    XGBoostExpert = RandomForestExpert = AdaptiveRFExpert = NeuralNetworkExpert = None
+    HAVE_EXPERTS = False
+
+# Импорт feature builder
+try:
+    from features.builder import BinanceFeatureBuilder
+    HAVE_FEATURE_BUILDER = True
+except ImportError as e:
+    print(f"WARNING: Failed to import feature builder: {e}")
+    BinanceFeatureBuilder = None
+    HAVE_FEATURE_BUILDER = False
 
 
 # ============================================================================
@@ -86,7 +96,7 @@ class Config:
     ]
 
     # Paths
-    MODELS_DIR = Path(__file__).parent.parent  # GGG3/
+    MODELS_DIR = Path(__file__).parent.parent / 'models' / 'saved'  # GGG3/models/saved/
     LOGS_DIR = Path(__file__).parent / 'logs'
     DATA_DIR = Path(__file__).parent / 'data'
 
@@ -149,20 +159,40 @@ class ModelsManager:
         logger.info("LOADING ML MODELS")
         logger.info("=" * 80)
 
-        # XGBoost
-        self.models['xgb'] = self._load_model('xgb_model.pkl', 'XGBoost')
+        if not HAVE_EXPERTS:
+            logger.error("Expert models not available - missing imports!")
+            return self.models
 
-        # Random Forest
-        self.models['rf'] = self._load_model('rf_model.pkl', 'RandomForest')
+        # XGBoost Expert
+        self.models['xgb'] = self._load_expert('xgb_expert.pkl', 'XGBoost', XGBoostExpert)
 
-        # Adaptive Random Forest (River)
-        self.models['arf'] = self._load_model('arf_model.pkl', 'AdaptiveRF')
+        # Random Forest Expert
+        self.models['rf'] = self._load_expert('rf_expert.pkl', 'RandomForest', RandomForestExpert)
 
-        # Neural Network
-        self.models['nn'] = self._load_model('nn_model.pkl', 'NeuralNet')
+        # Adaptive Random Forest Expert
+        self.models['arf'] = self._load_expert('arf_expert.pkl', 'AdaptiveRF', AdaptiveRFExpert)
+
+        # Neural Network Expert
+        self.models['nn'] = self._load_expert('nn_expert.pkl', 'NeuralNet', NeuralNetworkExpert)
 
         # META model
-        self.models['meta'] = self._load_model('meta_model.pkl', 'META')
+        meta_path = self.models_dir / 'meta_model.pkl'
+        if meta_path.exists():
+            try:
+                # Загружаем META через train_meta модуль
+                sys.path.insert(0, str(self.models_dir.parent))
+                from models.train_meta import SimpleMetaNetwork
+
+                self.models['meta'] = SimpleMetaNetwork.load(str(meta_path))
+                logger.info(f"✓ [META] Loaded from {meta_path.name}")
+                logger.info(f"  Trained: {self.models['meta'].is_trained}, "
+                           f"Accuracy: {self.models['meta'].train_accuracy:.3f}")
+            except Exception as e:
+                logger.error(f"✗ [META] Failed to load: {e}")
+                self.models['meta'] = None
+        else:
+            logger.warning("[META] Not found - using average of experts")
+            self.models['meta'] = None
 
         loaded = sum(1 for v in self.models.values() if v is not None)
         logger.info(f"Models loaded: {loaded}/{len(self.models)}")
@@ -170,8 +200,8 @@ class ModelsManager:
 
         return self.models
 
-    def _load_model(self, filename: str, model_name: str):
-        """Загружает одну модель"""
+    def _load_expert(self, filename: str, model_name: str, expert_class):
+        """Загружает эксперта используя метод .load()"""
         path = self.models_dir / filename
 
         if not path.exists():
@@ -179,12 +209,15 @@ class ModelsManager:
             return None
 
         try:
-            with open(path, 'rb') as f:
-                model = pickle.load(f)
+            # Используем метод load класса эксперта
+            expert = expert_class.load(str(path))
             logger.info(f"✓ [{model_name}] Loaded from {path.name}")
-            return model
+            logger.info(f"  Trained: {expert.is_trained}, Samples: {expert.train_samples}")
+            return expert
         except Exception as e:
             logger.error(f"✗ [{model_name}] Failed to load: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
 
@@ -195,59 +228,109 @@ class ModelsManager:
 class FeaturesCalculator:
     """Расчет фич для экспертов"""
 
-    @staticmethod
-    def calculate_features(symbol: str, timeframe: str = '5m') -> Optional[np.ndarray]:
+    def __init__(self):
+        """Инициализация с feature builder"""
+        self.feature_builder = BinanceFeatureBuilder() if HAVE_FEATURE_BUILDER else None
+
+    def calculate_features(self, symbol: str) -> Optional[np.ndarray]:
         """
         Рассчитывает 68D вектор фич для символа
 
         Args:
             symbol: торговая пара (например, 'BTCUSDT')
-            timeframe: таймфрейм для расчета
 
         Returns:
             np.ndarray: вектор фич 68D или None при ошибке
         """
+        if not HAVE_FEATURE_BUILDER or self.feature_builder is None:
+            logger.error("BinanceFeatureBuilder not available!")
+            return self._calculate_features_fallback(symbol)
+
         try:
-            # Получаем исторические данные
-            klines = []
-            for i in range(100):  # Получаем 100 свечей для расчета индикаторов
-                kline = get_binance_kline(symbol, timeframe, 1)
-                klines.append(kline)
-                time.sleep(0.1)  # Rate limit
+            # Получаем данные для всех 4 таймфреймов
+            logger.debug(f"Fetching multi-timeframe data for {symbol}...")
 
-            df = pd.DataFrame(klines)
+            df_5m = self._get_klines_df(symbol, '5m', limit=200)
+            df_15m = self._get_klines_df(symbol, '15m', limit=200)
+            df_30m = self._get_klines_df(symbol, '30m', limit=200)
+            df_4h = self._get_klines_df(symbol, '4h', limit=100)
 
-            # Рассчитываем технические индикаторы
-            features = []
+            # Проверяем что данные получены
+            if any(df is None for df in [df_5m, df_15m, df_30m, df_4h]):
+                logger.error(f"Failed to fetch data for {symbol}")
+                return None
 
-            # Price features (10)
-            features.append(df['close'].iloc[-1] / df['close'].iloc[-20] - 1)  # 20-period return
-            features.append(df['close'].iloc[-1] / df['close'].iloc[-50] - 1)  # 50-period return
-            features.extend([0.0] * 8)  # Остальные price features
+            # Рассчитываем фичи через BinanceFeatureBuilder
+            features = self.feature_builder.build_extended_features(
+                df_5m=df_5m,
+                df_15m=df_15m,
+                df_30m=df_30m,
+                df_4h=df_4h,
+                current_time=pd.Timestamp.now()
+            )
 
-            # Volume features (10)
-            features.append(df['volume'].iloc[-1] / df['volume'].iloc[-20:].mean())  # Volume ratio
-            features.extend([0.0] * 9)
-
-            # Volatility features (10)
-            returns = df['close'].pct_change()
-            features.append(returns.std())  # Volatility
-            features.extend([0.0] * 9)
-
-            # Technical indicators (20)
-            # RSI, MACD, BB, etc - упрощенные версии
-            features.extend([0.5] * 20)
-
-            # Market features (8)
-            features.extend([0.0] * 8)
-
-            # Additional features (10)
-            features.extend([0.0] * 10)
-
-            return np.array(features[:68])  # Обрезаем до 68
+            return features
 
         except Exception as e:
             logger.error(f"Failed to calculate features for {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def _get_klines_df(self, symbol: str, timeframe: str, limit: int = 100) -> Optional[pd.DataFrame]:
+        """
+        Получает OHLCV данные для символа
+
+        Args:
+            symbol: торговая пара
+            timeframe: '5m', '15m', '30m', '4h'
+            limit: количество свечей
+
+        Returns:
+            DataFrame с колонками: timestamp, open, high, low, close, volume
+        """
+        try:
+            # Для упрощения используем только последнюю свечу
+            # В production нужно получать через WebSocket или batch API
+            klines = []
+
+            # Получаем limit свечей (упрощенно - в production лучше batch request)
+            for _ in range(min(limit, 20)):  # Ограничиваем для demo
+                kline = get_binance_kline(symbol, timeframe, 1)
+                if kline:
+                    klines.append(kline)
+                time.sleep(0.05)  # Rate limit
+
+            if not klines:
+                return None
+
+            # Создаем DataFrame
+            df = pd.DataFrame(klines)
+
+            # Проверяем наличие всех необходимых колонок
+            required_cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            if not all(col in df.columns for col in required_cols):
+                logger.error(f"Missing required columns in klines data")
+                return None
+
+            # Конвертируем timestamp в datetime
+            if 'timestamp' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+            return df[required_cols]
+
+        except Exception as e:
+            logger.error(f"Failed to get klines for {symbol} {timeframe}: {e}")
+            return None
+
+    def _calculate_features_fallback(self, symbol: str) -> Optional[np.ndarray]:
+        """Fallback расчет фич (упрощенный)"""
+        try:
+            # Простой вектор из zeros (baseline)
+            logger.warning(f"Using fallback features for {symbol}")
+            return np.zeros(68, dtype=np.float64)
+        except Exception as e:
+            logger.error(f"Fallback features failed: {e}")
             return None
 
 
@@ -289,30 +372,45 @@ class EVFilter:
             universe: список всех монет для проверки
 
         Returns:
-            List[Dict]: топ монет с данными {'symbol', 'ev', 'direction', 'p_up'}
+            List[Dict]: топ монет с данными {'symbol', 'ev', 'direction', 'p_up', 'predictions'}
         """
         logger.info(f"[EV Filter] Scanning {len(universe)} coins...")
 
         results = []
+        features_calc = FeaturesCalculator()
 
         for symbol in universe:
             if symbol in self.config.BLACKLIST:
                 continue
 
             try:
-                # Рассчитываем фичи
-                features = FeaturesCalculator.calculate_features(symbol)
+                # Рассчитываем фичи (68D)
+                features = features_calc.calculate_features(symbol)
                 if features is None:
                     continue
 
-                # Получаем предсказания от экспертов (упрощенно)
-                p_up = 0.5  # По умолчанию 50/50
+                # Получаем предсказания от всех 4 экспертов
+                predictions = self._get_expert_predictions(features)
+                if predictions is None:
+                    continue
 
+                # Финальное предсказание
                 if self.models.get('meta') is not None:
-                    # Используем META для предсказания
-                    # В реальности здесь нужно сначала получить предсказания от 4 экспертов
-                    # и затем передать их в META
-                    pass
+                    # Используем META для комбинирования экспертов
+                    expert_probs = np.array([
+                        predictions['p_xgb'],
+                        predictions['p_rf'],
+                        predictions['p_arf'],
+                        predictions['p_nn']
+                    ]).reshape(1, -1)
+
+                    p_up_array = self.models['meta'].predict(expert_probs)
+                    p_up = float(p_up_array[0])
+                    predictions['p_meta'] = p_up
+                else:
+                    # SHADOW mode: используем среднее экспертов
+                    p_up = predictions['p_mean']
+                    predictions['p_meta'] = p_up
 
                 # Рассчитываем EV
                 ev_long, ev_short = self.calculate_ev(p_up)
@@ -323,14 +421,16 @@ class EVFilter:
                         'symbol': symbol,
                         'ev': ev_long,
                         'direction': 'LONG',
-                        'p_up': p_up
+                        'p_up': p_up,
+                        'predictions': predictions
                     })
                 elif ev_short > ev_long and ev_short > self.config.MIN_EV:
                     results.append({
                         'symbol': symbol,
                         'ev': ev_short,
                         'direction': 'SHORT',
-                        'p_up': p_up
+                        'p_up': p_up,
+                        'predictions': predictions
                     })
 
             except Exception as e:
@@ -345,9 +445,66 @@ class EVFilter:
 
         logger.info(f"[EV Filter] Selected {len(top_coins)} coins:")
         for coin in top_coins:
-            logger.info(f"  {coin['symbol']:12s} {coin['direction']:5s} EV={coin['ev']:+.4f} p_up={coin['p_up']:.3f}")
+            preds = coin['predictions']
+            logger.info(f"  {coin['symbol']:12s} {coin['direction']:5s} EV={coin['ev']:+.4f} "
+                       f"p_up={coin['p_up']:.3f} [XGB:{preds['p_xgb']:.2f} RF:{preds['p_rf']:.2f} "
+                       f"NN:{preds['p_nn']:.2f}]")
 
         return top_coins
+
+    def _get_expert_predictions(self, features: np.ndarray) -> Optional[Dict]:
+        """
+        Получает предсказания от всех экспертов
+
+        Args:
+            features: 68D вектор фич
+
+        Returns:
+            Dict с предсказаниями {'p_xgb', 'p_rf', 'p_arf', 'p_nn', 'p_mean'}
+        """
+        try:
+            predictions = {}
+            reg_ctx = {'phase': 0}  # Можно добавить определение фазы
+
+            # XGBoost
+            if self.models.get('xgb') is not None:
+                p_xgb, meta = self.models['xgb'].proba_up(features, reg_ctx)
+                predictions['p_xgb'] = p_xgb
+            else:
+                predictions['p_xgb'] = 0.5
+
+            # Random Forest
+            if self.models.get('rf') is not None:
+                p_rf, meta = self.models['rf'].proba_up(features, reg_ctx)
+                predictions['p_rf'] = p_rf
+            else:
+                predictions['p_rf'] = 0.5
+
+            # Adaptive Random Forest
+            if self.models.get('arf') is not None:
+                p_arf, meta = self.models['arf'].proba_up(features, reg_ctx)
+                predictions['p_arf'] = p_arf
+            else:
+                predictions['p_arf'] = 0.5
+
+            # Neural Network
+            if self.models.get('nn') is not None:
+                p_nn, meta = self.models['nn'].proba_up(features, reg_ctx)
+                predictions['p_nn'] = p_nn
+            else:
+                predictions['p_nn'] = 0.5
+
+            # Среднее предсказание
+            probs = [predictions['p_xgb'], predictions['p_rf'], predictions['p_arf'], predictions['p_nn']]
+            predictions['p_mean'] = np.mean(probs)
+
+            return predictions
+
+        except Exception as e:
+            logger.error(f"Failed to get expert predictions: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
 
 # ============================================================================
@@ -669,26 +826,62 @@ class PaperTradingBot:
                 logger.debug("No entry snapshot for online learning")
                 return
 
-            # Определяем outcome
+            # Определяем outcome: 1 если TP, 0 если SL
             outcome = 1 if position['close_reason'] == 'tp' else 0
 
             # Получаем фичи из snapshot (temporal consistency!)
             features = np.array(snapshot.get('features', []))
 
-            if len(features) == 0:
-                logger.debug("No features in snapshot")
+            if len(features) == 0 or len(features) != 68:
+                logger.debug(f"Invalid features in snapshot: {len(features)}")
                 return
 
-            # Обучаем модели (здесь упрощенно, в реальности нужно вызвать методы моделей)
-            logger.debug(f"Online learning: {position['symbol']} outcome={outcome}")
+            # Обучаем все эксперты online
+            logger.info(f"[Online Learning] {position['symbol']} outcome={outcome} ({position['close_reason']})")
 
-            # Пример для River ARF (incremental learning)
-            if self.models.get('arf') is not None:
-                # arf.learn_one(features_dict, outcome)
-                pass
+            features_2d = features.reshape(1, -1)
+            y = np.array([outcome])
+
+            # XGBoost - добавляем новые деревья
+            if self.models.get('xgb') is not None and HAVE_EXPERTS:
+                try:
+                    self.models['xgb'].partial_fit(features_2d, y, n_new_trees=5)
+                    logger.debug("  ✓ XGBoost updated")
+                except Exception as e:
+                    logger.error(f"  ✗ XGBoost update failed: {e}")
+
+            # Random Forest - добавляем новые деревья
+            if self.models.get('rf') is not None and HAVE_EXPERTS:
+                try:
+                    self.models['rf'].partial_fit(features_2d, y, n_new_trees=5)
+                    logger.debug("  ✓ RandomForest updated")
+                except Exception as e:
+                    logger.error(f"  ✗ RandomForest update failed: {e}")
+
+            # Adaptive RF - online learning
+            if self.models.get('arf') is not None and HAVE_EXPERTS:
+                try:
+                    self.models['arf'].partial_fit(features_2d, y)
+                    logger.debug("  ✓ AdaptiveRF updated")
+                except Exception as e:
+                    logger.error(f"  ✗ AdaptiveRF update failed: {e}")
+
+            # Neural Network - fine-tuning
+            if self.models.get('nn') is not None and HAVE_EXPERTS:
+                try:
+                    self.models['nn'].partial_fit(features_2d, y, n_epochs=5)
+                    logger.debug("  ✓ NeuralNet updated")
+                except Exception as e:
+                    logger.error(f"  ✗ NeuralNet update failed: {e}")
+
+            # TODO: Online learning для META нейросети
+
+            logger.info(f"[Online Learning] Models updated successfully")
 
         except Exception as e:
             logger.error(f"Failed to update models online: {e}")
+            import traceback
+            traceback.print_exc()
 
     def log_trade_to_csv(self, trade_data: Dict):
         """Сохраняет данные сделки в CSV"""
