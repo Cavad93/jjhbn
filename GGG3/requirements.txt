@@ -30,6 +30,12 @@ ta-lib>=0.4.28
 plotly>=5.17.0
 dash>=2.14.0
 
+# === Database (PostgreSQL for Smart Collector) ===
+asyncpg>=0.29.0
+psycopg2-binary>=2.9.0
+tqdm>=4.65.0  # Progress bars (including async support)
+APScheduler>=3.10.0  # Task scheduling
+
 # === Telegram Bot (for notifications) ===
 python-telegram-bot>=20.0
 
