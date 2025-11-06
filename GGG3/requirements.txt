@@ -1,26 +1,40 @@
 # === Core runtime ===
-numpy
-pandas
+numpy>=1.24.0
+pandas>=2.0.0
 scipy
-scikit-learn
+scikit-learn>=1.3.0
 requests
 urllib3
 python-dotenv
 web3
-river
+river>=0.20.0
 matplotlib
-cma
+cma>=3.3.0
 
-# === ML models (используются экспертами/МЕТОЙ) ===
-xgboost
+# === ML models ===
+xgboost>=2.0.0
 lightgbm
 
-# === NN head (опционально; нужно, если используете nn/nn_auc_head.py) ===
-torch
+# === NN head (optional; if using nn/nn_auc_head.py) ===
+torch>=2.0.0
 libauc
 
-# === Testing (опционально) ===
+# === Exchange APIs (for paper trading and real trading) ===
+python-binance>=1.0.19
+ccxt>=4.0.0
+
+# === Technical Analysis ===
+ta-lib>=0.4.28
+
+# === Dashboard and Visualization ===
+plotly>=5.17.0
+dash>=2.14.0
+
+# === Telegram Bot (for notifications) ===
+python-telegram-bot>=20.0
+
+# === Testing ===
 pytest
 
-# === Совместимость (только для старых версий Python) ===
+# === Compatibility (only for older Python versions) ===
 backports.zoneinfo; python_version < "3.9"
