@@ -44,6 +44,12 @@ def get_binance_price(symbol: str) -> float:
     """
     Получает текущую цену с Binance API
 
+    Uses MAINNET endpoints (not testnet):
+    - Primary: https://api.binance.com
+    - Fallback: https://api1.binance.com, https://api-gcp.binance.com
+
+    NO API KEYS REQUIRED - uses public market data endpoints
+
     Args:
         symbol: Торговая пара (например, 'BTCUSDT')
 
@@ -53,34 +59,57 @@ def get_binance_price(symbol: str) -> float:
     Raises:
         Exception: Ошибка при получении цены
     """
-    try:
-        # Убираем возможные суффиксы и форматируем символ
-        symbol = symbol.replace('/', '').upper()
+    # Убираем возможные суффиксы и форматируем символ
+    symbol = symbol.replace('/', '').upper()
 
-        url = f"https://api.binance.com/api/v3/ticker/price"
-        params = {'symbol': symbol}
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json'
-        }
+    # MAINNET endpoints (НЕ testnet!)
+    base_urls = [
+        "https://api.binance.com",           # Primary mainnet
+        "https://api1.binance.com",          # Alternative mainnet
+        "https://api-gcp.binance.com",       # GCP CDN mainnet
+        "https://data-api.binance.vision"    # Historical data mainnet
+    ]
 
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-        response.raise_for_status()
+    params = {'symbol': symbol}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json'
+    }
 
-        data = response.json()
-        price = float(data['price'])
+    last_error = None
 
-        return price
+    # Try each endpoint with fallback
+    for base_url in base_urls:
+        try:
+            url = f"{base_url}/api/v3/ticker/price"
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            response.raise_for_status()
 
-    except requests.exceptions.RequestException as e:
-        raise Exception(f"Failed to get price for {symbol}: {e}")
-    except (KeyError, ValueError) as e:
-        raise Exception(f"Invalid response format for {symbol}: {e}")
+            data = response.json()
+            price = float(data['price'])
+
+            return price
+
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            continue  # Try next endpoint
+        except (KeyError, ValueError) as e:
+            last_error = e
+            continue
+
+    # All endpoints failed
+    raise Exception(f"Failed to get price for {symbol} from all endpoints: {last_error}")
 
 
 def get_binance_kline(symbol: str, interval: str = '4h', limit: int = 1) -> Dict:
     """
     Получает данные свечи (OHLC) с Binance API
+
+    Uses MAINNET endpoints (not testnet):
+    - Primary: https://api.binance.com
+    - Fallback: https://api1.binance.com, https://api-gcp.binance.com
+
+    NO API KEYS REQUIRED - uses public market data endpoints
 
     Args:
         symbol: Торговая пара (например, 'BTCUSDT')
@@ -90,43 +119,60 @@ def get_binance_kline(symbol: str, interval: str = '4h', limit: int = 1) -> Dict
     Returns:
         Dict: Словарь с данными свечи (open, high, low, close, volume)
     """
-    try:
-        symbol = symbol.replace('/', '').upper()
+    symbol = symbol.replace('/', '').upper()
 
-        url = "https://api.binance.com/api/v3/klines"
-        params = {
-            'symbol': symbol,
-            'interval': interval,
-            'limit': limit
-        }
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json'
-        }
+    # MAINNET endpoints (НЕ testnet!)
+    base_urls = [
+        "https://api.binance.com",           # Primary mainnet
+        "https://api1.binance.com",          # Alternative mainnet
+        "https://api-gcp.binance.com",       # GCP CDN mainnet
+        "https://data-api.binance.vision"    # Historical data mainnet
+    ]
 
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-        response.raise_for_status()
+    params = {
+        'symbol': symbol,
+        'interval': interval,
+        'limit': limit
+    }
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json'
+    }
 
-        data = response.json()
-        if not data:
-            raise Exception(f"No kline data for {symbol}")
+    last_error = None
 
-        # Последняя свеча
-        kline = data[-1]
+    # Try each endpoint with fallback
+    for base_url in base_urls:
+        try:
+            url = f"{base_url}/api/v3/klines"
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            response.raise_for_status()
 
-        return {
-            'open': float(kline[1]),
-            'high': float(kline[2]),
-            'low': float(kline[3]),
-            'close': float(kline[4]),
-            'volume': float(kline[5]),
-            'timestamp': int(kline[0])
-        }
+            data = response.json()
+            if not data:
+                raise Exception(f"No kline data for {symbol}")
 
-    except requests.exceptions.RequestException as e:
-        raise Exception(f"Failed to get kline for {symbol}: {e}")
-    except (KeyError, ValueError, IndexError) as e:
-        raise Exception(f"Invalid kline response format for {symbol}: {e}")
+            # Последняя свеча
+            kline = data[-1]
+
+            return {
+                'open': float(kline[1]),
+                'high': float(kline[2]),
+                'low': float(kline[3]),
+                'close': float(kline[4]),
+                'volume': float(kline[5]),
+                'timestamp': int(kline[0])
+            }
+
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            continue  # Try next endpoint
+        except (KeyError, ValueError, IndexError) as e:
+            last_error = e
+            continue
+
+    # All endpoints failed
+    raise Exception(f"Failed to get kline for {symbol} from all endpoints: {last_error}")
 
 
 # ============================================================================
