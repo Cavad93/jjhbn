@@ -40,13 +40,32 @@
 - **Python**: 3.9 или выше (рекомендуется 3.11+)
 - **RAM**: 4GB минимум, 8GB рекомендуется
 - **Диск**: 2GB свободного места
-- **ОС**: Linux, macOS, Windows (WSL2)
+- **ОС**:
+  - ✅ **Windows** Server 2012 R2 / Windows 10 / Windows 11
+  - ✅ **Linux** (Ubuntu, Debian, CentOS)
+  - ✅ **macOS**
 
 ---
 
 ## 🚀 Быстрый старт (5 минут)
 
-### 1. Автоматическая установка
+### Для Windows (Server 2012 R2 / 10 / 11)
+
+```batch
+REM Откройте Command Prompt (cmd.exe)
+cd C:\path\to\jjhbn\GGG3
+
+REM Запустите автоматическую установку
+install.bat
+```
+
+**📚 Документация для Windows:**
+- [QUICK_START_WINDOWS.md](QUICK_START_WINDOWS.md) - Быстрый старт
+- [INSTALLATION_GUIDE_WINDOWS.md](INSTALLATION_GUIDE_WINDOWS.md) - Полное руководство
+
+---
+
+### Для Linux / macOS
 
 ```bash
 # Клонируйте репозиторий (если ещё не сделано)
@@ -106,15 +125,44 @@ tail -f logs/binance_bot.log
 
 ## 📚 Документация
 
-- **[QUICK_START.md](QUICK_START.md)** - Быстрый старт за 5 команд
-- **[INSTALLATION_GUIDE.md](INSTALLATION_GUIDE.md)** - Полное руководство по установке и настройке
-- **[BOT_ARCHITECTURE.md](BOT_ARCHITECTURE.md)** - Детальное описание архитектуры и принятия решений
+### Для Windows
+- **[QUICK_START_WINDOWS.md](QUICK_START_WINDOWS.md)** - Быстрый старт за 5 команд (Windows)
+- **[INSTALLATION_GUIDE_WINDOWS.md](INSTALLATION_GUIDE_WINDOWS.md)** - Полное руководство (Windows)
+
+### Для Linux / macOS
+- **[QUICK_START.md](QUICK_START.md)** - Быстрый старт за 5 команд (Linux/macOS)
+- **[INSTALLATION_GUIDE.md](INSTALLATION_GUIDE.md)** - Полное руководство (Linux/macOS)
+
+### Общее
+- **[README.md](README.md)** - Этот файл
+- **[BOT_ARCHITECTURE.md](BOT_ARCHITECTURE.md)** - Детальное описание архитектуры
 
 ---
 
 ## 🔧 Управление ботом
 
-### Запуск
+### Для Windows
+
+```batch
+REM Запуск бота (интерактивный режим)
+start_bot.bat
+
+REM Запуск в фоновом режиме
+start_bot.bat --background
+
+REM Проверка статуса
+status_bot.bat
+
+REM Просмотр логов
+tail_logs.bat
+
+REM Остановка бота
+stop_bot.bat
+```
+
+---
+
+### Для Linux / macOS
 
 ```bash
 # Интерактивный режим (paper trading)
