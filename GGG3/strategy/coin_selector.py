@@ -393,7 +393,7 @@ class CoinSelector:
 
                 # Получаем предсказание p_up
                 if get_predictions_func:
-                    p_up = get_predictions_func(features, phase, symbol)
+                    p_up = get_predictions_func(features, phase, symbol, df_4h)  # Добавлен df_4h
                 else:
                     # Если нет функции предсказаний, используем dummy значение
                     # В реальности здесь должны быть predictions от ML моделей
