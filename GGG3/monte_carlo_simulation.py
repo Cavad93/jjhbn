@@ -55,6 +55,8 @@ class SimulationResult:
     max_balance: float
     min_balance: float
     days_to_bust: int  # 0 если не обанкротился
+    total_deposited: float = 0.0  # Общая сумма депозитов
+    net_profit: float = 0.0  # Чистая прибыль (final - deposited)
 
 
 class MonteCarloSimulator:
@@ -67,7 +69,8 @@ class MonteCarloSimulator:
         min_position_size: float = 15.0,
         max_position_size: float = 200.0,
         kelly_fraction: float = 0.25,
-        simulation_days: int = 90
+        simulation_days: int = 90,
+        monthly_deposit: float = 0.0
     ):
         self.initial_capital = initial_capital
         self.max_positions = max_positions
@@ -75,6 +78,7 @@ class MonteCarloSimulator:
         self.max_position_size = max_position_size
         self.kelly_fraction = kelly_fraction
         self.simulation_days = simulation_days
+        self.monthly_deposit = monthly_deposit
 
         # Реинвестирование
         self.reserve_fund = 0.0
@@ -190,11 +194,18 @@ class MonteCarloSimulator:
         days_to_bust = 0
         is_busted = False
 
+        total_deposited = self.initial_capital  # Отслеживаем общую сумму депозитов
+
         # R/R ratio
         rr_ratio = params.tp_multiplier / params.sl_multiplier
 
         # Симулируем каждый день
         for day in range(self.simulation_days):
+            # Ежемесячное пополнение (каждые 30 дней)
+            if day > 0 and day % 30 == 0 and self.monthly_deposit > 0:
+                balance += self.monthly_deposit
+                total_deposited += self.monthly_deposit
+
             day_start_balance = balance
             day_start_total = balance + reserve_fund
 
@@ -264,7 +275,8 @@ class MonteCarloSimulator:
 
         # Финальные метрики (с учетом резерва)
         final_balance = balance + reserve_fund
-        total_return_pct = ((final_balance - self.initial_capital) / self.initial_capital) * 100
+        net_profit = final_balance - total_deposited
+        total_return_pct = ((final_balance - total_deposited) / total_deposited) * 100
 
         # Максимальная просадка
         if max_balance > 0:
@@ -293,7 +305,9 @@ class MonteCarloSimulator:
             actual_win_rate=actual_win_rate,
             max_balance=max_balance,
             min_balance=min_balance,
-            days_to_bust=days_to_bust if is_busted else 0
+            days_to_bust=days_to_bust if is_busted else 0,
+            total_deposited=total_deposited,
+            net_profit=net_profit
         )
 
     def run_monte_carlo(
@@ -337,9 +351,11 @@ class MonteCarloSimulator:
 
         # Извлекаем метрики
         final_balances = [r.final_balance for r in results]
+        net_profits = [r.net_profit for r in results]
         returns = [r.total_return_pct for r in results]
         drawdowns = [r.max_drawdown_pct for r in results]
         sharpe_ratios = [r.sharpe_ratio for r in results if r.sharpe_ratio != 0]
+        total_deposited = results[0].total_deposited if results else 0
 
         # Банкротства
         busts = sum(1 for r in results if r.final_balance < 50)
@@ -353,6 +369,15 @@ class MonteCarloSimulator:
         analysis = {
             'scenario_name': results[0].scenario_name,
             'num_simulations': len(results),
+            'total_deposited': total_deposited,
+
+            # Net Profit
+            'net_profit_mean': np.mean(net_profits),
+            'net_profit_median': np.median(net_profits),
+            'net_profit_min': np.min(net_profits),
+            'net_profit_max': np.max(net_profits),
+            'net_profit_p5': np.percentile(net_profits, 5),
+            'net_profit_p95': np.percentile(net_profits, 95),
 
             # Final Balance
             'final_balance_mean': np.mean(final_balances),
@@ -404,9 +429,19 @@ class MonteCarloSimulator:
         print(f"АНАЛИЗ РЕЗУЛЬТАТОВ: {analysis['scenario_name']}")
         print(f"{'='*80}")
         print(f"Количество симуляций: {analysis['num_simulations']:,}")
+        print(f"Всего внесено: ${analysis['total_deposited']:,.2f}")
         print()
 
-        print("📊 ДОХОДНОСТЬ (90 дней):")
+        print("💵 ЧИСТАЯ ПРИБЫЛЬ (за вычетом депозитов):")
+        print(f"  Средняя:     ${analysis['net_profit_mean']:8.2f}")
+        print(f"  Медианная:   ${analysis['net_profit_median']:8.2f}")
+        print(f"  Минимум:     ${analysis['net_profit_min']:8.2f}")
+        print(f"  Максимум:    ${analysis['net_profit_max']:8.2f}")
+        print(f"  P5:          ${analysis['net_profit_p5']:8.2f}  (5% хуже)")
+        print(f"  P95:         ${analysis['net_profit_p95']:8.2f}  (5% лучше)")
+        print()
+
+        print("📊 ДОХОДНОСТЬ (ROI):")
         print(f"  Средняя:     {analysis['return_mean']:+7.2f}%")
         print(f"  Медиана:     {analysis['return_median']:+7.2f}%")
         print(f"  Ст. откл.:   {analysis['return_std']:7.2f}%")
@@ -518,7 +553,9 @@ def main():
     print()
     print("Параметры симуляции:")
     print(f"  - Начальный капитал: $1,000")
-    print(f"  - Период: 90 дней (~3 месяца)")
+    print(f"  - Ежемесячное пополнение: $300")
+    print(f"  - Период: 365 дней (12 месяцев)")
+    print(f"  - Всего будет внесено: $1,000 + $300 × 12 = $4,600")
     print(f"  - Количество траекторий: 10,000 на сценарий")
     print(f"  - Kelly sizing: Quarter Kelly (0.25)")
     print(f"  - R/R ratio: 2.5 / 1.5 = 1.667")
@@ -533,7 +570,8 @@ def main():
         min_position_size=15.0,
         max_position_size=200.0,
         kelly_fraction=0.25,
-        simulation_days=90
+        simulation_days=365,
+        monthly_deposit=300.0
     )
 
     # Создаем сценарии
@@ -598,7 +636,10 @@ def main():
     real_analysis = all_analyses["РЕАЛИСТИЧНЫЙ"]
 
     print(f"📊 РЕАЛИСТИЧНЫЙ СЦЕНАРИЙ (наиболее вероятный):")
-    print(f"   - Ожидаемая доходность за 3 месяца: {real_analysis['return_median']:+.1f}%")
+    print(f"   - Внесено всего: ${real_analysis['total_deposited']:,.2f}")
+    print(f"   - Медианная чистая прибыль: ${real_analysis['net_profit_median']:,.2f}")
+    print(f"   - Медианный итоговый баланс: ${real_analysis['final_balance_median']:,.2f}")
+    print(f"   - Ожидаемая доходность (ROI): {real_analysis['return_median']:+.1f}%")
     print(f"   - Вероятность получить прибыль: {real_analysis['profitable_rate']:.1f}%")
     print(f"   - Риск банкротства: {real_analysis['bust_rate']:.2f}%")
     print(f"   - Sharpe Ratio: {real_analysis['sharpe_median']:.2f}")
