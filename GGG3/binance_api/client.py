@@ -687,3 +687,36 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Failed to get open orders: {e}")
             raise BinanceAPIError(f"Failed to get open orders: {e}")
+
+    def get_ticker(self, symbol: str) -> dict:
+        """
+        Получает 24h ticker данные для символа
+
+        Args:
+            symbol: Торговая пара
+
+        Returns:
+            dict: Ticker данные (price, volume, bid, ask, etc.)
+        """
+        try:
+            ticker = self._retry_request(
+                self.client.futures_ticker,
+                symbol=symbol
+            )
+
+            return {
+                'symbol': ticker['symbol'],
+                'priceChange': float(ticker['priceChange']),
+                'priceChangePercent': float(ticker['priceChangePercent']),
+                'lastPrice': float(ticker['lastPrice']),
+                'bidPrice': float(ticker.get('bidPrice', ticker['lastPrice'])),
+                'askPrice': float(ticker.get('askPrice', ticker['lastPrice'])),
+                'volume': float(ticker['volume']),
+                'quoteVolume': float(ticker['quoteVolume']),
+                'openTime': int(ticker['openTime']),
+                'closeTime': int(ticker['closeTime']),
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to get ticker for {symbol}: {e}")
+            raise BinanceAPIError(f"Failed to get ticker: {e}")

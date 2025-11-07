@@ -48,6 +48,7 @@ from strategy.kelly_sizer import calculate_kelly_position_size
 # Features
 from features.builder import BinanceFeatureBuilder
 from features.base_logic import BaseLogicMultiTF
+from features.target_calculator import calculate_atr, detect_market_phase
 
 # Models
 from models.experts import XGBoostExpert, RandomForestExpert, NeuralNetworkExpert
@@ -377,9 +378,11 @@ class BinanceTradingBot:
 
         top_opportunities = self.coin_selector.select_top_coins(
             all_pairs=all_pairs,
-            experts=self.experts,
-            meta=self.meta,
-            base_model=self.base_logic,
+            get_ticker_func=lambda s: self.exchange.get_ticker(s),
+            get_ohlcv_func=lambda s, tf, lim: self.exchange.get_ohlcv(s, tf, lim),
+            feature_builder=self.feature_builder,
+            calculate_atr_func=calculate_atr,
+            calculate_phase_func=detect_market_phase,
             top_n=config.TOP_N_COINS
         )
 

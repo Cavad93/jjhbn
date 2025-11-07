@@ -175,6 +175,71 @@ def get_binance_kline(symbol: str, interval: str = '4h', limit: int = 1) -> Dict
     raise Exception(f"Failed to get kline for {symbol} from all endpoints: {last_error}")
 
 
+def get_binance_ticker(symbol: str) -> Dict:
+    """
+    Получает 24h ticker данные с Binance API
+
+    Uses MAINNET endpoints (not testnet):
+    - Primary: https://api.binance.com
+    - Fallback: https://api1.binance.com, https://api-gcp.binance.com
+
+    NO API KEYS REQUIRED - uses public market data endpoints
+
+    Args:
+        symbol: Торговая пара (например, 'BTCUSDT')
+
+    Returns:
+        Dict: Ticker данные (price, volume, bid, ask, etc.)
+    """
+    symbol = symbol.replace('/', '').upper()
+
+    # MAINNET endpoints (НЕ testnet!)
+    base_urls = [
+        "https://api.binance.com",
+        "https://api1.binance.com",
+        "https://api-gcp.binance.com",
+    ]
+
+    params = {'symbol': symbol}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json'
+    }
+
+    last_error = None
+
+    # Try each endpoint with fallback
+    for base_url in base_urls:
+        try:
+            url = f"{base_url}/api/v3/ticker/24hr"
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            response.raise_for_status()
+
+            data = response.json()
+            return {
+                'symbol': data['symbol'],
+                'priceChange': float(data['priceChange']),
+                'priceChangePercent': float(data['priceChangePercent']),
+                'lastPrice': float(data['lastPrice']),
+                'bidPrice': float(data['bidPrice']),
+                'askPrice': float(data['askPrice']),
+                'volume': float(data['volume']),
+                'quoteVolume': float(data['quoteVolume']),
+                'openTime': int(data['openTime']),
+                'closeTime': int(data['closeTime']),
+            }
+
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            continue  # Try next endpoint
+        except (KeyError, ValueError) as e:
+            last_error = e
+            continue
+
+    # All endpoints failed
+    raise Exception(f"Failed to get ticker for {symbol} from all endpoints: {last_error}")
+
+
 # ============================================================================
 # PAPER EXCHANGE CLASS
 # ============================================================================
@@ -743,6 +808,89 @@ class PaperExchange:
             # Возвращаем хотя бы топовые пары если не получилось
             return ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT', 'XRPUSDT',
                     'DOGEUSDT', 'DOTUSDT', 'MATICUSDT', 'AVAXUSDT']
+
+    def get_ticker(self, symbol: str) -> dict:
+        """
+        Получает ticker данные для символа
+
+        Args:
+            symbol: Торговая пара
+
+        Returns:
+            dict: Ticker данные
+        """
+        return get_binance_ticker(symbol)
+
+    def get_ohlcv(self, symbol: str, timeframe: str, limit: int = 200) -> 'pd.DataFrame':
+        """
+        Получает OHLCV данные для символа
+
+        Args:
+            symbol: Торговая пара
+            timeframe: Таймфрейм ('1m', '5m', '15m', '30m', '1h', '4h', '1d')
+            limit: Количество свечей
+
+        Returns:
+            pd.DataFrame: DataFrame с колонками [timestamp, open, high, low, close, volume]
+        """
+        import pandas as pd
+
+        # Конвертация timeframe в Binance формат
+        tf_map = {
+            '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m',
+            '1h': '1h', '4h': '4h', '1d': '1d'
+        }
+        interval = tf_map.get(timeframe, timeframe)
+
+        # Получаем klines через публичное API
+        base_urls = [
+            "https://api.binance.com",
+            "https://api1.binance.com",
+            "https://api-gcp.binance.com",
+        ]
+
+        params = {
+            'symbol': symbol.replace('/', '').upper(),
+            'interval': interval,
+            'limit': limit
+        }
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json'
+        }
+
+        for base_url in base_urls:
+            try:
+                url = f"{base_url}/api/v3/klines"
+                response = requests.get(url, params=params, headers=headers, timeout=10)
+                response.raise_for_status()
+
+                data = response.json()
+
+                # Преобразуем в DataFrame
+                df = pd.DataFrame(data, columns=[
+                    'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                    'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+                    'taker_buy_quote', 'ignore'
+                ])
+
+                # Оставляем только нужные колонки и конвертируем типы
+                df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df['open'] = df['open'].astype(float)
+                df['high'] = df['high'].astype(float)
+                df['low'] = df['low'].astype(float)
+                df['close'] = df['close'].astype(float)
+                df['volume'] = df['volume'].astype(float)
+
+                return df
+
+            except Exception:
+                continue
+
+        # Все endpoints failed - возвращаем пустой DataFrame
+        import pandas as pd
+        return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
     def get_statistics(self) -> dict:
         """
