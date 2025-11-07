@@ -6,6 +6,9 @@ REM ============================================================================
 
 setlocal enabledelayedexpansion
 
+REM Переход в директорию скрипта
+cd /d "%~dp0"
+
 REM Цвета для Windows
 set "RED=[91m"
 set "GREEN=[92m"
