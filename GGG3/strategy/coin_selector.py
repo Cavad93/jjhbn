@@ -406,8 +406,15 @@ class CoinSelector:
                 phase = calculate_phase_func(df_4h)
 
                 # Получаем предсказание p_up (от БАЗОВОЙ ЛОГИКИ)
+                base_signals = {}
                 if get_predictions_func:
-                    p_up = get_predictions_func(features, phase, symbol, df_4h)  # Добавлен df_4h
+                    result = get_predictions_func(features, phase, symbol, df_4h)  # Добавлен df_4h
+                    # Поддержка старого формата (только p_up) и нового (p_up, base_signals)
+                    if isinstance(result, tuple):
+                        p_up, base_signals = result
+                    else:
+                        p_up = result
+                        base_signals = {}
                 else:
                     # Если нет функции предсказаний, используем dummy значение
                     # В реальности здесь должны быть predictions от ML моделей
@@ -465,7 +472,8 @@ class CoinSelector:
                     'timestamp': datetime.now().isoformat(),
                     'ml_predictions': ml_predictions,  # ML предсказания для META
                     'features': features,  # 68D фичи для snapshot
-                    'context': context_features  # ✅ 7D контекстные фичи для META
+                    'context': context_features,  # ✅ 7D контекстные фичи для META
+                    'base_signals': base_signals  # ✅ BASE сигналы [M, S, B, R] для калибровки весов
                 }
 
                 opportunities.append(opportunity)

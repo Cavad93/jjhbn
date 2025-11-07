@@ -150,6 +150,15 @@ class BinanceTradingBot:
         # BASE logic
         self.base_logic = BaseLogicMultiTF()
 
+        # BASE weight calibrator
+        from features.weight_calibrator import BaseWeightCalibrator
+        self.base_weight_calibrator = BaseWeightCalibrator(
+            min_samples=50,  # Калибровать каждые 50 сделок
+            regularization=1.0,
+            smoothing_alpha=0.3  # 30% EMA с предыдущими весами
+        )
+        self.last_calibration_at = 0  # Счётчик для калибровки
+
         # Risk managers
         print("\n  Initializing risk managers...")
         self.trailing_stop = TrailingStopManager()
@@ -263,7 +272,62 @@ class BinanceTradingBot:
         wins = sum(1 for p in closed if p.pnl > 0)
         return wins / len(closed)
 
-    def _get_predictions(self, features: np.ndarray, phase: int, symbol: str, df_4h: pd.DataFrame = None) -> float:
+    def _maybe_calibrate_base_weights(self):
+        """
+        Проверяет нужна ли калибровка BASE весов и выполняет её
+
+        Калибрует каждые N закрытых позиций (N = min_samples калибратора)
+        """
+        n_closed = len(self.position_manager.closed_positions)
+
+        # Проверяем нужна ли калибровка
+        if not self.base_weight_calibrator.should_calibrate(n_closed, self.last_calibration_at):
+            return
+
+        try:
+            logger.info("[BaseWeightCalibrator] Начинаем калибровку весов...")
+
+            # Текущие веса
+            old_weights = self.base_logic.w_dyn
+            if old_weights is None:
+                old_weights = np.array([0.35, 0.20, 0.20, 0.25])  # Дефолтные
+
+            # Калибруем
+            result = self.base_weight_calibrator.calibrate(
+                closed_positions=self.position_manager.closed_positions,
+                old_weights=old_weights
+            )
+
+            if result is not None:
+                # Применяем новые веса
+                self.base_logic.set_weights(result.weights)
+
+                # Обновляем счётчик
+                self.last_calibration_at = n_closed
+
+                logger.info(
+                    f"[BaseWeightCalibrator] Веса обновлены: "
+                    f"M={result.weights[0]:.3f}, S={result.weights[1]:.3f}, "
+                    f"B={result.weights[2]:.3f}, R={result.weights[3]:.3f} "
+                    f"(improvement={result.improvement:+.1f}%)"
+                )
+
+                # Отправляем уведомление в Telegram
+                if self.telegram_notifier and hasattr(self.telegram_notifier, 'send_calibration_update'):
+                    self.telegram_notifier.send_calibration_update({
+                        'old_weights': result.old_weights.tolist(),
+                        'new_weights': result.weights.tolist(),
+                        'n_samples': result.n_samples,
+                        'improvement': result.improvement,
+                        'win_rate': result.win_rate
+                    })
+            else:
+                logger.info("[BaseWeightCalibrator] Калибровка пропущена (недостаточно данных)")
+
+        except Exception as e:
+            logger.error(f"[BaseWeightCalibrator] Ошибка калибровки: {e}", exc_info=True)
+
+    def _get_predictions(self, features: np.ndarray, phase: int, symbol: str, df_4h: pd.DataFrame = None) -> tuple:
         """
         Получает предсказание вероятности роста от БАЗОВОЙ ЛОГИКИ
 
@@ -277,7 +341,7 @@ class BinanceTradingBot:
             df_4h: DataFrame 4h для базовой логики
 
         Returns:
-            p_up: Вероятность роста (0-1) от базовой логики
+            (p_up, base_signals): Вероятность роста (0-1) и словарь BASE сигналов {M, S, B, R}
         """
         try:
             # ===== ИСПОЛЬЗУЕМ ТОЛЬКО БАЗОВУЮ ЛОГИКУ =====
@@ -287,21 +351,38 @@ class BinanceTradingBot:
                 # Используем базовую логику с 4h данными
                 p_up, p_down = self.base_logic.predict(df_4h)
 
+                # Извлекаем BASE сигналы для калибровки весов
+                from features.base_logic import features_from_binance, _index_pad
+                feats = features_from_binance(df_4h)
+                timestamp = df_4h.index[-1]
+                i = _index_pad(feats["M_up"], timestamp)
+
+                if i is not None:
+                    # Вычисляем разности сигналов (как в prob_up_down_at_time)
+                    M = float(feats["M_up"].iloc[i] - feats["M_dn"].iloc[i])
+                    S = float(feats["S_up"].iloc[i] - feats["S_dn"].iloc[i])
+                    B = float(feats["B_up"].iloc[i] - feats["B_dn"].iloc[i])
+                    R = float(feats["R_up"].iloc[i] - feats["R_dn"].iloc[i])
+
+                    base_signals = {'M': M, 'S': S, 'B': B, 'R': R}
+                else:
+                    base_signals = {'M': 0.0, 'S': 0.0, 'B': 0.0, 'R': 0.0}
+
                 # Проверяем валидность
                 if not np.isfinite(p_up) or p_up < 0 or p_up > 1:
                     logger.warning(f"{symbol}: Invalid p_up from base_logic: {p_up}, using 0.5")
                     p_up = 0.5
 
-                return float(p_up)
+                return float(p_up), base_signals
             else:
                 # Если нет df_4h, используем нейтральное значение
                 logger.warning(f"{symbol}: No df_4h provided, using neutral p_up=0.5")
-                return 0.5
+                return 0.5, {'M': 0.0, 'S': 0.0, 'B': 0.0, 'R': 0.0}
 
         except Exception as e:
             logger.error(f"Error getting base_logic prediction for {symbol}: {e}")
             # Fallback - нейтральное значение
-            return 0.5
+            return 0.5, {'M': 0.0, 'S': 0.0, 'B': 0.0, 'R': 0.0}
 
     def _collect_ml_predictions_for_meta(self, features: np.ndarray, phase: int, symbol: str) -> Dict[str, float]:
         """
@@ -630,7 +711,8 @@ class BinanceTradingBot:
                 'p_meta': opportunity['p_up'],
                 'phase': opportunity.get('phase', 0),  # Фаза рынка
                 'timestamp': time.time(),
-                'context': opportunity.get('context', {})  # ✅ Дублируем для совместимости
+                'context': opportunity.get('context', {}),  # ✅ Дублируем для совместимости
+                'base_signals': opportunity.get('base_signals', {})  # ✅ BASE сигналы [M, S, B, R] для калибровки
             }
 
             # Создаем Position объект
@@ -865,6 +947,9 @@ class BinanceTradingBot:
         self.total_closed_trades += 1
         self.stats['win_rate_last_100'] = self._calculate_win_rate()
         self.last_trade_time = time.time()  # Track time for adaptive threshold
+
+        # Проверяем нужна ли калибровка BASE весов
+        self._maybe_calibrate_base_weights()
 
         # Сбрасываем trailing stop
         self.trailing_stop.reset_position(position.symbol)
