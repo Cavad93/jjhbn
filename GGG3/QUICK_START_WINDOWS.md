@@ -11,6 +11,12 @@
 - **PowerShell**: 3.0 или выше (встроен в Windows)
 - **Интернет**: для установки зависимостей
 
+**❌ НЕ ТРЕБУЕТСЯ:**
+- PostgreSQL - НЕ нужен для paper trading!
+- Binance API ключи - НЕ нужны для paper trading!
+
+📋 **Детальные требования:** см. `PREREQUISITES_WINDOWS.md`
+
 ---
 
 ## 🚀 Запуск за 5 команд
@@ -349,6 +355,26 @@ venv\Scripts\activate.bat
 REM Запустите быстрый тест
 python tests\quick_bot_test.py
 ```
+
+---
+
+## 📚 Дополнительная документация
+
+### Установка и настройка:
+- **PREREQUISITES_WINDOWS.md** - Что нужно установить ПЕРЕД запуском install.bat
+- **INSTALL_POSTGRESQL_WINDOWS.md** - Установка PostgreSQL 12 (ОПЦИОНАЛЬНО, НЕ нужен для paper trading)
+- **README_NO_API_KEYS.md** - Работа без API ключей (только публичные API)
+
+### Удаление и очистка:
+- **CLEANUP_OLD_BOT_WINDOWS.md** - Удаление старого бота PostgreSQL 12
+- **cleanup_old_bot.bat** - Автоматический скрипт очистки
+
+### Команды и утилиты:
+- **COMMANDS_CHEATSHEET.md** - Шпаргалка команд Windows Command Prompt
+- **start_bot.bat** - Запуск бота (интерактивный/фоновый)
+- **stop_bot.bat** - Остановка бота (мягкая/принудительная)
+- **status_bot.bat** - Проверка статуса бота
+- **tail_logs.bat** - Просмотр логов в реальном времени
 
 ---
 
