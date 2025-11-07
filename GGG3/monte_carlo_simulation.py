@@ -257,12 +257,21 @@ class MonteCarloSimulator:
             if is_busted:
                 break
 
-            # Реинвестирование: если был профит за день, часть идет в резерв
-            day_profit = balance - day_start_balance
-            if day_profit > 0:
-                to_reserve = day_profit * params.reinvest_to_reserve_pct
+            # Реинвестирование
+            day_pnl = balance - day_start_balance
+
+            if day_pnl > 0:
+                # ПРИБЫЛЬНЫЙ ДЕНЬ: часть прибыли идет в резерв
+                to_reserve = day_pnl * params.reinvest_to_reserve_pct
                 reserve_fund += to_reserve
                 balance -= to_reserve
+
+            elif day_pnl < 0:
+                # УБЫТОЧНЫЙ ДЕНЬ: покрываем убыток из резерва
+                daily_loss = abs(day_pnl)
+                from_reserve = min(daily_loss, reserve_fund)
+                reserve_fund -= from_reserve
+                balance += from_reserve
 
             # Записываем баланс на конец дня
             balances.append(balance)

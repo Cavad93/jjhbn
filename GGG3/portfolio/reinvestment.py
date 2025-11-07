@@ -125,38 +125,35 @@ class ReinvestmentManager:
         if today > self.last_reinvest_date:
             # Новый день - делаем расчёт
 
-            # Рассчитываем дневную прибыль
-            # (current_equity уже включает позиции, закрытые за день)
-            previous_trading_capital = current_equity  # Упрощение: берём текущий equity как базу
+            # Рассчитываем дневную прибыль/убыток
+            # Для упрощения считаем как отклонение от initial_capital
+            daily_pnl = current_equity - self.initial_capital
 
-            # Более правильный расчёт: берём equity на начало дня
-            # Для упрощения считаем прибыль как превышение над initial_capital
-            daily_profit = max(0, current_equity - self.initial_capital)
-
-            if daily_profit > 0:
-                # Процент прибыли → резерв (30% по умолчанию из config)
-                to_reserve = daily_profit * self.profit_to_reserve_pct
+            if daily_pnl > 0:
+                # ПРИБЫЛЬНЫЙ ДЕНЬ: процент прибыли → резерв
+                to_reserve = daily_pnl * self.profit_to_reserve_pct
                 self.reserve_fund += to_reserve
 
                 # Остальное реинвестируем (остаётся в trading_capital)
                 trading_capital = current_equity - to_reserve
 
                 # Обновляем статистику
-                self.total_profit_accumulated += daily_profit
+                self.total_profit_accumulated += daily_pnl
                 self.total_to_reserve_accumulated += to_reserve
 
                 # Сохраняем в историю
                 self.daily_history.append({
                     'date': str(today),
-                    'daily_profit': daily_profit,
+                    'daily_profit': daily_pnl,
                     'to_reserve': to_reserve,
+                    'from_reserve': 0.0,
                     'reserve_fund': self.reserve_fund,
                     'trading_capital': trading_capital
                 })
 
                 logger.info(
                     f"[Reinvestment] Date: {today}, "
-                    f"Daily profit: ${daily_profit:.2f}, "
+                    f"Daily profit: ${daily_pnl:.2f}, "
                     f"To reserve: ${to_reserve:.2f} ({self.profit_to_reserve_pct*100:.0f}%), "
                     f"Trading capital: ${trading_capital:.2f}, "
                     f"Reserve fund: ${self.reserve_fund:.2f}"
@@ -169,12 +166,55 @@ class ReinvestmentManager:
                     'trading_capital': trading_capital,
                     'reserve_fund': self.reserve_fund,
                     'total_equity': trading_capital + self.reserve_fund,
-                    'daily_profit': daily_profit,
+                    'daily_profit': daily_pnl,
                     'to_reserve': to_reserve,
                     'reinvested': True
                 }
+
+            elif daily_pnl < 0:
+                # УБЫТОЧНЫЙ ДЕНЬ: покрываем убыток из резерва
+                daily_loss = abs(daily_pnl)
+
+                # Покрываем убыток из резерва (но не больше чем есть)
+                from_reserve = min(daily_loss, self.reserve_fund)
+                self.reserve_fund -= from_reserve
+
+                # Добавляем к торговому капиталу
+                trading_capital = current_equity + from_reserve
+
+                # Сохраняем в историю
+                self.daily_history.append({
+                    'date': str(today),
+                    'daily_profit': daily_pnl,
+                    'to_reserve': 0.0,
+                    'from_reserve': from_reserve,
+                    'reserve_fund': self.reserve_fund,
+                    'trading_capital': trading_capital
+                })
+
+                logger.info(
+                    f"[Reinvestment] Date: {today}, "
+                    f"Daily loss: ${daily_loss:.2f}, "
+                    f"Covered from reserve: ${from_reserve:.2f}, "
+                    f"Trading capital: ${trading_capital:.2f}, "
+                    f"Reserve fund: ${self.reserve_fund:.2f}"
+                )
+
+                self.last_reinvest_date = today
+                self._save_state()
+
+                return {
+                    'trading_capital': trading_capital,
+                    'reserve_fund': self.reserve_fund,
+                    'total_equity': trading_capital + self.reserve_fund,
+                    'daily_profit': daily_pnl,
+                    'to_reserve': 0.0,
+                    'from_reserve': from_reserve,
+                    'reinvested': True
+                }
+
             else:
-                # Нет прибыли сегодня
+                # БЕЗ ИЗМЕНЕНИЙ (daily_pnl == 0)
                 self.last_reinvest_date = today
                 self._save_state()
 
