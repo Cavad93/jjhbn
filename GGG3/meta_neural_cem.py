@@ -643,7 +643,7 @@ class MetaNeuralCEM:
                 except Exception as e:
                     print(f"[MetaNeural] ❌ Training failed for ph={ph}: {e}")
                     traceback.print_exc()
-            elif self.new_since_train_ph[ph] >= int(getattr(self.cfg, "meta_retrain_every", 50)):
+            elif self.new_since_train_ph[ph] >= int(getattr(self.cfg, "meta_retrain_every", 100)):
                 # КРИТИЧЕСКОЕ: Сброс счетчика даже если не готовы к обучению
                 # Иначе счетчик будет расти бесконечно до достижения min_samples
                 self.new_since_train_ph[ph] = 0
@@ -668,33 +668,37 @@ class MetaNeuralCEM:
     # ========== ОБУЧЕНИЕ CMA-ES ==========
     
     def _phase_ready(self, ph: int) -> bool:
-        """Проверка готовности фазы к обучению с адаптивной частотой"""
+        """Проверка готовности фазы к обучению"""
         min_samples = int(getattr(self.cfg, "meta_min_train", 150))
-        base_retrain = int(getattr(self.cfg, "meta_retrain_every", 50))
-        
-        # Адаптивная частота на основе сложности модели
+        base_retrain = int(getattr(self.cfg, "meta_retrain_every", 100))
+        use_adaptive = bool(getattr(self.cfg, "meta_use_adaptive", False))
+
+        # Адаптивная частота на основе сложности модели (опционально)
+        retrain_every = base_retrain
         net = self.networks.get(ph)
-        if net is not None:
+
+        if use_adaptive and net is not None:
             n_params = len(net.get_weights_flat())
-            # Для ~5000 параметров: 50 × 3 = 150
-            # Для ~1500 параметров: 50 × 1 = 50
-            multiplier = max(1, n_params // 1500)  # 🔥 ОПТИМАЛЬНЫЙ ДЕЛИТЕЛЬ
+            # Для ~5000 параметров: 100 × 3 = 300
+            # Для ~1500 параметров: 100 × 1 = 100
+            multiplier = max(1, n_params // 1500)
             retrain_every = base_retrain * multiplier
+            n_params_str = str(n_params)
         else:
-            retrain_every = base_retrain
-        
+            n_params_str = "N/A (fixed)"
+
         seen = self.seen_ph.get(ph, 0)
         new_since_last_train = self.new_since_train_ph.get(ph, 0)
-        
+
         if seen < min_samples:
             return False
-        
+
         if new_since_last_train < retrain_every:
             return False
-        
+
         print(f"[MetaNeural] Phase {ph} ready: {new_since_last_train} new samples "
-            f"(threshold={retrain_every}, params={n_params if net else 'N/A'})")
-        
+            f"(threshold={retrain_every}, params={n_params_str}, adaptive={use_adaptive})")
+
         return True
     
     def _train_phase(self, ph: int):
