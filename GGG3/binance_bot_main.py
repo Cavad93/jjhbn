@@ -27,6 +27,7 @@ import logging
 import pickle
 import numpy as np
 import pandas as pd
+import signal
 
 # Добавляем путь к GGG3
 sys.path.insert(0, str(Path(__file__).parent))
@@ -195,6 +196,10 @@ class BinanceTradingBot:
 
         print("\n✅ Bot initialized successfully\n")
         print("="*80)
+
+        # Setup signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
 
         # Send bot started notification
         if config.TELEGRAM_ALERT_TYPES.get('bot_started', True):
@@ -1006,9 +1011,78 @@ class BinanceTradingBot:
     # SHUTDOWN
     # ========================================================================
 
+    def _signal_handler(self, signum, frame):
+        """Обработчик сигналов для graceful shutdown"""
+        signal_name = 'SIGINT' if signum == signal.SIGINT else 'SIGTERM'
+        print(f"\n\n⚠️  Received {signal_name} signal, shutting down gracefully...")
+        self.shutdown()
+        sys.exit(0)
+
     def shutdown(self):
-        """Корректное завершение бота"""
-        print("\nShutting down...")
+        """Корректное завершение бота с закрытием всех активных позиций"""
+        print("\n\n" + "="*80)
+        print("🛑 GRACEFUL SHUTDOWN - Closing all positions...")
+        print("="*80 + "\n")
+
+        # ═══════════════════════════════════════════════════════════
+        # ШАГ 1: Закрываем все открытые позиции
+        # ═══════════════════════════════════════════════════════════
+
+        open_positions = self.position_manager.get_all_open()
+
+        if open_positions:
+            print(f"📊 Found {len(open_positions)} open positions to close\n")
+
+            for position in open_positions:
+                try:
+                    # Получаем текущую цену
+                    current_price = self.exchange.get_current_price(position.symbol)
+
+                    # Отменяем TP/SL ордера
+                    if self.paper_mode:
+                        try:
+                            if position.tp_order_id:
+                                self.exchange.cancel_order(position.symbol, position.tp_order_id)
+                            if position.sl_order_id:
+                                self.exchange.cancel_order(position.symbol, position.sl_order_id)
+                        except Exception as e:
+                            logger.warning(f"Failed to cancel TP/SL for {position.symbol}: {e}")
+
+                    # Закрываем позицию
+                    self.position_manager.close_position(
+                        symbol=position.symbol,
+                        exit_price=current_price,
+                        exit_reason='SHUTDOWN'
+                    )
+
+                    print(f"✅ Closed {position.symbol}: Entry={position.entry_price:.6f}, Exit={current_price:.6f}")
+
+                except Exception as e:
+                    logger.error(f"❌ Failed to close {position.symbol}: {e}")
+                    print(f"❌ Error closing {position.symbol}: {e}")
+        else:
+            print("ℹ️  No open positions to close\n")
+
+        # ═══════════════════════════════════════════════════════════
+        # ШАГ 2: Отменяем все оставшиеся активные ордера
+        # ═══════════════════════════════════════════════════════════
+
+        if self.paper_mode and hasattr(self.exchange, 'orders'):
+            remaining_orders = list(self.exchange.orders.values())
+            if remaining_orders:
+                print(f"\n📋 Cancelling {len(remaining_orders)} remaining orders...")
+                for order in remaining_orders:
+                    try:
+                        self.exchange.cancel_order(order['symbol'], order['id'])
+                        print(f"✅ Cancelled order {order['id']} for {order['symbol']}")
+                    except Exception as e:
+                        logger.warning(f"Failed to cancel order {order['id']}: {e}")
+
+        # ═══════════════════════════════════════════════════════════
+        # ШАГ 3: Сохраняем состояние
+        # ═══════════════════════════════════════════════════════════
+
+        print("\n💾 Saving state...")
         self.position_manager.save_to_file()
         print("✅ Positions saved")
 
@@ -1022,13 +1096,18 @@ class BinanceTradingBot:
 
         # Print reinvestment summary if enabled
         if self.paper_mode and self.reinvestment:
+            print("\n" + "="*80)
+            print("📊 REINVESTMENT SUMMARY")
+            print("="*80)
             self.reinvestment.print_summary()
 
         # Send bot stopped notification
         if config.TELEGRAM_ALERT_TYPES.get('bot_stopped', True):
             self.telegram.notify_bot_stopped(reason="Manual shutdown")
 
-        print("✅ Bot stopped")
+        print("\n" + "="*80)
+        print("✅ BOT STOPPED SUCCESSFULLY")
+        print("="*80 + "\n")
 
 
 # ============================================================================
