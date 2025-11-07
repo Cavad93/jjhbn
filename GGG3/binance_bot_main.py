@@ -262,6 +262,77 @@ class BinanceTradingBot:
         wins = sum(1 for p in closed if p.get('pnl', 0) > 0)
         return wins / len(closed)
 
+    def _get_predictions(self, features: np.ndarray, phase: int, symbol: str) -> float:
+        """
+        Получает предсказания от ML моделей и возвращает итоговую вероятность
+
+        Args:
+            features: 68D вектор фич
+            phase: Фаза рынка (0-5)
+            symbol: Символ монеты
+
+        Returns:
+            p_up: Вероятность роста (0-1)
+        """
+        try:
+            # Собираем предсказания от экспертов
+            predictions = {}
+
+            # XGBoost
+            if self.experts.get('xgb') is not None:
+                try:
+                    p_xgb = self.experts['xgb'].predict_proba(features.reshape(1, -1))[0]
+                    predictions['xgb'] = p_xgb
+                except Exception:
+                    pass
+
+            # Random Forest
+            if self.experts.get('rf') is not None:
+                try:
+                    p_rf = self.experts['rf'].predict_proba(features.reshape(1, -1))[0]
+                    predictions['rf'] = p_rf
+                except Exception:
+                    pass
+
+            # Neural Network
+            if self.experts.get('nn') is not None:
+                try:
+                    p_nn = self.experts['nn'].predict_proba(features.reshape(1, -1))[0]
+                    predictions['nn'] = p_nn
+                except Exception:
+                    pass
+
+            # Если нет ни одного предсказания, используем базовую логику
+            if not predictions:
+                p_up = self.base_logic.predict_proba(features.reshape(1, -1))[0]
+                return float(p_up)
+
+            # Если есть META модель, используем её
+            if self.meta is not None:
+                try:
+                    # META комбинирует предсказания экспертов
+                    # Предполагаем, что META содержит 'predict' функцию
+                    # Для упрощения используем среднее если META не готова
+                    p_up = np.mean(list(predictions.values()))
+                except Exception:
+                    # Fallback на среднее
+                    p_up = np.mean(list(predictions.values()))
+            else:
+                # Используем среднее арифметическое
+                p_up = np.mean(list(predictions.values()))
+
+            return float(p_up)
+
+        except Exception as e:
+            logger.error(f"Error getting predictions for {symbol}: {e}")
+            # Fallback на базовую логику
+            try:
+                p_up = self.base_logic.predict_proba(features.reshape(1, -1))[0]
+                return float(p_up)
+            except Exception:
+                # Последний fallback - нейтральное значение
+                return 0.5
+
     # ========================================================================
     # MAIN LOOP
     # ========================================================================
@@ -395,6 +466,7 @@ class BinanceTradingBot:
             feature_builder=self.feature_builder,
             calculate_atr_func=calculate_atr,
             calculate_phase_func=detect_market_phase,
+            get_predictions_func=self._get_predictions,  # ← ДОБАВЛЕНО!
             top_n=config.TOP_N_COINS
         )
 
