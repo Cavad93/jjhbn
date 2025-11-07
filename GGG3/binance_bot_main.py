@@ -53,6 +53,7 @@ from features.target_calculator import calculate_atr, detect_market_phase
 
 # Models
 from models.experts import XGBoostExpert, RandomForestExpert, NeuralNetworkExpert
+from meta_neural_cem import MetaNeuralCEM
 
 # Risk management
 from risk.trailing_stop import TrailingStopManager
@@ -242,19 +243,15 @@ class BinanceTradingBot:
 
     def _load_meta(self):
         """Загружает META модель"""
-        meta_path = config.MODELS_DIR / 'saved' / 'meta_cmaes_model.pkl'
-
-        if not meta_path.exists():
-            print(f"    ⚠ META not found (будет использован Average)")
-            return None
-
         try:
-            with open(meta_path, 'rb') as f:
-                meta_data = pickle.load(f)
-            print(f"    ✓ META ({meta_data.get('mode', 'UNKNOWN')} mode)")
-            return meta_data
+            # Создаем экземпляр MetaNeuralCEM
+            meta = MetaNeuralCEM(cfg=config)
+            print(f"    ✓ META ({meta.mode} mode, {sum(meta.seen_ph.values())} samples)")
+            return meta
         except Exception as e:
-            print(f"    ⚠ META failed: {e}")
+            print(f"    ⚠ META init failed: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _calculate_win_rate(self) -> float:
@@ -308,10 +305,10 @@ class BinanceTradingBot:
 
     def _collect_ml_predictions_for_meta(self, features: np.ndarray, phase: int, symbol: str) -> Dict[str, float]:
         """
-        Собирает предсказания от ML экспертов для передачи в META (shadow режим)
+        Собирает предсказания от ML экспертов для передачи в META
 
         ВАЖНО: Эти предсказания НЕ используются для торговли!
-        Они передаются в META для обучения в background.
+        Они передаются в META для обучения ВСЕГДА (в режимах SHADOW и ACTIVE).
 
         Args:
             features: 68D вектор фич
@@ -490,7 +487,8 @@ class BinanceTradingBot:
             feature_builder=self.feature_builder,
             calculate_atr_func=calculate_atr,
             calculate_phase_func=detect_market_phase,
-            get_predictions_func=self._get_predictions,  # ← ДОБАВЛЕНО!
+            get_predictions_func=self._get_predictions,  # Базовая логика для торговли
+            collect_ml_predictions_func=self._collect_ml_predictions_for_meta,  # ML для META
             top_n=config.TOP_N_COINS
         )
 
@@ -616,8 +614,10 @@ class BinanceTradingBot:
             entry_snapshot = {
                 'features_68d': opportunity.get('features', np.zeros(68)),
                 'predictions': opportunity.get('predictions', {}),
+                'ml_predictions': opportunity.get('ml_predictions', {}),  # ML предсказания для META
                 'meta_context': opportunity.get('context', {}),
                 'p_meta': opportunity['p_up'],
+                'phase': opportunity.get('phase', 0),  # Фаза рынка
                 'timestamp': time.time()
             }
 
@@ -808,8 +808,30 @@ class BinanceTradingBot:
         print(f"  PnL: ${position.pnl:.2f} ({position.pnl_pct:+.2f}%)")
 
         # ✅ КРИТИЧНО: Online learning с snapshot
-        # TODO: Реализовать online learning
-        # (требуется record_result() методы в экспертах)
+        # Передаем результат в META для обучения (ВСЕГДА: в SHADOW и ACTIVE)
+        try:
+            if self.meta is not None and hasattr(position, 'entry_snapshot') and position.entry_snapshot:
+                snapshot = position.entry_snapshot
+                ml_preds = snapshot.get('ml_predictions', {})
+
+                # Определяем фактический результат
+                y_up = 1 if position.pnl > 0 else 0
+
+                # Передаем в META для обучения
+                self.meta.record_result(
+                    p_xgb=ml_preds.get('xgb'),
+                    p_rf=ml_preds.get('rf'),
+                    p_arf=None,  # У нас нет ARF
+                    p_nn=ml_preds.get('nn'),
+                    p_base=snapshot.get('p_meta'),  # Предсказание базовой логики
+                    y_up=y_up,
+                    used_in_live=True,
+                    p_final_used=snapshot.get('p_meta'),
+                    reg_ctx={'phase': snapshot.get('phase', 0)}
+                )
+                logger.debug(f"META.record_result() called for {position.symbol}: y_up={y_up}")
+        except Exception as e:
+            logger.error(f"Error recording result to META: {e}")
 
         # Закрываем позицию в manager
         self.position_manager.close_position(position.symbol, exit_price, exit_reason)

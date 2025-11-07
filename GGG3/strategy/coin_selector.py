@@ -261,6 +261,7 @@ class CoinSelector:
         calculate_atr_func: callable,
         calculate_phase_func: callable,
         get_predictions_func: callable = None,
+        collect_ml_predictions_func: callable = None,
         top_n: int = 10
     ) -> List[dict]:
         """
@@ -391,13 +392,18 @@ class CoinSelector:
                 # Определяем фазу рынка
                 phase = calculate_phase_func(df_4h)
 
-                # Получаем предсказание p_up
+                # Получаем предсказание p_up (от БАЗОВОЙ ЛОГИКИ)
                 if get_predictions_func:
                     p_up = get_predictions_func(features, phase, symbol, df_4h)  # Добавлен df_4h
                 else:
                     # Если нет функции предсказаний, используем dummy значение
                     # В реальности здесь должны быть predictions от ML моделей
                     p_up = 0.5  # Нейтральное значение
+
+                # Собираем ML предсказания для META (ВСЕГДА, в обоих режимах)
+                ml_predictions = {}
+                if collect_ml_predictions_func:
+                    ml_predictions = collect_ml_predictions_func(features, phase, symbol)
 
                 # Рассчитываем EV для обоих направлений
                 ev_long, ev_short = self.calculate_ev_bidirectional(p_up)
@@ -437,7 +443,9 @@ class CoinSelector:
                     'sl_price': sl_price,
                     'sector': sector,
                     'risk_level': risk_level,
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': datetime.now().isoformat(),
+                    'ml_predictions': ml_predictions,  # ML предсказания для META
+                    'features': features  # 68D фичи для snapshot
                 }
 
                 opportunities.append(opportunity)
