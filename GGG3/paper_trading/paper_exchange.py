@@ -646,6 +646,104 @@ class PaperExchange:
         """Возвращает список всех активных ордеров"""
         return list(self.orders.values())
 
+    def get_all_usdt_pairs(self, min_volume_24h: float = 1_000_000) -> List[str]:
+        """
+        Получает все торговые пары USDT с Binance
+
+        Фильтры:
+        - Только USDT пары (BTCUSDT, ETHUSDT, ...)
+        - Только активные пары (status = 'TRADING')
+        - Минимальный объем 24h > $1M (по умолчанию)
+        - Исключить стейблкоины (USDCUSDT, BUSDUSDT, ...)
+
+        Args:
+            min_volume_24h: Минимальный объем за 24ч в USD
+
+        Returns:
+            Список символов (~300-400 пар)
+        """
+        print(f"[PaperExchange] Fetching all USDT pairs with min volume ${min_volume_24h:,.0f}")
+
+        # MAINNET endpoints (НЕ testnet!)
+        base_urls = [
+            "https://api.binance.com",
+            "https://api1.binance.com",
+            "https://api-gcp.binance.com",
+        ]
+
+        # Список стейблкоинов для исключения
+        stablecoins = ['USDCUSDT', 'BUSDUSDT', 'TUSDUSDT', 'DAIUSDT', 'USDPUSDT', 'FDUSDUSDT']
+
+        try:
+            # Получаем информацию о всех парах
+            exchange_info = None
+            last_error = None
+
+            for base_url in base_urls:
+                try:
+                    url = f"{base_url}/api/v3/exchangeInfo"
+                    response = requests.get(url, timeout=10)
+                    response.raise_for_status()
+                    exchange_info = response.json()
+                    break
+                except Exception as e:
+                    last_error = e
+                    continue
+
+            if exchange_info is None:
+                raise Exception(f"Failed to get exchange info from all endpoints: {last_error}")
+
+            pairs = []
+
+            for symbol_info in exchange_info['symbols']:
+                symbol = symbol_info['symbol']
+                status = symbol_info['status']
+
+                # Фильтр 1: Только активные пары
+                if status != 'TRADING':
+                    continue
+
+                # Фильтр 2: Только USDT пары
+                if not symbol.endswith('USDT'):
+                    continue
+
+                # Фильтр 3: Исключить стейблкоины
+                if symbol in stablecoins:
+                    continue
+
+                # Фильтр 4: Проверить объем за 24ч
+                try:
+                    ticker = None
+                    for base_url in base_urls:
+                        try:
+                            url = f"{base_url}/api/v3/ticker/24hr"
+                            response = requests.get(url, params={'symbol': symbol}, timeout=10)
+                            response.raise_for_status()
+                            ticker = response.json()
+                            break
+                        except:
+                            continue
+
+                    if ticker is None:
+                        continue
+
+                    volume_24h = float(ticker['quoteVolume'])
+
+                    if volume_24h >= min_volume_24h:
+                        pairs.append(symbol)
+
+                except Exception:
+                    continue
+
+            print(f"[PaperExchange] Found {len(pairs)} USDT pairs meeting criteria")
+            return pairs
+
+        except Exception as e:
+            print(f"[PaperExchange] Error getting USDT pairs: {e}")
+            # Возвращаем хотя бы топовые пары если не получилось
+            return ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT', 'XRPUSDT',
+                    'DOGEUSDT', 'DOTUSDT', 'MATICUSDT', 'AVAXUSDT']
+
     def get_statistics(self) -> dict:
         """
         Возвращает статистику по торговле
