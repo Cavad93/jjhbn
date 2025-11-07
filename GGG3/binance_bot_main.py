@@ -260,7 +260,7 @@ class BinanceTradingBot:
         if not closed:
             return 0.5
 
-        wins = sum(1 for p in closed if p.get('pnl', 0) > 0)
+        wins = sum(1 for p in closed if p.pnl > 0)
         return wins / len(closed)
 
     def _get_predictions(self, features: np.ndarray, phase: int, symbol: str, df_4h: pd.DataFrame = None) -> float:
