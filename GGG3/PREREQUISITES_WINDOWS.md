@@ -236,7 +236,30 @@ python -m pip install psycopg2-binary --no-cache-dir
 
 Или просто **пропустить** - бот будет работать!
 
-### Проблема 3: Ошибка при установке ta-lib
+### Проблема 3: Ошибка при установке ccxt (coincurve)
+
+**Сообщение:**
+```
+error: metadata-generation-failed
+× Encountered error while generating package metadata.
+╰─> coincurve
+```
+
+**Причина:** ccxt>=4.0.0 требует coincurve, который нужно компилировать.
+
+**Решение:**
+✅ **УЖЕ ИСПРАВЛЕНО!** requirements.txt использует `ccxt>=3.1.1,<4.0.0`
+
+Версия 3.x работает БЕЗ компиляции на Windows и имеет все функции!
+
+Если всё равно возникает ошибка, обновите pip:
+```batch
+python -m pip install --upgrade pip setuptools wheel
+```
+
+---
+
+### Проблема 4: Ошибка при установке ta-lib
 
 **Сообщение:**
 ```
@@ -255,9 +278,9 @@ ERROR: Failed building wheel for ta-lib
    pip install C:\path\to\TA_Lib‑0.4.28‑cp39‑cp39‑win_amd64.whl
    ```
 
-**Или пропустить** - многие индикаторы работают без ta-lib.
+**Или пропустить** - бот работает БЕЗ ta-lib (используются альтернативные индикаторы).
 
-### Проблема 4: Нет интернета при установке
+### Проблема 5: Нет интернета при установке
 
 **Решение:**
 ```batch

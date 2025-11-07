@@ -21,7 +21,7 @@ libauc
 
 # === Exchange APIs (for paper trading and real trading) ===
 python-binance>=1.0.19
-ccxt>=4.0.0
+ccxt>=3.1.1,<4.0.0  # v3.x doesn't require coincurve (Windows compatible)
 
 # === Technical Analysis ===
 ta-lib>=0.4.28
