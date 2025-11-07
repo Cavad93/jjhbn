@@ -36,6 +36,8 @@ class ScenarioParams:
     commission: float                    # Комиссия за сделку
     slippage: float                      # Проскальзывание
     max_drawdown_before_stop: float      # Макс просадка до остановки торговли
+    reinvest_to_reserve_pct: float = 0.3 # Процент прибыли в резерв
+    timeout_close_prob: float = 0.1      # Вероятность закрытия по таймауту (72ч)
 
 
 @dataclass
@@ -73,6 +75,9 @@ class MonteCarloSimulator:
         self.max_position_size = max_position_size
         self.kelly_fraction = kelly_fraction
         self.simulation_days = simulation_days
+
+        # Реинвестирование
+        self.reserve_fund = 0.0
 
     def calculate_position_size(
         self,
@@ -113,6 +118,14 @@ class MonteCarloSimulator:
         Returns:
             (is_win, pnl)
         """
+
+        # Проверяем закрытие по таймауту (72 часа)
+        if np.random.random() < params.timeout_close_prob:
+            # Закрытие по таймауту - случайный результат [-0.5R, +0.5R]
+            timeout_pnl = position_size * (np.random.random() - 0.5)
+            commission_cost = position_size * params.commission * 2
+            slippage_cost = position_size * params.slippage * 2
+            return timeout_pnl > 0, timeout_pnl - commission_cost - slippage_cost
 
         # Определяем выигрыш/проигрыш
         is_win = np.random.random() < params.win_rate
@@ -165,6 +178,7 @@ class MonteCarloSimulator:
         balance = self.initial_capital
         max_balance = self.initial_capital
         min_balance = self.initial_capital
+        reserve_fund = 0.0
 
         balances = [balance]
         daily_returns = []
@@ -182,6 +196,7 @@ class MonteCarloSimulator:
         # Симулируем каждый день
         for day in range(self.simulation_days):
             day_start_balance = balance
+            day_start_total = balance + reserve_fund
 
             # Количество сделок в день (Пуассоновское распределение)
             num_trades_today = np.random.poisson(params.avg_trades_per_day)
@@ -231,16 +246,24 @@ class MonteCarloSimulator:
             if is_busted:
                 break
 
+            # Реинвестирование: если был профит за день, часть идет в резерв
+            day_profit = balance - day_start_balance
+            if day_profit > 0:
+                to_reserve = day_profit * params.reinvest_to_reserve_pct
+                reserve_fund += to_reserve
+                balance -= to_reserve
+
             # Записываем баланс на конец дня
             balances.append(balance)
 
-            # Дневная доходность
-            if day_start_balance > 0:
-                daily_return = (balance - day_start_balance) / day_start_balance
+            # Дневная доходность (с учетом резерва)
+            day_end_total = balance + reserve_fund
+            if day_start_total > 0:
+                daily_return = (day_end_total - day_start_total) / day_start_total
                 daily_returns.append(daily_return)
 
-        # Финальные метрики
-        final_balance = balance
+        # Финальные метрики (с учетом резерва)
+        final_balance = balance + reserve_fund
         total_return_pct = ((final_balance - self.initial_capital) / self.initial_capital) * 100
 
         # Максимальная просадка
@@ -433,45 +456,54 @@ def create_scenarios() -> List[ScenarioParams]:
     scenarios = []
 
     # 1. ОПТИМИСТИЧНЫЙ СЦЕНАРИЙ
+    # Условия: хорошая работа моделей, низкая волатильность, много возможностей
     scenarios.append(ScenarioParams(
         name="ОПТИМИСТИЧНЫЙ",
-        win_rate=0.60,                    # 60% WR
-        avg_trades_per_day=1.5,           # ~1-2 сделки в день
-        tp_multiplier=2.5,
+        win_rate=0.58,                    # 58% WR (высокое качество сигналов)
+        avg_trades_per_day=1.2,           # ~1-2 сделки в день (хорошие возможности)
+        tp_multiplier=2.5,                # Стандартные множители
         sl_multiplier=1.5,
-        trailing_stop_prob=0.30,          # 30% сделок с trailing stop
-        trailing_stop_bonus=0.5,          # +0.5R бонус
-        commission=0.0004,                # 0.04% комиссия
-        slippage=0.0002,                  # 0.02% проскальзывание
-        max_drawdown_before_stop=0.25     # Стоп при 25% просадке
+        trailing_stop_prob=0.25,          # 25% сделок с trailing stop
+        trailing_stop_bonus=0.4,          # +0.4R бонус от trailing
+        commission=0.001,                 # 0.1% комиссия (из config)
+        slippage=0.0005,                  # 0.05% проскальзывание (из config)
+        max_drawdown_before_stop=0.20,    # Стоп при 20% просадке (из config)
+        reinvest_to_reserve_pct=0.3,      # 30% прибыли в резерв (из config)
+        timeout_close_prob=0.08           # 8% закрытий по таймауту (72ч)
     ))
 
     # 2. РЕАЛИСТИЧНЫЙ СЦЕНАРИЙ
+    # Условия: средняя работа моделей, нормальная волатильность
     scenarios.append(ScenarioParams(
         name="РЕАЛИСТИЧНЫЙ",
-        win_rate=0.52,                    # 52% WR
-        avg_trades_per_day=1.0,           # ~1 сделка в день
+        win_rate=0.53,                    # 53% WR (чуть выше break-even)
+        avg_trades_per_day=0.9,           # ~1 сделка в день
         tp_multiplier=2.5,
         sl_multiplier=1.5,
         trailing_stop_prob=0.15,          # 15% сделок с trailing stop
         trailing_stop_bonus=0.3,          # +0.3R бонус
-        commission=0.0006,                # 0.06% комиссия
-        slippage=0.0004,                  # 0.04% проскальзывание
-        max_drawdown_before_stop=0.20     # Стоп при 20% просадке
+        commission=0.001,                 # 0.1% комиссия
+        slippage=0.0005,                  # 0.05% проскальзывание
+        max_drawdown_before_stop=0.20,    # Стоп при 20% просадке
+        reinvest_to_reserve_pct=0.3,      # 30% прибыли в резерв
+        timeout_close_prob=0.12           # 12% закрытий по таймауту
     ))
 
     # 3. ПЕССИМИСТИЧНЫЙ СЦЕНАРИЙ
+    # Условия: плохая работа моделей, высокая волатильность, мало возможностей
     scenarios.append(ScenarioParams(
         name="ПЕССИМИСТИЧНЫЙ",
-        win_rate=0.48,                    # 48% WR (ниже 50%)
-        avg_trades_per_day=0.7,           # ~0.7 сделки в день
+        win_rate=0.48,                    # 48% WR (ниже break-even)
+        avg_trades_per_day=0.6,           # ~0.6 сделки в день (мало возможностей)
         tp_multiplier=2.5,
         sl_multiplier=1.5,
-        trailing_stop_prob=0.05,          # 5% сделок с trailing stop
+        trailing_stop_prob=0.08,          # 8% сделок с trailing stop
         trailing_stop_bonus=0.2,          # +0.2R бонус
-        commission=0.0008,                # 0.08% комиссия
-        slippage=0.0006,                  # 0.06% проскальзывание
-        max_drawdown_before_stop=0.20     # Стоп при 20% просадке
+        commission=0.001,                 # 0.1% комиссия
+        slippage=0.0005,                  # 0.05% проскальзывание
+        max_drawdown_before_stop=0.20,    # Стоп при 20% просадке
+        reinvest_to_reserve_pct=0.3,      # 30% прибыли в резерв
+        timeout_close_prob=0.15           # 15% закрытий по таймауту
     ))
 
     return scenarios
