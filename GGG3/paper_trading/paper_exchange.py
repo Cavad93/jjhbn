@@ -578,6 +578,42 @@ class PaperExchange:
 
         return order
 
+    def create_stop_market_order(self, symbol: str, side: str, amount: float,
+                                 stop_price: float, position_id: Optional[str] = None) -> dict:
+        """
+        Создает stop-market ордер (алиас для create_stop_loss для совместимости с BinanceClient)
+
+        Args:
+            symbol: Торговая пара
+            side: Направление ('BUY' или 'SELL')
+            amount: Количество
+            stop_price: Цена срабатывания стопа
+            position_id: ID связанной позиции
+
+        Returns:
+            dict: Данные созданного ордера
+        """
+        return self.create_stop_loss(symbol, side, amount, stop_price, position_id)
+
+    def cancel_order(self, symbol: str, order_id: str) -> bool:
+        """
+        Отменяет ордер
+
+        Args:
+            symbol: Торговая пара
+            order_id: ID ордера
+
+        Returns:
+            True если успешно отменен
+        """
+        if order_id in self.orders:
+            del self.orders[order_id]
+            print(f"[PaperExchange] Order {order_id} cancelled for {symbol}")
+            return True
+        else:
+            print(f"[PaperExchange] Warning: Order {order_id} not found for {symbol}")
+            return False
+
     def check_orders(self) -> List[dict]:
         """
         Проверяет и исполняет TP/SL ордера на основе реальных цен
@@ -661,9 +697,32 @@ class PaperExchange:
 
         return executed_orders
 
-    def get_balance(self) -> float:
-        """Возвращает текущий свободный баланс"""
+    def get_balance(self, asset: str = 'USDT') -> float:
+        """
+        Возвращает текущий свободный баланс
+
+        Args:
+            asset: Актив ('USDT' по умолчанию) - для совместимости с BinanceClient
+
+        Returns:
+            Текущий баланс
+        """
         return self.balance
+
+    def get_current_price(self, symbol: str) -> float:
+        """
+        Получает текущую цену символа с Binance API
+
+        Args:
+            symbol: Торговая пара (например, 'BTCUSDT')
+
+        Returns:
+            Текущая цена
+
+        Raises:
+            Exception: Ошибка при получении цены
+        """
+        return get_binance_price(symbol)
 
     def get_equity(self) -> float:
         """
