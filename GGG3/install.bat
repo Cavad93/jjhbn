@@ -130,29 +130,21 @@ echo.
 
 REM Установка основных зависимостей
 echo %YELLOW%[INFO]%NC% Установка основных пакетов...
-pip install -r requirements.txt --no-deps
 pip install -r requirements.txt
 if errorlevel 1 (
     echo.
-    echo %YELLOW%[WARNING]%NC% Некоторые пакеты не установились!
+    echo %RED%[ERROR]%NC% Не удалось установить зависимости!
     echo.
-    echo %YELLOW%Это нормально для Windows!%NC% Обычно проблема с:
-    echo   - ta-lib (требует TA-Lib C библиотеку)
+    echo Проверьте:
+    echo   1. Интернет соединение
+    echo   2. Файл requirements.txt существует
+    echo   3. Python версия >= 3.9
     echo.
-    echo %YELLOW%Решение:%NC%
-    echo   1. Скачайте TA-Lib wheel с https://www.lfd.uci.edu/~gohlke/pythonlibs/#ta-lib
-    echo   2. Выберите файл для вашей версии Python
-    echo   3. Установите: pip install C:\path\to\TA_Lib-xxx.whl
+    echo %GREEN%[INFO]%NC% Все индикаторы работают на чистом Python!
+    echo   Не требуется ta-lib или другие C библиотеки.
     echo.
-    echo %GREEN%Бот будет работать и без ta-lib!%NC%
-    echo   (Используются альтернативные индикаторы)
-    echo.
-    echo %YELLOW%Продолжить установку? (Y/n): %NC%
-    set /p CONTINUE=
-    if /i "!CONTINUE!"=="n" (
-        pause
-        exit /b 1
-    )
+    pause
+    exit /b 1
 )
 
 echo %GREEN%[OK]%NC% Основные зависимости установлены

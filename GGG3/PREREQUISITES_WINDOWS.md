@@ -259,28 +259,7 @@ python -m pip install --upgrade pip setuptools wheel
 
 ---
 
-### Проблема 4: Ошибка при установке ta-lib
-
-**Сообщение:**
-```
-ERROR: Failed building wheel for ta-lib
-```
-
-**Решение для Windows:**
-
-1. Скачайте pre-built wheel с https://www.lfd.uci.edu/~gohlke/pythonlibs/#ta-lib
-2. Выберите подходящий файл:
-   - `TA_Lib‑0.4.28‑cp39‑cp39‑win_amd64.whl` (для Python 3.9, 64-bit)
-   - `TA_Lib‑0.4.28‑cp310‑cp310‑win_amd64.whl` (для Python 3.10, 64-bit)
-
-3. Установите вручную:
-   ```batch
-   pip install C:\path\to\TA_Lib‑0.4.28‑cp39‑cp39‑win_amd64.whl
-   ```
-
-**Или пропустить** - бот работает БЕЗ ta-lib (используются альтернативные индикаторы).
-
-### Проблема 5: Нет интернета при установке
+### Проблема 4: Нет интернета при установке
 
 **Решение:**
 ```batch

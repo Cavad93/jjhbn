@@ -24,7 +24,8 @@ python-binance>=1.0.19
 ccxt>=3.1.1,<4.0.0  # v3.x doesn't require coincurve (Windows compatible)
 
 # === Technical Analysis ===
-ta-lib>=0.4.28
+# TA-Lib removed - using custom indicators in indicators/technical.py
+# All indicators (RSI, MACD, Bollinger Bands, etc.) are implemented with pure pandas/numpy
 
 # === Dashboard and Visualization ===
 plotly>=5.17.0

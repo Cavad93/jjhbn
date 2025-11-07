@@ -15,13 +15,19 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 import logging
 
-# Технические индикаторы
-try:
-    import talib as ta
-except ImportError:
-    # Fallback на ta (python-ta)
-    import ta as ta_lib
-    ta = None
+# Технические индикаторы (собственная реализация, БЕЗ ta-lib)
+from indicators import (
+    rsi as calc_rsi,
+    macd as calc_macd,
+    stochastic as calc_stochastic,
+    atr as calc_atr,
+    bollinger_bands as calc_bbands,
+    adx as calc_adx,
+    williams_r as calc_willr,
+    cci as calc_cci,
+    roc as calc_roc,
+    ema as calc_ema
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,12 +138,7 @@ class BinanceFeatureBuilder:
         features = []
 
         # 1-2. RSI (14) и его slope
-        if ta is not None:
-            rsi = ta.RSI(close, timeperiod=14)
-        else:
-            rsi_indicator = ta_lib.momentum.RSIIndicator(close=pd.Series(close), window=14)
-            rsi = rsi_indicator.rsi().values
-
+        rsi = calc_rsi(close, period=14)
         rsi_current = self._safe_get(rsi, -1, 50.0)
         rsi_prev_5 = self._safe_get(rsi, -6, rsi_current)
         rsi_slope = (rsi_current - rsi_prev_5) / 5.0 if rsi_prev_5 != 0 else 0.0
@@ -146,14 +147,7 @@ class BinanceFeatureBuilder:
         features.append(rsi_slope / 10.0)  # Нормализация slope
 
         # 3-5. MACD (12, 26, 9)
-        if ta is not None:
-            macd, macd_signal, macd_hist = ta.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
-        else:
-            macd_indicator = ta_lib.trend.MACD(close=pd.Series(close))
-            macd = macd_indicator.macd().values
-            macd_signal = macd_indicator.macd_signal().values
-            macd_hist = macd_indicator.macd_diff().values
-
+        macd, macd_signal, macd_hist = calc_macd(close, fast_period=12, slow_period=26, signal_period=9)
         macd_current = self._safe_get(macd, -1, 0.0)
         macd_signal_current = self._safe_get(macd_signal, -1, 0.0)
         macd_hist_current = self._safe_get(macd_hist, -1, 0.0)
@@ -165,19 +159,7 @@ class BinanceFeatureBuilder:
         features.append(macd_hist_current / price_current * 100)
 
         # 6-7. Stochastic (14, 3, 3)
-        if ta is not None:
-            slowk, slowd = ta.STOCH(high, low, close, fastk_period=14, slowk_period=3, slowd_period=3)
-        else:
-            stoch_indicator = ta_lib.momentum.StochasticOscillator(
-                high=pd.Series(high),
-                low=pd.Series(low),
-                close=pd.Series(close),
-                window=14,
-                smooth_window=3
-            )
-            slowk = stoch_indicator.stoch().values
-            slowd = stoch_indicator.stoch_signal().values
-
+        slowk, slowd = calc_stochastic(high, low, close, k_period=14, k_smooth=3, d_smooth=3)
         stoch_k = self._safe_get(slowk, -1, 50.0)
         stoch_d = self._safe_get(slowd, -1, 50.0)
 
@@ -222,17 +204,7 @@ class BinanceFeatureBuilder:
         features.append(corr)
 
         # 14. ATR change (momentum волатильности)
-        if ta is not None:
-            atr_14 = ta.ATR(high, low, close, timeperiod=14)
-        else:
-            atr_indicator = ta_lib.volatility.AverageTrueRange(
-                high=pd.Series(high),
-                low=pd.Series(low),
-                close=pd.Series(close),
-                window=14
-            )
-            atr_14 = atr_indicator.average_true_range().values
-
+        atr_14 = calc_atr(high, low, close, period=14)
         atr_current = self._safe_get(atr_14, -1, price_current * 0.01)
         atr_prev_5 = self._safe_get(atr_14, -6, atr_current)
         atr_change = (atr_current / atr_prev_5 - 1.0) if atr_prev_5 > 0 else 0.0
@@ -285,14 +257,7 @@ class BinanceFeatureBuilder:
         features.extend([vwap_slope, vwap_distance, vwap_strength])
 
         # 4-8. Bollinger Bands (20, 2)
-        if ta is not None:
-            bb_upper, bb_middle, bb_lower = ta.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2)
-        else:
-            bb_indicator = ta_lib.volatility.BollingerBands(close=pd.Series(close), window=20, window_dev=2)
-            bb_upper = bb_indicator.bollinger_hband().values
-            bb_middle = bb_indicator.bollinger_mavg().values
-            bb_lower = bb_indicator.bollinger_lband().values
-
+        bb_upper, bb_middle, bb_lower = calc_bbands(close, period=20, std_dev=2.0)
         bb_upper_current = self._safe_get(bb_upper, -1, price_current * 1.02)
         bb_middle_current = self._safe_get(bb_middle, -1, price_current)
         bb_lower_current = self._safe_get(bb_lower, -1, price_current * 0.98)
@@ -448,21 +413,7 @@ class BinanceFeatureBuilder:
         features.extend([ema_9_21_diff, ema_21_55_diff, price_above_ema9, price_above_ema55])
 
         # 5-8. ADX and Directional Indicators
-        if ta is not None:
-            adx = ta.ADX(high, low, close, timeperiod=14)
-            plus_di = ta.PLUS_DI(high, low, close, timeperiod=14)
-            minus_di = ta.MINUS_DI(high, low, close, timeperiod=14)
-        else:
-            adx_indicator = ta_lib.trend.ADXIndicator(
-                high=pd.Series(high),
-                low=pd.Series(low),
-                close=pd.Series(close),
-                window=14
-            )
-            adx = adx_indicator.adx().values
-            plus_di = adx_indicator.adx_pos().values
-            minus_di = adx_indicator.adx_neg().values
-
+        adx, plus_di, minus_di = calc_adx(high, low, close, period=14)
         adx_current = self._safe_get(adx, -1, 20.0)
         plus_di_current = self._safe_get(plus_di, -1, 20.0)
         minus_di_current = self._safe_get(minus_di, -1, 20.0)
@@ -492,12 +443,7 @@ class BinanceFeatureBuilder:
         reversion_bb = -z_score if abs(z_score) > 2.0 else 0.0  # Signal only at extremes
 
         # RSI reversion (oversold/overbought)
-        if ta is not None:
-            rsi_30m = ta.RSI(close, timeperiod=14)
-        else:
-            rsi_indicator = ta_lib.momentum.RSIIndicator(close=pd.Series(close), window=14)
-            rsi_30m = rsi_indicator.rsi().values
-
+        rsi_30m = calc_rsi(close, period=14)
         rsi_current = self._safe_get(rsi_30m, -1, 50.0)
         reversion_rsi = 0.0
         if rsi_current < 30:
@@ -516,39 +462,17 @@ class BinanceFeatureBuilder:
 
         # 13-15. Momentum oscillators
         # Williams %R
-        if ta is not None:
-            willr = ta.WILLR(high, low, close, timeperiod=14)
-        else:
-            willr = ta_lib.momentum.WilliamsRIndicator(
-                high=pd.Series(high),
-                low=pd.Series(low),
-                close=pd.Series(close),
-                lbp=14
-            ).williams_r().values
-
+        willr = calc_willr(high, low, close, period=14)
         willr_current = self._safe_get(willr, -1, -50.0)
         willr_norm = (willr_current + 50.0) / 50.0  # Normalize to -1 to 1
 
         # CCI (Commodity Channel Index)
-        if ta is not None:
-            cci = ta.CCI(high, low, close, timeperiod=20)
-        else:
-            cci = ta_lib.trend.CCIIndicator(
-                high=pd.Series(high),
-                low=pd.Series(low),
-                close=pd.Series(close),
-                window=20
-            ).cci().values
-
+        cci = calc_cci(high, low, close, period=20)
         cci_current = self._safe_get(cci, -1, 0.0)
         cci_norm = cci_current / 200.0  # Normalize to roughly -1 to 1
 
         # ROC (Rate of Change)
-        if ta is not None:
-            roc = ta.ROC(close, timeperiod=10)
-        else:
-            roc = ta_lib.momentum.ROCIndicator(close=pd.Series(close), window=10).roc().values
-
+        roc = calc_roc(close, period=10)
         roc_current = self._safe_get(roc, -1, 0.0)
 
         features.extend([willr_norm, cci_norm, roc_current / 10.0])
@@ -615,17 +539,7 @@ class BinanceFeatureBuilder:
         price_current = close[-1] if len(close) > 0 else 1.0
 
         # 1-3. ATR indicators
-        if ta is not None:
-            atr_14 = ta.ATR(high, low, close, timeperiod=14)
-        else:
-            atr_indicator = ta_lib.volatility.AverageTrueRange(
-                high=pd.Series(high),
-                low=pd.Series(low),
-                close=pd.Series(close),
-                window=14
-            )
-            atr_14 = atr_indicator.average_true_range().values
-
+        atr_14 = calc_atr(high, low, close, period=14)
         atr_current = self._safe_get(atr_14, -1, price_current * 0.02)
 
         # ATR normalized (as % of price)
@@ -723,16 +637,7 @@ class BinanceFeatureBuilder:
         middle = self._calc_ema(close, period)
 
         # ATR для ширины канала
-        if ta is not None:
-            atr = ta.ATR(high, low, close, timeperiod=period)
-        else:
-            atr_indicator = ta_lib.volatility.AverageTrueRange(
-                high=pd.Series(high),
-                low=pd.Series(low),
-                close=pd.Series(close),
-                window=period
-            )
-            atr = atr_indicator.average_true_range().values
+        atr = calc_atr(high, low, close, period=period)
 
         upper = middle + (atr * atr_mult)
         lower = middle - (atr * atr_mult)
@@ -741,11 +646,7 @@ class BinanceFeatureBuilder:
 
     def _calc_ema(self, data: np.ndarray, period: int) -> np.ndarray:
         """Расчёт EMA"""
-        if ta is not None:
-            return ta.EMA(data, timeperiod=period)
-        else:
-            ema = ta_lib.trend.EMAIndicator(close=pd.Series(data), window=period)
-            return ema.ema_indicator().values
+        return calc_ema(data, period=period)
 
     def _safe_get(self, arr: np.ndarray, idx: int, default: float) -> float:
         """Безопасное получение элемента массива"""
