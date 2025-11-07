@@ -51,3 +51,7 @@ Thumbs.db
 *.json.tmp
 *.state
 *.csv.tmp
+
+# META model data (generated during runtime)
+meta_neural_phase_*.csv
+meta_neural_state.json
