@@ -568,8 +568,9 @@ class BinanceTradingBot:
             # ATR для расчета TP/SL
             df_4h = self.exchange.get_ohlcv(symbol, '4h', 100)
 
-            from features.builder import BinanceFeatureBuilder
-            atr = BinanceFeatureBuilder.calculate_atr(df_4h, period=config.ATR_PERIOD).iloc[-1]
+            from indicators import atr as calc_atr
+            atr_values = calc_atr(df_4h['high'], df_4h['low'], df_4h['close'], period=config.ATR_PERIOD)
+            atr = atr_values[-1]
 
             # Рассчитываем ATR в процентах для адаптивных множителей
             atr_pct = (atr / current_price) * 100
