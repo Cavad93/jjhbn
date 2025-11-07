@@ -945,12 +945,12 @@ class BinanceTradingBot:
         except Exception as e:
             logger.error(f"Error recording result to META: {e}")
 
-        # Отменяем TP/SL ордера в exchange (для paper trading)
-        if self.paper_mode:
+        # Отменяем TP/SL ордера в exchange (для paper trading, если они существуют)
+        if self.paper_mode and hasattr(self.exchange, 'orders'):
             try:
-                if position.tp_order_id:
+                if position.tp_order_id and position.tp_order_id in self.exchange.orders:
                     self.exchange.cancel_order(position.symbol, position.tp_order_id)
-                if position.sl_order_id:
+                if position.sl_order_id and position.sl_order_id in self.exchange.orders:
                     self.exchange.cancel_order(position.symbol, position.sl_order_id)
             except Exception as e:
                 logger.warning(f"Failed to cancel TP/SL orders for {position.symbol}: {e}")
@@ -989,11 +989,12 @@ class BinanceTradingBot:
         try:
             current_price = self.exchange.get_current_price(position.symbol)
 
-            # Отменяем TP/SL ордера
-            if position.tp_order_id:
-                self.exchange.cancel_order(position.symbol, position.tp_order_id)
-            if position.sl_order_id:
-                self.exchange.cancel_order(position.symbol, position.sl_order_id)
+            # Отменяем TP/SL ордера (если они существуют)
+            if self.paper_mode and hasattr(self.exchange, 'orders'):
+                if position.tp_order_id and position.tp_order_id in self.exchange.orders:
+                    self.exchange.cancel_order(position.symbol, position.tp_order_id)
+                if position.sl_order_id and position.sl_order_id in self.exchange.orders:
+                    self.exchange.cancel_order(position.symbol, position.sl_order_id)
 
             # Закрываем по рынку
             self.exchange.create_market_order(
@@ -1038,12 +1039,12 @@ class BinanceTradingBot:
                     # Получаем текущую цену
                     current_price = self.exchange.get_current_price(position.symbol)
 
-                    # Отменяем TP/SL ордера
-                    if self.paper_mode:
+                    # Отменяем TP/SL ордера (если они существуют)
+                    if self.paper_mode and hasattr(self.exchange, 'orders'):
                         try:
-                            if position.tp_order_id:
+                            if position.tp_order_id and position.tp_order_id in self.exchange.orders:
                                 self.exchange.cancel_order(position.symbol, position.tp_order_id)
-                            if position.sl_order_id:
+                            if position.sl_order_id and position.sl_order_id in self.exchange.orders:
                                 self.exchange.cancel_order(position.symbol, position.sl_order_id)
                         except Exception as e:
                             logger.warning(f"Failed to cancel TP/SL for {position.symbol}: {e}")
@@ -1062,6 +1063,55 @@ class BinanceTradingBot:
                     print(f"❌ Error closing {position.symbol}: {e}")
         else:
             print("ℹ️  No open positions to close\n")
+
+        # ═══════════════════════════════════════════════════════════
+        # ИТОГИ: Показываем финальный баланс
+        # ═══════════════════════════════════════════════════════════
+
+        if self.paper_mode:
+            print("\n" + "="*80)
+            print("💰 FINAL BALANCE")
+            print("="*80)
+
+            current_balance = self.exchange.get_balance('USDT')
+            initial_balance = self.exchange.initial_capital
+
+            # Подсчитываем общий PnL из закрытых позиций
+            total_pnl = sum(
+                pos.pnl_after_commission
+                for pos in self.position_manager.closed_positions
+            )
+
+            # Статистика по позициям
+            total_closed = len(self.position_manager.closed_positions)
+            if total_closed > 0:
+                wins = sum(1 for pos in self.position_manager.closed_positions if pos.pnl_after_commission > 0)
+                losses = total_closed - wins
+                win_rate = (wins / total_closed) * 100 if total_closed > 0 else 0
+
+                print(f"\n📊 Trading Statistics:")
+                print(f"  Total trades:     {total_closed}")
+                print(f"  Winning trades:   {wins} ({win_rate:.1f}%)")
+                print(f"  Losing trades:    {losses}")
+                print(f"  Total PnL:        ${total_pnl:+,.2f}")
+
+            print(f"\n💵 Account Balance:")
+            print(f"  Initial balance:  ${initial_balance:,.2f}")
+            print(f"  Current balance:  ${current_balance:,.2f}")
+            print(f"  Net change:       ${current_balance - initial_balance:+,.2f}")
+
+            # Если есть резервный фонд
+            if self.reinvestment and self.reinvestment.reserve_fund > 0:
+                reserve = self.reinvestment.reserve_fund
+                total_equity = current_balance + reserve
+                print(f"\n  Reserve fund:     ${reserve:,.2f}")
+                print(f"  Total equity:     ${total_equity:,.2f}")
+                print(f"  Total change:     ${total_equity - initial_balance:+,.2f}")
+
+            # ROI
+            roi = ((current_balance - initial_balance) / initial_balance) * 100
+            print(f"\n  ROI:              {roi:+.2f}%")
+            print("="*80)
 
         # ═══════════════════════════════════════════════════════════
         # ШАГ 2: Отменяем все оставшиеся активные ордера
