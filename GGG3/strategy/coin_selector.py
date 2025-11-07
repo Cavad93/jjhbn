@@ -33,6 +33,14 @@ except ImportError:
     from strategy.sector_config import get_coin_sector, get_sector_limit, count_coins_per_sector
     from strategy.blacklist import is_blacklisted, is_high_risk, get_risk_level, get_max_allocation
 
+# Импорт функций для вычисления контекстных фич META
+try:
+    from features.context_features import build_context_features
+except ImportError:
+    import sys
+    sys.path.append('/home/user/jjhbn/GGG3')
+    from features.context_features import build_context_features
+
 # Импорт адаптивных множителей TP/SL
 import sys
 sys.path.append('/home/user/jjhbn/GGG3')
@@ -437,6 +445,9 @@ class CoinSelector:
                 sector = get_coin_sector(symbol)
                 risk_level = get_risk_level(symbol)
 
+                # ✅ Вычисляем контекстные фичи для META (7D)
+                context_features = build_context_features(df_4h, symbol=symbol)
+
                 # Формируем opportunity
                 opportunity = {
                     'symbol': symbol,
@@ -453,7 +464,8 @@ class CoinSelector:
                     'risk_level': risk_level,
                     'timestamp': datetime.now().isoformat(),
                     'ml_predictions': ml_predictions,  # ML предсказания для META
-                    'features': features  # 68D фичи для snapshot
+                    'features': features,  # 68D фичи для snapshot
+                    'context': context_features  # ✅ 7D контекстные фичи для META
                 }
 
                 opportunities.append(opportunity)

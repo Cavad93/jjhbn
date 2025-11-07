@@ -625,10 +625,11 @@ class BinanceTradingBot:
                 'features_68d': opportunity.get('features', np.zeros(68)),
                 'predictions': opportunity.get('predictions', {}),
                 'ml_predictions': opportunity.get('ml_predictions', {}),  # ML предсказания для META
-                'meta_context': opportunity.get('context', {}),
+                'meta_context': opportunity.get('context', {}),  # ✅ СОХРАНЯЕМ РЕАЛЬНЫЕ КОНТЕКСТНЫЕ ФИЧИ
                 'p_meta': opportunity['p_up'],
                 'phase': opportunity.get('phase', 0),  # Фаза рынка
-                'timestamp': time.time()
+                'timestamp': time.time(),
+                'context': opportunity.get('context', {})  # ✅ Дублируем для совместимости
             }
 
             # Создаем Position объект
@@ -827,7 +828,20 @@ class BinanceTradingBot:
                 # Определяем фактический результат
                 y_up = 1 if position.pnl > 0 else 0
 
-                # Передаем в META для обучения
+                # ✅ Формируем полный контекст из snapshot (реальные значения из t0)
+                context = snapshot.get('context', {})
+                reg_ctx = {
+                    'phase': snapshot.get('phase', 0),
+                    'vol_ratio': context.get('vol_ratio', 1.0),
+                    'trend_macd': context.get('trend_macd', 0.0),
+                    'jump_detected': context.get('jump_detected', False),
+                    'funding_sign': context.get('funding_sign', 0.0),
+                    'book_imb': context.get('book_imb', 0.0),
+                    'ofi_15s': context.get('ofi_15s', 0.0),
+                    'basis_pct': context.get('basis_pct', 0.0)
+                }
+
+                # Передаем в META для обучения с РЕАЛЬНЫМ КОНТЕКСТОМ
                 self.meta.record_result(
                     p_xgb=ml_preds.get('xgb'),
                     p_rf=ml_preds.get('rf'),
@@ -837,9 +851,9 @@ class BinanceTradingBot:
                     y_up=y_up,
                     used_in_live=True,
                     p_final_used=snapshot.get('p_meta'),
-                    reg_ctx={'phase': snapshot.get('phase', 0)}
+                    reg_ctx=reg_ctx  # ✅ ПЕРЕДАЕМ РЕАЛЬНЫЙ КОНТЕКСТ из t0
                 )
-                logger.debug(f"META.record_result() called for {position.symbol}: y_up={y_up}")
+                logger.debug(f"META.record_result() called for {position.symbol}: y_up={y_up}, context={reg_ctx}")
         except Exception as e:
             logger.error(f"Error recording result to META: {e}")
 
