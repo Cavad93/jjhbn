@@ -27,18 +27,6 @@ import logging
 import pickle
 import numpy as np
 
-# Исправление кодировки для Windows консоли
-if sys.platform == 'win32':
-    try:
-        # Устанавливаем UTF-8 для вывода
-        import codecs
-        sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
-        sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
-        # Переключаем консоль на UTF-8
-        os.system('chcp 65001 >nul 2>&1')
-    except Exception:
-        pass  # Игнорируем ошибки, если не получилось
-
 # Добавляем путь к GGG3
 sys.path.insert(0, str(Path(__file__).parent))
 
