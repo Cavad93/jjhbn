@@ -359,6 +359,11 @@ class BinanceClient:
             # Возвращаем только нужные колонки
             result = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
 
+            # Устанавливаем timestamp как DatetimeIndex (требуется для BaseLogic)
+            result = result.set_index('timestamp')
+            # Добавляем timestamp как колонку для совместимости
+            result['timestamp'] = result.index
+
             logger.debug(f"Retrieved {len(result)} candles for {symbol}")
             return result
 

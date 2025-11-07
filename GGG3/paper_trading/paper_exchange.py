@@ -883,14 +883,30 @@ class PaperExchange:
                 df['close'] = df['close'].astype(float)
                 df['volume'] = df['volume'].astype(float)
 
+                # Устанавливаем timestamp как DatetimeIndex (требуется для BaseLogic)
+                df = df.set_index('timestamp')
+                # Добавляем timestamp как колонку для совместимости
+                df['timestamp'] = df.index
+
                 return df
 
-            except Exception:
+            except Exception as e:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(f"Failed to fetch from {base_url}: {e}")
                 continue
 
-        # Все endpoints failed - возвращаем пустой DataFrame
+        # Все endpoints failed - возвращаем пустой DataFrame с DatetimeIndex
         import pandas as pd
-        return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"All endpoints failed for {symbol} {timeframe}, returning empty DataFrame")
+
+        empty_df = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+        empty_df.index = pd.DatetimeIndex([])
+        empty_df.index.name = 'timestamp'
+        empty_df['timestamp'] = empty_df.index
+        return empty_df
 
     def get_statistics(self) -> dict:
         """
