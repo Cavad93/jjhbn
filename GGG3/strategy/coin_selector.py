@@ -33,6 +33,11 @@ except ImportError:
     from strategy.sector_config import get_coin_sector, get_sector_limit, count_coins_per_sector
     from strategy.blacklist import is_blacklisted, is_high_risk, get_risk_level, get_max_allocation
 
+# Импорт адаптивных множителей TP/SL
+import sys
+sys.path.append('/home/user/jjhbn/GGG3')
+import binance_config
+
 
 class CoinSelector:
     """
@@ -408,18 +413,21 @@ class CoinSelector:
                 # Рассчитываем EV для обоих направлений
                 ev_long, ev_short = self.calculate_ev_bidirectional(p_up)
 
+                # Получаем адаптивные множители TP/SL на основе волатильности
+                tp_mult, sl_mult = binance_config.get_adaptive_tp_sl_multipliers(atr_pct)
+
                 # Выбираем лучшее направление
                 if ev_long > self.min_ev_threshold and ev_long > ev_short:
                     direction = 'LONG'
                     ev = ev_long
-                    tp_price = entry_price + 1.2 * atr_value
-                    sl_price = entry_price - 0.8 * atr_value
+                    tp_price = entry_price + tp_mult * atr_value
+                    sl_price = entry_price - sl_mult * atr_value
 
                 elif ev_short > self.min_ev_threshold and ev_short > ev_long:
                     direction = 'SHORT'
                     ev = ev_short
-                    tp_price = entry_price - 1.2 * atr_value
-                    sl_price = entry_price + 0.8 * atr_value
+                    tp_price = entry_price - tp_mult * atr_value
+                    sl_price = entry_price + sl_mult * atr_value
 
                 else:
                     # Нет подходящего направления с достаточным EV

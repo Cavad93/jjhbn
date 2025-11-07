@@ -571,13 +571,22 @@ class BinanceTradingBot:
             from features.builder import BinanceFeatureBuilder
             atr = BinanceFeatureBuilder.calculate_atr(df_4h, period=config.ATR_PERIOD).iloc[-1]
 
-            # TP/SL уровни
+            # Рассчитываем ATR в процентах для адаптивных множителей
+            atr_pct = (atr / current_price) * 100
+
+            # Получаем адаптивные множители TP/SL на основе волатильности
+            tp_mult, sl_mult = config.get_adaptive_tp_sl_multipliers(atr_pct)
+
+            # Рассчитываем R:R ratio для Kelly Criterion
+            rr_ratio = tp_mult / sl_mult
+
+            # TP/SL уровни с адаптивными множителями
             if direction == 'LONG':
-                tp_price = current_price + config.TP_ATR_MULTIPLIER * atr
-                sl_price = current_price - config.SL_ATR_MULTIPLIER * atr
+                tp_price = current_price + tp_mult * atr
+                sl_price = current_price - sl_mult * atr
             else:  # SHORT
-                tp_price = current_price - config.TP_ATR_MULTIPLIER * atr
-                sl_price = current_price + config.SL_ATR_MULTIPLIER * atr
+                tp_price = current_price - tp_mult * atr
+                sl_price = current_price + sl_mult * atr
 
             # Размер позиции (Kelly)
             capital = self.exchange.get_balance('USDT')
@@ -605,7 +614,8 @@ class BinanceTradingBot:
                 capital=capital,
                 ev=opportunity['ev'],
                 p_up=opportunity['p_up'],
-                recent_wr=self.stats['win_rate_last_100']
+                recent_wr=self.stats['win_rate_last_100'],
+                rr_ratio=rr_ratio
             )
 
             amount = position_size_usd / current_price

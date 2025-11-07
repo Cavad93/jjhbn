@@ -24,7 +24,8 @@ def calculate_kelly_position_size(
     ev: float,
     p_up: float,
     recent_wr: float = 0.5,
-    kelly_fraction: float = 0.25
+    kelly_fraction: float = 0.25,
+    rr_ratio: float = None
 ) -> float:
     """
     Рассчитывает размер позиции на основе Kelly Criterion
@@ -44,6 +45,7 @@ def calculate_kelly_position_size(
         p_up: Вероятность достижения TP (0-1)
         recent_wr: Реальный win rate за последние сделки (0-1)
         kelly_fraction: Фракция Kelly (0.25 = четверть Kelly)
+        rr_ratio: Risk/Reward ratio (если None, используется из config)
 
     Returns:
         position_size: Размер позиции в USDT
@@ -56,9 +58,10 @@ def calculate_kelly_position_size(
     # Вероятность проигрыша
     p_loss = 1.0 - p_win
 
-    # Odds (R/R ratio из конфига)
-    # TP = 2.5 ATR, SL = 1.5 ATR => R/R = 2.5/1.5 = 1.667
-    rr_ratio = config.TP_ATR_MULTIPLIER / config.SL_ATR_MULTIPLIER
+    # Odds (R/R ratio)
+    # Если не передан, используем значение из конфига
+    if rr_ratio is None:
+        rr_ratio = config.TP_ATR_MULTIPLIER / config.SL_ATR_MULTIPLIER
 
     # Kelly formula
     # f = (p * b - q) / b
@@ -90,7 +93,8 @@ def get_kelly_explanation(
     p_up: float,
     recent_wr: float,
     position_size: float,
-    kelly_fraction: float = 0.25
+    kelly_fraction: float = 0.25,
+    rr_ratio: float = None
 ) -> str:
     """
     Возвращает текстовое объяснение расчета Kelly
@@ -102,13 +106,15 @@ def get_kelly_explanation(
         recent_wr: Реальный win rate
         position_size: Рассчитанный размер позиции
         kelly_fraction: Фракция Kelly
+        rr_ratio: Risk/Reward ratio (если None, используется из config)
 
     Returns:
         explanation: Текстовое объяснение
     """
     p_win = (p_up + recent_wr) / 2.0
     p_loss = 1.0 - p_win
-    rr_ratio = config.TP_ATR_MULTIPLIER / config.SL_ATR_MULTIPLIER
+    if rr_ratio is None:
+        rr_ratio = config.TP_ATR_MULTIPLIER / config.SL_ATR_MULTIPLIER
     kelly_full = (p_win * rr_ratio - p_loss) / rr_ratio
     kelly = kelly_full * kelly_fraction
     kelly = max(config.MIN_RISK_PER_POSITION, min(kelly, config.MAX_RISK_PER_POSITION))
