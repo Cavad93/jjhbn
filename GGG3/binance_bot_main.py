@@ -107,8 +107,20 @@ class BinanceTradingBot:
 
         # Binance client / Paper Exchange
         if paper_mode:
-            self.exchange = PaperExchange(initial_capital=config.PAPER_INITIAL_BALANCE)
-            print(f"  Mode: 📄 PAPER TRADING (${config.PAPER_INITIAL_BALANCE})")
+            # Попытка загрузить существующее состояние Paper Exchange
+            state_file = 'data/paper_exchange_state.json'
+            if os.path.exists(state_file):
+                try:
+                    self.exchange = PaperExchange.load_state(state_file)
+                    balance = self.exchange.balance
+                    print(f"  Mode: 📄 PAPER TRADING (Loaded: ${balance:.2f} USDT)")
+                except Exception as e:
+                    print(f"  ⚠️  Failed to load Paper Exchange state: {e}")
+                    self.exchange = PaperExchange(initial_capital=config.PAPER_INITIAL_BALANCE)
+                    print(f"  Mode: 📄 PAPER TRADING (New: ${config.PAPER_INITIAL_BALANCE})")
+            else:
+                self.exchange = PaperExchange(initial_capital=config.PAPER_INITIAL_BALANCE)
+                print(f"  Mode: 📄 PAPER TRADING (New: ${config.PAPER_INITIAL_BALANCE})")
         else:
             self.exchange = BinanceClient(
                 api_key=config.BINANCE_API_KEY,
@@ -760,6 +772,14 @@ class BinanceTradingBot:
         print("\nShutting down...")
         self.position_manager.save_to_file()
         print("✅ Positions saved")
+
+        # Сохранение баланса Paper Exchange
+        if self.paper_mode:
+            try:
+                self.exchange.save_state('data/paper_exchange_state.json')
+                print("✅ Paper Exchange balance saved")
+            except Exception as e:
+                print(f"⚠️  Failed to save Paper Exchange state: {e}")
 
         # Print reinvestment summary if enabled
         if self.paper_mode and self.reinvestment:
