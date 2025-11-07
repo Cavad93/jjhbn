@@ -47,7 +47,7 @@ class ReinvestmentManager:
 
     Стратегия:
     - 100% прироста капитала реинвестируется
-    - 50% дневной прибыли → резервный фонд
+    - 30% дневной прибыли → резервный фонд (настраивается в config)
     - Резерв защищает от drawdown
     """
 
@@ -134,7 +134,7 @@ class ReinvestmentManager:
             daily_profit = max(0, current_equity - self.initial_capital)
 
             if daily_profit > 0:
-                # 50% прибыли → резерв
+                # Процент прибыли → резерв (30% по умолчанию из config)
                 to_reserve = daily_profit * self.profit_to_reserve_pct
                 self.reserve_fund += to_reserve
 
