@@ -26,17 +26,24 @@ def get_adaptive_threshold(
     total_closed: int,
     recent_hour: int,
     recent_wr: float,
-    calib_error: float
+    calib_error: float,
+    last_trade_time: float = None
 ) -> float:
     """
     Рассчитывает адаптивный порог вероятности для входа в позицию
 
     Логика:
-    1. Базовый порог зависит от количества сделок:
+    1. ХОЛОДНЫЙ СТАРТ (первые 500 сделок):
+       - Фиксированный порог 0.5 для быстрого накопления статистики
+
+    2. БЕЗ АКТИВНОСТИ (нет сделок 1+ час):
+       - Снижаем порог до 0.5 для возобновления торговли
+
+    3. Базовый порог зависит от количества сделок:
        - Если < MIN_TRADES_FOR_ADAPTIVE: используем BASE_THRESHOLD_INITIAL (0.65)
        - Если >= MIN_TRADES_FOR_ADAPTIVE: используем BASE_THRESHOLD_TRAINED (0.58)
 
-    2. Корректировки:
+    4. Корректировки:
        - Win rate < 50%: повышаем порог (+0.05)
        - Win rate > 60%: снижаем порог (-0.03)
        - Calibration error > 0.05: повышаем порог (+0.02)
@@ -48,10 +55,28 @@ def get_adaptive_threshold(
         recent_hour: Количество сделок за последний час
         recent_wr: Win rate за последние 100 сделок (0-1)
         calib_error: Expected Calibration Error модели (0-1)
+        last_trade_time: Timestamp последней сделки (Unix time) для проверки активности
 
     Returns:
         threshold: Адаптивный порог вероятности (0-1)
     """
+    import time
+
+    # ===== ХОЛОДНЫЙ СТАРТ: Первые 500 сделок =====
+    if total_closed < 500:
+        # Фиксированный низкий порог для быстрого накопления данных
+        return 0.5
+
+    # ===== ПРОВЕРКА АКТИВНОСТИ: Нет сделок > 1 часа =====
+    if last_trade_time is not None:
+        time_since_last_trade = time.time() - last_trade_time
+        hours_since_last_trade = time_since_last_trade / 3600.0
+
+        if hours_since_last_trade >= 1.0:
+            # Нет сделок больше часа - снижаем порог для возобновления активности
+            return 0.5
+
+    # ===== ОБЫЧНЫЙ РЕЖИМ =====
 
     # Базовый порог
     if total_closed < config.MIN_TRADES_FOR_ADAPTIVE:

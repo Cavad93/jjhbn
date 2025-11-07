@@ -26,6 +26,7 @@ from typing import Dict, List, Optional
 import logging
 import pickle
 import numpy as np
+import pandas as pd
 
 # Добавляем путь к GGG3
 sys.path.insert(0, str(Path(__file__).parent))
@@ -179,6 +180,9 @@ class BinanceTradingBot:
             'recent_hour_trades': 0
         }
 
+        # Track last trade time for adaptive threshold
+        self.last_trade_time = None
+
         print("\n✅ Bot initialized successfully\n")
         print("="*80)
 
@@ -262,9 +266,52 @@ class BinanceTradingBot:
         wins = sum(1 for p in closed if p.get('pnl', 0) > 0)
         return wins / len(closed)
 
-    def _get_predictions(self, features: np.ndarray, phase: int, symbol: str) -> float:
+    def _get_predictions(self, features: np.ndarray, phase: int, symbol: str, df_4h: pd.DataFrame = None) -> float:
         """
-        Получает предсказания от ML моделей и возвращает итоговую вероятность
+        Получает предсказание вероятности роста от БАЗОВОЙ ЛОГИКИ
+
+        ВАЖНО: Используется ТОЛЬКО базовая логика (БЕЗ ML)!
+        ML эксперты собираются отдельно для обучения META в shadow режиме.
+
+        Args:
+            features: 68D вектор фич (не используется для базовой логики)
+            phase: Фаза рынка (0-5)
+            symbol: Символ монеты
+            df_4h: DataFrame 4h для базовой логики
+
+        Returns:
+            p_up: Вероятность роста (0-1) от базовой логики
+        """
+        try:
+            # ===== ИСПОЛЬЗУЕМ ТОЛЬКО БАЗОВУЮ ЛОГИКУ =====
+            # BaseLogicMultiTF работает на основе правил и индикаторов БЕЗ ML
+
+            if df_4h is not None and len(df_4h) >= 50:
+                # Используем базовую логику с 4h данными
+                p_up, p_down = self.base_logic.predict(df_4h)
+
+                # Проверяем валидность
+                if not np.isfinite(p_up) or p_up < 0 or p_up > 1:
+                    logger.warning(f"{symbol}: Invalid p_up from base_logic: {p_up}, using 0.5")
+                    p_up = 0.5
+
+                return float(p_up)
+            else:
+                # Если нет df_4h, используем нейтральное значение
+                logger.warning(f"{symbol}: No df_4h provided, using neutral p_up=0.5")
+                return 0.5
+
+        except Exception as e:
+            logger.error(f"Error getting base_logic prediction for {symbol}: {e}")
+            # Fallback - нейтральное значение
+            return 0.5
+
+    def _collect_ml_predictions_for_meta(self, features: np.ndarray, phase: int, symbol: str) -> Dict[str, float]:
+        """
+        Собирает предсказания от ML экспертов для передачи в META (shadow режим)
+
+        ВАЖНО: Эти предсказания НЕ используются для торговли!
+        Они передаются в META для обучения в background.
 
         Args:
             features: 68D вектор фич
@@ -272,66 +319,42 @@ class BinanceTradingBot:
             symbol: Символ монеты
 
         Returns:
-            p_up: Вероятность роста (0-1)
+            predictions: Dict с предсказаниями экспертов {'xgb': 0.62, 'rf': 0.58, ...}
         """
-        try:
-            # Собираем предсказания от экспертов
-            predictions = {}
+        predictions = {}
 
+        try:
             # XGBoost
             if self.experts.get('xgb') is not None:
                 try:
                     p_xgb = self.experts['xgb'].predict_proba(features.reshape(1, -1))[0]
-                    predictions['xgb'] = p_xgb
-                except Exception:
-                    pass
+                    if np.isfinite(p_xgb) and 0 <= p_xgb <= 1:
+                        predictions['xgb'] = float(p_xgb)
+                except Exception as e:
+                    logger.debug(f"{symbol}: XGBoost prediction failed: {e}")
 
             # Random Forest
             if self.experts.get('rf') is not None:
                 try:
                     p_rf = self.experts['rf'].predict_proba(features.reshape(1, -1))[0]
-                    predictions['rf'] = p_rf
-                except Exception:
-                    pass
+                    if np.isfinite(p_rf) and 0 <= p_rf <= 1:
+                        predictions['rf'] = float(p_rf)
+                except Exception as e:
+                    logger.debug(f"{symbol}: RandomForest prediction failed: {e}")
 
             # Neural Network
             if self.experts.get('nn') is not None:
                 try:
                     p_nn = self.experts['nn'].predict_proba(features.reshape(1, -1))[0]
-                    predictions['nn'] = p_nn
-                except Exception:
-                    pass
-
-            # Если нет ни одного предсказания, используем базовую логику
-            if not predictions:
-                p_up = self.base_logic.predict_proba(features.reshape(1, -1))[0]
-                return float(p_up)
-
-            # Если есть META модель, используем её
-            if self.meta is not None:
-                try:
-                    # META комбинирует предсказания экспертов
-                    # Предполагаем, что META содержит 'predict' функцию
-                    # Для упрощения используем среднее если META не готова
-                    p_up = np.mean(list(predictions.values()))
-                except Exception:
-                    # Fallback на среднее
-                    p_up = np.mean(list(predictions.values()))
-            else:
-                # Используем среднее арифметическое
-                p_up = np.mean(list(predictions.values()))
-
-            return float(p_up)
+                    if np.isfinite(p_nn) and 0 <= p_nn <= 1:
+                        predictions['nn'] = float(p_nn)
+                except Exception as e:
+                    logger.debug(f"{symbol}: NeuralNet prediction failed: {e}")
 
         except Exception as e:
-            logger.error(f"Error getting predictions for {symbol}: {e}")
-            # Fallback на базовую логику
-            try:
-                p_up = self.base_logic.predict_proba(features.reshape(1, -1))[0]
-                return float(p_up)
-            except Exception:
-                # Последний fallback - нейтральное значение
-                return 0.5
+            logger.error(f"Error collecting ML predictions for {symbol}: {e}")
+
+        return predictions
 
     # ========================================================================
     # MAIN LOOP
@@ -454,7 +477,8 @@ class BinanceTradingBot:
             total_closed=self.total_closed_trades,
             recent_hour=self.stats['recent_hour_trades'],
             recent_wr=self.stats['win_rate_last_100'],
-            calib_error=self.stats['calibration_error']
+            calib_error=self.stats['calibration_error'],
+            last_trade_time=self.last_trade_time
         )
 
         print(f"  Adaptive threshold: {p_threshold:.4f}")
@@ -793,6 +817,7 @@ class BinanceTradingBot:
         # Обновляем статистику
         self.total_closed_trades += 1
         self.stats['win_rate_last_100'] = self._calculate_win_rate()
+        self.last_trade_time = time.time()  # Track time for adaptive threshold
 
         # Сбрасываем trailing stop
         self.trailing_stop.reset_position(position.symbol)
