@@ -940,6 +940,16 @@ class BinanceTradingBot:
         except Exception as e:
             logger.error(f"Error recording result to META: {e}")
 
+        # Отменяем TP/SL ордера в exchange (для paper trading)
+        if self.paper_mode:
+            try:
+                if position.tp_order_id:
+                    self.exchange.cancel_order(position.symbol, position.tp_order_id)
+                if position.sl_order_id:
+                    self.exchange.cancel_order(position.symbol, position.sl_order_id)
+            except Exception as e:
+                logger.warning(f"Failed to cancel TP/SL orders for {position.symbol}: {e}")
+
         # Закрываем позицию в manager
         self.position_manager.close_position(position.symbol, exit_price, exit_reason)
 
