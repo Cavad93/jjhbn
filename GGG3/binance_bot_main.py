@@ -646,10 +646,12 @@ class BinanceTradingBot:
 
                 # Логируем решения Haiku
                 for i, opp in enumerate(top_10_enriched, 1):
-                    haiku_score = opp.get('haiku_score', 'N/A')
+                    haiku_score = opp.get('haiku_score', 0.5)
                     haiku_reason = opp.get('haiku_reason', 'N/A')
+                    # Форматируем haiku_score правильно
+                    fund_str = f"{haiku_score:.3f}" if isinstance(haiku_score, (int, float)) else str(haiku_score)
                     print(f"    {i:2d}. {opp['symbol']:<12} {opp['direction']:<6} "
-                          f"tech={opp['p_up']:.3f} fund={haiku_score:.3f if isinstance(haiku_score, float) else haiku_score} "
+                          f"tech={opp['p_up']:.3f} fund={fund_str} "
                           f"EV={opp['ev']:.4f} ({haiku_reason})")
 
                 # Используем обогащённый список для открытия позиций
