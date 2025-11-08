@@ -1045,6 +1045,22 @@ class BinanceTradingBot:
             except Exception as e:
                 logger.warning(f"Failed to cancel TP/SL orders for {position.symbol}: {e}")
 
+        # ═══════════════════════════════════════════════════════════════════════
+        # КРИТИЧНО: Закрываем позицию в exchange для возврата баланса
+        # Без этого баланс "застревает" в закрытых позициях!
+        # ═══════════════════════════════════════════════════════════════════════
+        if self.paper_mode:
+            try:
+                # Создаем market order для закрытия позиции
+                close_side = 'SELL' if position.direction == 'LONG' else 'BUY'
+                self.exchange.create_market_order(
+                    symbol=position.symbol,
+                    side=close_side,
+                    amount=position.amount
+                )
+            except Exception as e:
+                logger.error(f"Failed to close position in exchange for {position.symbol}: {e}")
+
         # Закрываем позицию в manager
         self.position_manager.close_position(position.symbol, exit_price, exit_reason)
 
@@ -1129,22 +1145,8 @@ class BinanceTradingBot:
                     # Получаем текущую цену
                     current_price = self.exchange.get_current_price(position.symbol)
 
-                    # Отменяем TP/SL ордера (если они существуют)
-                    if self.paper_mode and hasattr(self.exchange, 'orders'):
-                        try:
-                            if position.tp_order_id and position.tp_order_id in self.exchange.orders:
-                                self.exchange.cancel_order(position.symbol, position.tp_order_id)
-                            if position.sl_order_id and position.sl_order_id in self.exchange.orders:
-                                self.exchange.cancel_order(position.symbol, position.sl_order_id)
-                        except Exception as e:
-                            logger.warning(f"Failed to cancel TP/SL for {position.symbol}: {e}")
-
-                    # Закрываем позицию
-                    self.position_manager.close_position(
-                        symbol=position.symbol,
-                        exit_price=current_price,
-                        exit_reason='SHUTDOWN'
-                    )
+                    # Закрываем позицию через общий метод (который теперь корректно возвращает баланс)
+                    self.close_position(position, 'SHUTDOWN', current_price)
 
                     print(f"✅ Closed {position.symbol}: Entry={position.entry_price:.6f}, Exit={current_price:.6f}")
 
