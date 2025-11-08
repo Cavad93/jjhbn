@@ -105,12 +105,15 @@ def create_backup(base_dir: Path) -> Path:
     # Создаем директорию для бэкапа
     backup_dir.mkdir(exist_ok=True)
 
-    # Файлы для бэкапа
+    # Файлы для бэкапа (исправленные пути!)
     files_to_backup = [
-        ('data/positions.json', 'Позиции'),
-        ('data/paper_exchange_state.json', 'Баланс PaperExchange'),
+        ('data/positions/positions.json', 'Позиции'),
+        ('paper_trading/data/paper_exchange_state.json', 'Баланс PaperExchange'),
+        ('paper_trading/data/paper_bot_state.json', 'Состояние PaperBot'),
         ('data/reinvestment_state.json', 'Реинвестирование'),
         ('data/capital_history.json', 'История капитала'),
+        ('portfolio/data/reinvestment_state.json', 'Реинвестирование (portfolio)'),
+        ('portfolio/data/capital_history.json', 'История капитала (portfolio)'),
     ]
 
     backed_up = 0
@@ -173,19 +176,24 @@ def cold_start(
 
     print_header("УДАЛЕНИЕ ДАННЫХ О ПОЗИЦИЯХ")
 
+    # Позиции (в подпапке data/positions/)
+    positions_dir = base_dir / 'data' / 'positions'
+    delete_file(positions_dir / 'positions.json', "Позиции (positions.json)")
+
+    # Paper Exchange (в подпапке paper_trading/data/)
+    paper_data_dir = base_dir / 'paper_trading' / 'data'
+    delete_file(paper_data_dir / 'paper_exchange_state.json', "Баланс PaperExchange")
+    delete_file(paper_data_dir / 'paper_bot_state.json', "Состояние PaperBot")
+
+    # Реинвестирование и капитал (могут быть в разных местах)
     data_dir = base_dir / 'data'
-
-    # Позиции
-    delete_file(data_dir / 'positions.json', "Позиции (positions.json)")
-
-    # Paper Exchange
-    delete_file(data_dir / 'paper_exchange_state.json', "Баланс PaperExchange")
-
-    # Реинвестирование
     delete_file(data_dir / 'reinvestment_state.json', "История реинвестирования")
-
-    # История капитала
     delete_file(data_dir / 'capital_history.json', "История капитала")
+
+    # Также проверяем портфельные данные
+    portfolio_data_dir = base_dir / 'portfolio' / 'data'
+    delete_file(portfolio_data_dir / 'reinvestment_state.json', "История реинвестирования (portfolio)")
+    delete_file(portfolio_data_dir / 'capital_history.json', "История капитала (portfolio)")
 
     # Логи
     if not keep_logs:
@@ -221,21 +229,30 @@ def cold_start(
 
     print_header("ИНИЦИАЛИЗАЦИЯ ЧИСТОГО СОСТОЯНИЯ")
 
-    # Создаем data директорию если не существует
-    data_dir.mkdir(exist_ok=True)
+    # Создаем директории если не существуют
+    positions_dir = base_dir / 'data' / 'positions'
+    positions_dir.mkdir(parents=True, exist_ok=True)
 
-    # Создаем пустой positions.json
+    paper_data_dir = base_dir / 'paper_trading' / 'data'
+    paper_data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Создаем пустой positions.json (в правильной директории!)
     positions_data = {
         "open_positions": [],
         "closed_positions": [],
-        "last_updated": datetime.now().isoformat()
+        "metadata": {
+            "max_positions": 10,
+            "total_open": 0,
+            "total_closed": 0,
+            "last_updated": datetime.now().isoformat()
+        }
     }
 
-    with open(data_dir / 'positions.json', 'w') as f:
+    with open(positions_dir / 'positions.json', 'w') as f:
         json.dump(positions_data, f, indent=2)
-    print_success("Создан чистый positions.json")
+    print_success(f"Создан чистый positions.json в {positions_dir}")
 
-    # Создаем пустой paper_exchange_state.json
+    # Создаем пустой paper_exchange_state.json (в правильной директории!)
     # Читаем начальный капитал из конфига
     try:
         sys.path.insert(0, str(base_dir))
@@ -250,18 +267,19 @@ def cold_start(
         "initial_capital": initial_capital,
         "positions": {},
         "orders": {},
-        "trades_history": [],
-        "closed_positions": [],
+        "equity_history": [],
         "slippage": 0.0005,
-        "commission": 0.001,
-        "last_updated": datetime.now().isoformat()
+        "commission": 0.001
     }
 
-    with open(data_dir / 'paper_exchange_state.json', 'w') as f:
+    with open(paper_data_dir / 'paper_exchange_state.json', 'w') as f:
         json.dump(exchange_data, f, indent=2)
-    print_success(f"Создан чистый paper_exchange_state.json (баланс: ${initial_capital})")
+    print_success(f"Создан чистый paper_exchange_state.json (баланс: ${initial_capital}) в {paper_data_dir}")
 
     # Создаем пустой capital_history.json
+    data_dir = base_dir / 'data'
+    data_dir.mkdir(exist_ok=True)
+
     capital_data = {
         "history": [],
         "last_updated": datetime.now().isoformat()
