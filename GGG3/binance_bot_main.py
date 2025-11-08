@@ -589,12 +589,25 @@ class BinanceTradingBot:
             print(f"    {i}. {opp['symbol']:<12} {opp['direction']:<6} "
                   f"p_up={opp['p_up']:.3f}  EV={opp['ev']:.4f}")
 
-        # Закрываем позиции не в топ-10
-        top_symbols = {opp['symbol'] for opp in top_opportunities}
+        # Закрываем позиции не в топ-20 (даем больше пространства)
+        # Получаем расширенный список топ-20 для проверки
+        top_20_opportunities = self.coin_selector.select_top_coins(
+            all_pairs=all_pairs,
+            get_ticker_func=lambda s: self.exchange.get_ticker(s),
+            get_ohlcv_func=lambda s, tf, lim: self.exchange.get_ohlcv(s, tf, lim),
+            feature_builder=self.feature_builder,
+            calculate_atr_func=calculate_atr,
+            calculate_phase_func=detect_market_phase,
+            get_predictions_func=self._get_predictions,
+            collect_ml_predictions_func=self._collect_ml_predictions_for_meta,
+            top_n=20  # Топ-20 для проверки закрытия
+        )
+
+        top_20_symbols = {opp['symbol'] for opp in top_20_opportunities}
 
         for position in list(self.position_manager.get_all_open()):
-            if position.symbol not in top_symbols:
-                print(f"\n  Closing {position.symbol}: not in top-10 anymore")
+            if position.symbol not in top_20_symbols:
+                print(f"\n  Closing {position.symbol}: not in top-20 anymore")
                 self.close_position_manual(position)
 
         # Открываем новые позиции
