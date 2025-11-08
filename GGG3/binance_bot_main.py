@@ -1220,7 +1220,9 @@ class BinanceTradingBot:
             print("\n" + "="*80)
             print("📊 REINVESTMENT SUMMARY")
             print("="*80)
-            self.reinvestment.print_summary()
+            # Передаём текущий баланс для отображения актуального состояния
+            current_balance = self.exchange.get_balance('USDT')
+            self.reinvestment.print_summary(current_balance=current_balance)
 
         # Send bot stopped notification
         if config.TELEGRAM_ALERT_TYPES.get('bot_stopped', True):

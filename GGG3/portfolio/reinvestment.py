@@ -380,15 +380,34 @@ class ReinvestmentManager:
         """
         return self.daily_history[-days:]
 
-    def print_summary(self):
-        """Выводит краткую сводку"""
+    def print_summary(self, current_balance: Optional[float] = None):
+        """
+        Выводит краткую сводку
+
+        Args:
+            current_balance: Текущий баланс (для отображения актуального состояния)
+        """
         stats = self.get_statistics()
 
         print("\n" + "="*80)
         print("REINVESTMENT SUMMARY")
         print("="*80)
         print(f"Initial Capital:      ${stats['initial_capital']:,.2f}")
+
+        # Если передан текущий баланс - показываем актуальное состояние
+        if current_balance is not None:
+            net_change = current_balance - stats['initial_capital']
+            roi_pct = (net_change / stats['initial_capital'] * 100) if stats['initial_capital'] > 0 else 0
+            print(f"Current Balance:      ${current_balance:,.2f}")
+            print(f"Net Change:           ${net_change:+,.2f} ({roi_pct:+.2f}%)")
+
         print(f"Reserve Fund:         ${stats['reserve_fund']:,.2f} ({stats['reserve_pct_of_initial']:.1f}% of initial)")
+
+        # Если есть резерв, показываем total equity
+        if current_balance is not None and stats['reserve_fund'] > 0:
+            total_equity = current_balance + stats['reserve_fund']
+            print(f"Total Equity:         ${total_equity:,.2f} (balance + reserve)")
+
         print(f"Total Profit:         ${stats['total_profit_accumulated']:,.2f}")
         print(f"Total to Reserve:     ${stats['total_to_reserve_accumulated']:,.2f}")
         print(f"Days Tracked:         {stats['days_tracked']}")
