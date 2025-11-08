@@ -858,16 +858,40 @@ class BinanceTradingBot:
                     # Paper mode: проверяем достижение уровней вручную
                     if position.direction == 'LONG':
                         if current_price >= position.tp_price:
+                            # Закрываем позицию на бирже (КРИТИЧНО: возвращает деньги на баланс!)
+                            self.exchange.create_market_order(
+                                symbol=position.symbol,
+                                side='SELL',
+                                amount=position.amount
+                            )
                             self.close_position(position, 'TP', position.tp_price)
                             continue
                         elif current_price <= position.sl_price:
+                            # Закрываем позицию на бирже (КРИТИЧНО: возвращает деньги на баланс!)
+                            self.exchange.create_market_order(
+                                symbol=position.symbol,
+                                side='SELL',
+                                amount=position.amount
+                            )
                             self.close_position(position, 'SL', position.sl_price)
                             continue
                     else:  # SHORT
                         if current_price <= position.tp_price:
+                            # Закрываем позицию на бирже (КРИТИЧНО: возвращает деньги на баланс!)
+                            self.exchange.create_market_order(
+                                symbol=position.symbol,
+                                side='BUY',
+                                amount=position.amount
+                            )
                             self.close_position(position, 'TP', position.tp_price)
                             continue
                         elif current_price >= position.sl_price:
+                            # Закрываем позицию на бирже (КРИТИЧНО: возвращает деньги на баланс!)
+                            self.exchange.create_market_order(
+                                symbol=position.symbol,
+                                side='BUY',
+                                amount=position.amount
+                            )
                             self.close_position(position, 'SL', position.sl_price)
                             continue
 
