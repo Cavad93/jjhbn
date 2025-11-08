@@ -582,12 +582,12 @@ class BinanceTradingBot:
                     self._night_mode_notified = False
 
         # Получаем все торгуемые пары
-        print("Fetching all USDT pairs...")
+        print("Fetching all USDT pairs...", flush=True)
         all_pairs = self.exchange.get_all_usdt_pairs()
-        print(f"  Found {len(all_pairs)} pairs")
+        print(f"  Found {len(all_pairs)} pairs", flush=True)
 
         # Отбираем топ-10
-        print("\nSelecting top-10 opportunities...")
+        print("\nSelecting top-10 opportunities...", flush=True)
 
         # Adaptive threshold
         p_threshold = get_adaptive_threshold(
@@ -631,7 +631,7 @@ class BinanceTradingBot:
         # HAIKU 4.5: Фундаментальный анализ TOP-20 для формирования финального TOP-10
         # ═══════════════════════════════════════════════════════════════════════
         if self.haiku_analyzer is not None:
-            print(f"\n🤖 Running Haiku 4.5 fundamental analysis on TOP-20...")
+            print(f"\n🤖 Running Haiku 4.5 fundamental analysis on TOP-20...", flush=True)
             try:
                 # Анализ и переранжирование с учётом фундаментальных факторов
                 top_10_enriched = analyze_and_rank_top20(
@@ -667,7 +667,7 @@ class BinanceTradingBot:
             # Haiku отключён - используем первые 10 из TOP-20
             top_10_for_opening = top_20_opportunities[:10]
 
-        print(f"\n  Checking if existing positions should be closed (using top-20)...")
+        print(f"\n  Checking if existing positions should be closed (using top-20)...", flush=True)
 
         # Счетчик закрытых позиций
         positions_before_close = len(self.position_manager.get_all_open())
@@ -701,7 +701,7 @@ class BinanceTradingBot:
                 print(f"  [Reinvest] Reserve fund: ${reinvest_result['reserve_fund']:.2f}")
 
         # Открываем новые позиции (используем обогащённый Haiku топ-10)
-        print(f"\n  Opening new positions (using top-10 from Haiku analysis)...")
+        print(f"\n  Opening new positions (using top-10 from Haiku analysis)...", flush=True)
         positions_before_open = len(self.position_manager.get_all_open())
         opened_count = 0
 
