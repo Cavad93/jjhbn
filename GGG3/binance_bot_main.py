@@ -1136,14 +1136,14 @@ class BinanceTradingBot:
 
             # Подсчитываем общий PnL из закрытых позиций
             total_pnl = sum(
-                pos.pnl_after_commission
+                pos.pnl
                 for pos in self.position_manager.closed_positions
             )
 
             # Статистика по позициям
             total_closed = len(self.position_manager.closed_positions)
             if total_closed > 0:
-                wins = sum(1 for pos in self.position_manager.closed_positions if pos.pnl_after_commission > 0)
+                wins = sum(1 for pos in self.position_manager.closed_positions if pos.pnl > 0)
                 losses = total_closed - wins
                 win_rate = (wins / total_closed) * 100 if total_closed > 0 else 0
 
