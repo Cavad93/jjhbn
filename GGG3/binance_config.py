@@ -122,7 +122,7 @@ def get_adaptive_tp_sl_multipliers(atr_pct: float) -> tuple:
 
 # Процент от баланса на одну позицию
 MIN_RISK_PER_POSITION = 0.005  # 0.5%
-MAX_RISK_PER_POSITION = 0.025  # 2.5%
+MAX_RISK_PER_POSITION = 0.09  # 9%
 DEFAULT_RISK_PER_POSITION = 0.009  # 0.9% по умолчанию
 
 # Максимальная просадка (в процентах от начального баланса)
