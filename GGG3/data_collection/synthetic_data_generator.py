@@ -205,7 +205,7 @@ class SyntheticOHLCVGenerator:
 # ============================================================================
 
 def generate_synthetic_dataset(
-    output_dir: str = '/home/user/jjhbn/GGG3/data/historical',
+    output_dir: str = None,
     n_symbols: int = 50,
     timeframes: List[str] = ['5m', '15m', '30m', '4h'],
     n_candles: int = 500
@@ -214,11 +214,16 @@ def generate_synthetic_dataset(
     Генерирует синтетический датасет для множества символов
 
     Args:
-        output_dir: Директория для сохранения
+        output_dir: Директория для сохранения (по умолчанию: относительный путь)
         n_symbols: Количество символов для генерации
         timeframes: Список таймфреймов
         n_candles: Количество свечей на таймфрейм
     """
+    # Используем относительный путь если не указан явно
+    if output_dir is None:
+        project_root = Path(__file__).parent.parent  # GGG3/
+        output_dir = str(project_root / 'data' / 'historical')
+
     os.makedirs(output_dir, exist_ok=True)
 
     # Популярные символы
@@ -327,8 +332,12 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description='Generate synthetic OHLCV data for testing')
+
+    # Вычисляем относительный путь по умолчанию
+    default_output_dir = str(Path(__file__).parent.parent / 'data' / 'historical')
+
     parser.add_argument('--output-dir', type=str,
-                       default='/home/user/jjhbn/GGG3/data/historical',
+                       default=default_output_dir,
                        help='Output directory for data')
     parser.add_argument('--n-symbols', type=int, default=50,
                        help='Number of symbols to generate')

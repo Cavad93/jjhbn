@@ -34,12 +34,15 @@ from models.experts import XGBoostExpert, RandomForestExpert, AdaptiveRFExpert, 
 class Config:
     """Конфигурация обучения"""
 
-    # Пути к данным
-    TRAIN_DATASET = "/home/user/jjhbn/GGG3/data/datasets/binance_dataset_train.parquet"
-    TEST_DATASET = "/home/user/jjhbn/GGG3/data/datasets/binance_dataset_test.parquet"
+    # Пути к данным (относительно корня проекта)
+    from pathlib import Path
+    _PROJECT_ROOT = Path(__file__).parent.parent
+
+    TRAIN_DATASET = str(_PROJECT_ROOT / "data" / "datasets" / "binance_dataset_train.parquet")
+    TEST_DATASET = str(_PROJECT_ROOT / "data" / "datasets" / "binance_dataset_test.parquet")
 
     # Директория для сохранения моделей
-    MODELS_DIR = "/home/user/jjhbn/GGG3/models/saved"
+    MODELS_DIR = str(_PROJECT_ROOT / "models" / "saved")
 
     # Параметры экспертов
     XGB_PARAMS = {

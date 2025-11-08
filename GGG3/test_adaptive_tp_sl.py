@@ -10,7 +10,9 @@
 """
 
 import sys
-sys.path.append('/home/user/jjhbn/GGG3')
+from pathlib import Path
+# Добавляем корневую директорию проекта в путь
+sys.path.insert(0, str(Path(__file__).parent))
 
 import binance_config as config
 from strategy.kelly_sizer import calculate_kelly_position_size

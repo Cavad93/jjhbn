@@ -661,6 +661,6 @@ if __name__ == "__main__":
     print("\n💡 Для генерации полного датасета используйте:")
     print("   from features.target_calculator import prepare_training_dataset")
     print("   train_path, test_path = prepare_training_dataset(")
-    print("       data_dir='/home/user/jjhbn/GGG3/data/historical',")
-    print("       output_dir='/home/user/jjhbn/GGG3/data/datasets'")
+    print("       data_dir='data/historical',  # или используйте относительные пути")
+    print("       output_dir='data/datasets'")
     print("   )")

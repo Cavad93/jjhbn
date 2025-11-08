@@ -271,7 +271,7 @@ def update_ohlcv_data(
 # ============================================================================
 
 def collect_all_data(
-    output_dir: str = '/home/user/jjhbn/GGG3/data/historical',
+    output_dir: str = None,
     timeframes: Optional[List[str]] = None,
     min_volume_24h: float = 1_000_000,
     limit: int = 500,
@@ -281,7 +281,7 @@ def collect_all_data(
     Главная функция первичной загрузки всех данных
 
     Args:
-        output_dir: Директория для сохранения данных
+        output_dir: Директория для сохранения данных (по умолчанию: относительный путь)
         timeframes: Список таймфреймов (по умолчанию ['5m', '15m', '30m', '4h'])
         min_volume_24h: Минимальный объём торгов за 24ч
         limit: Количество свечей для загрузки
@@ -303,6 +303,11 @@ def collect_all_data(
     logger.info("=" * 80)
 
     # Параметры по умолчанию
+    if output_dir is None:
+        from pathlib import Path
+        project_root = Path(__file__).parent.parent  # GGG3/
+        output_dir = str(project_root / 'data' / 'historical')
+
     if timeframes is None:
         timeframes = ['5m', '15m', '30m', '4h']
 
@@ -400,7 +405,7 @@ def collect_all_data(
 # ============================================================================
 
 def update_all_data(
-    data_dir: str = '/home/user/jjhbn/GGG3/data/historical',
+    data_dir: str = None,
     timeframes: Optional[List[str]] = None,
     use_testnet: bool = False
 ) -> Dict[str, Any]:
@@ -413,7 +418,7 @@ def update_all_data(
     3. Обновляет индекс
 
     Args:
-        data_dir: Директория с данными
+        data_dir: Директория с данными (по умолчанию: относительный путь)
         timeframes: Список таймфреймов (по умолчанию ['5m', '15m', '30m', '4h'])
         use_testnet: Использовать testnet
 
@@ -425,6 +430,11 @@ def update_all_data(
     logger.info("=" * 80)
 
     # Параметры по умолчанию
+    if data_dir is None:
+        from pathlib import Path
+        project_root = Path(__file__).parent.parent  # GGG3/
+        data_dir = str(project_root / 'data' / 'historical')
+
     if timeframes is None:
         timeframes = ['5m', '15m', '30m', '4h']
 
@@ -637,16 +647,22 @@ def create_data_index(data_dir: str) -> Dict[str, Any]:
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================================
 
-def get_data_stats(data_dir: str = '/home/user/jjhbn/GGG3/data/historical') -> Dict[str, Any]:
+def get_data_stats(data_dir: str = None) -> Dict[str, Any]:
     """
     Получает статистику по загруженным данным
 
     Args:
-        data_dir: Директория с данными
+        data_dir: Директория с данными (по умолчанию: относительный путь)
 
     Returns:
         Dict: Статистика
     """
+    # Используем относительный путь если не указан явно
+    if data_dir is None:
+        from pathlib import Path
+        project_root = Path(__file__).parent.parent  # GGG3/
+        data_dir = str(project_root / 'data' / 'historical')
+
     index_path = os.path.join(data_dir, 'data_index.json')
 
     if not os.path.exists(index_path):
@@ -682,6 +698,9 @@ def get_data_stats(data_dir: str = '/home/user/jjhbn/GGG3/data/historical') -> D
 if __name__ == '__main__':
     import argparse
 
+    # Вычисляем относительный путь по умолчанию
+    default_data_dir = str(Path(__file__).parent.parent / 'data' / 'historical')
+
     parser = argparse.ArgumentParser(description='Binance Data Collector')
     parser.add_argument(
         '--mode',
@@ -693,7 +712,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--output-dir',
         type=str,
-        default='/home/user/jjhbn/GGG3/data/historical',
+        default=default_data_dir,
         help='Директория для сохранения данных'
     )
     parser.add_argument(

@@ -72,13 +72,16 @@ logger = logging.getLogger(__name__)
 class Config:
     """Конфигурация обучения META"""
 
-    # Пути к данным
-    TRAIN_DATASET = "/home/user/jjhbn/GGG3/data/datasets/binance_dataset_train.parquet"
-    TEST_DATASET = "/home/user/jjhbn/GGG3/data/datasets/binance_dataset_test.parquet"
+    # Пути к данным (относительно корня проекта)
+    from pathlib import Path
+    _PROJECT_ROOT = Path(__file__).parent.parent
+
+    TRAIN_DATASET = str(_PROJECT_ROOT / "data" / "datasets" / "binance_dataset_train.parquet")
+    TEST_DATASET = str(_PROJECT_ROOT / "data" / "datasets" / "binance_dataset_test.parquet")
 
     # Пути к моделям
-    MODELS_DIR = "/home/user/jjhbn/GGG3/models/saved"
-    META_SAVE_PATH = "/home/user/jjhbn/GGG3/models/saved/meta_cmaes_model.pkl"
+    MODELS_DIR = str(_PROJECT_ROOT / "models" / "saved")
+    META_SAVE_PATH = str(_PROJECT_ROOT / "models" / "saved" / "meta_cmaes_model.pkl")
 
     # CMA-ES параметры
     CMA_SIGMA = 0.3

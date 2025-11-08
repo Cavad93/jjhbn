@@ -11,7 +11,6 @@
 Сравнение META с Average Ensemble.
 
 Usage:
-    cd /home/user/jjhbn/GGG3
     python3 training/validate_all_models.py
 """
 
