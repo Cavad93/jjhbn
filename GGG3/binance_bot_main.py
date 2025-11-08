@@ -41,6 +41,7 @@ from binance_api.client import BinanceClient
 # Portfolio
 from portfolio.position_manager import PositionManager, Position
 from portfolio.reinvestment import ReinvestmentManager
+from portfolio.capital_tracker import CapitalTracker
 
 # Strategy
 from strategy.coin_selector import CoinSelector
@@ -173,8 +174,13 @@ class BinanceTradingBot:
                 enabled=getattr(config, 'AUTO_REINVEST_ENABLED', True)
             )
             print(f"  Reinvestment: Enabled (50% profit → reserve)")
+
+            # Capital tracker (отслеживание изменений за периоды)
+            self.capital_tracker = CapitalTracker()
+            print(f"  Capital tracker: Enabled")
         else:
             self.reinvestment = None
+            self.capital_tracker = None
 
         # Telegram notifier
         self.telegram = TelegramNotifier(
@@ -789,13 +795,41 @@ class BinanceTradingBot:
                     'predictions': opportunity.get('predictions', {})
                 }
 
-                # Добавляем информацию о резервном фонде (если доступно)
-                if reserve_fund is not None:
-                    position_data['reserve_fund'] = reserve_fund
-                if trading_capital is not None:
-                    position_data['trading_capital'] = trading_capital
-                if total_equity is not None:
-                    position_data['total_equity'] = total_equity
+                # ПРАВИЛЬНЫЙ расчет капитала ПОСЛЕ открытия позиции
+                if self.paper_mode:
+                    # Получаем текущий свободный баланс (после открытия позиции)
+                    current_free_balance = self.exchange.get_balance('USDT')
+
+                    # Рассчитываем стоимость всех открытых позиций
+                    locked_in_positions = sum(
+                        pos.position_value
+                        for pos in self.position_manager.get_all_open()
+                    )
+
+                    # Резервный фонд
+                    current_reserve = self.reinvestment.reserve_fund if self.reinvestment else 0.0
+
+                    # Общий капитал = Свободный + Заблокированный + Резерв
+                    actual_total_equity = current_free_balance + locked_in_positions + current_reserve
+
+                    # Записываем snapshot
+                    if self.capital_tracker:
+                        self.capital_tracker.record_snapshot(
+                            free_balance=current_free_balance,
+                            locked_in_positions=locked_in_positions,
+                            reserve_fund=current_reserve,
+                            num_open_positions=len(self.position_manager.get_all_open())
+                        )
+
+                        # Получаем изменения за периоды
+                        period_changes = self.capital_tracker.get_all_period_changes(actual_total_equity)
+                        position_data['period_changes'] = period_changes
+
+                    # Обновляем данные для уведомления
+                    position_data['reserve_fund'] = current_reserve
+                    position_data['trading_capital'] = current_free_balance
+                    position_data['locked_in_positions'] = locked_in_positions
+                    position_data['total_equity'] = actual_total_equity
 
                 self.telegram.notify_position_opened(position_data)
 

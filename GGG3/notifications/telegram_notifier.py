@@ -169,19 +169,31 @@ class TelegramNotifier:
 💰 EV: {ev:+.2%}
         """.strip()
 
-        # Добавляем информацию о резервном фонде (если есть)
+        # Добавляем информацию о резервном фонде и капитале (если есть)
         reserve_fund = position_data.get('reserve_fund')
         trading_capital = position_data.get('trading_capital')
+        locked_in_positions = position_data.get('locked_in_positions')
         total_equity = position_data.get('total_equity')
+        period_changes = position_data.get('period_changes')
 
-        if reserve_fund is not None and trading_capital is not None:
+        if total_equity is not None:
             text += f"\n\n<b>💼 Капитал:</b>"
-            text += f"\n  • Торговый: ${trading_capital:,.2f}"
-            text += f"\n  • Резервный: ${reserve_fund:,.2f}"
-            if total_equity is not None:
-                text += f"\n  • Общий: ${total_equity:,.2f}"
-                reserve_pct = (reserve_fund / total_equity * 100) if total_equity > 0 else 0
+            text += f"\n  • Свободный: ${trading_capital:,.2f}" if trading_capital is not None else ""
+            text += f"\n  • В позициях: ${locked_in_positions:,.2f}" if locked_in_positions is not None else ""
+            if reserve_fund is not None and reserve_fund > 0:
+                text += f"\n  • Резервный: ${reserve_fund:,.2f}"
+            text += f"\n  • <b>Общий: ${total_equity:,.2f}</b>"
+            if reserve_fund is not None and total_equity > 0:
+                reserve_pct = (reserve_fund / total_equity * 100)
                 text += f"\n  • Резерв: {reserve_pct:.1f}% от капитала"
+
+            # Добавляем изменения за периоды
+            if period_changes:
+                text += f"\n\n<b>📊 Изменения:</b>"
+                for period_name, data in period_changes.items():
+                    if data.get('available'):
+                        sign = "+" if data['absolute'] >= 0 else ""
+                        text += f"\n  • {period_name}: {sign}${data['absolute']:.2f} ({sign}{data['percent']:.2f}%)"
 
         # Добавляем предсказания экспертов если есть
         predictions = position_data.get('predictions')
