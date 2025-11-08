@@ -610,6 +610,24 @@ class BinanceTradingBot:
                 print(f"\n  Closing {position.symbol}: not in top-20 anymore")
                 self.close_position_manual(position)
 
+        # ═══════════════════════════════════════════════════════════════════════
+        # КРИТИЧНО: Вычисляем торговый капитал ОДИН РАЗ для всех позиций
+        # Kelly будет рассчитываться от ПОЛНОГО баланса, а не от остатка
+        # ═══════════════════════════════════════════════════════════════════════
+        initial_trading_capital = self.exchange.get_balance('USDT')
+
+        # Apply reinvestment if enabled (paper trading only)
+        if self.paper_mode and self.reinvestment and self.reinvestment.enabled:
+            reinvest_result = self.reinvestment.calculate_daily_reinvestment(initial_trading_capital)
+            initial_trading_capital = reinvest_result['trading_capital']
+
+            # Log reserve fund info
+            if reinvest_result['reinvested']:
+                print(f"\n  [Reinvest] Daily profit: ${reinvest_result['daily_profit']:.2f}")
+                print(f"  [Reinvest] To reserve: ${reinvest_result['to_reserve']:.2f}")
+                print(f"  [Reinvest] Trading capital: ${initial_trading_capital:.2f}")
+                print(f"  [Reinvest] Reserve fund: ${reinvest_result['reserve_fund']:.2f}")
+
         # Открываем новые позиции
         for opp in top_opportunities:
             if self.position_manager.has_position(opp['symbol']):
@@ -631,8 +649,8 @@ class BinanceTradingBot:
                 print(f"\n  Max positions reached ({current_positions}/{max_positions})")
                 break
 
-            # Открываем позицию
-            self.open_position(opp)
+            # Открываем позицию с фиксированным торговым капиталом
+            self.open_position(opp, initial_trading_capital=initial_trading_capital)
 
         final_positions = len(self.position_manager.get_all_open())
         print(f"\n  Portfolio status: {final_positions}/{config.MAX_POSITIONS} positions")
@@ -653,11 +671,16 @@ class BinanceTradingBot:
     # POSITION MANAGEMENT
     # ========================================================================
 
-    def open_position(self, opportunity: dict):
+    def open_position(self, opportunity: dict, initial_trading_capital: float = None):
         """
         Открывает позицию с полным snapshot
 
         КРИТИЧНО: Сохраняет ВСЕ данные на момент входа (t0)
+
+        Args:
+            opportunity: Торговая возможность с данными
+            initial_trading_capital: Начальный торговый капитал для Kelly (фиксированный)
+                                    Если None, вычисляется из текущего баланса
         """
 
         symbol = opportunity['symbol']
@@ -694,27 +717,23 @@ class BinanceTradingBot:
                 tp_price = current_price - tp_mult * atr
                 sl_price = current_price + sl_mult * atr
 
+            # ═══════════════════════════════════════════════════════════════
             # Размер позиции (Kelly)
-            capital = self.exchange.get_balance('USDT')
+            # КРИТИЧНО: Используем ФИКСИРОВАННЫЙ торговый капитал для всех позиций
+            # Это гарантирует что Kelly рассчитывается от полного баланса,
+            # а не от остатка после предыдущих покупок
+            # ═══════════════════════════════════════════════════════════════
+            if initial_trading_capital is not None:
+                # Используем переданный фиксированный капитал
+                capital = initial_trading_capital
+            else:
+                # Fallback: вычисляем из текущего баланса (старое поведение)
+                capital = self.exchange.get_balance('USDT')
 
-            # Apply reinvestment if enabled (paper trading only)
-            reserve_fund = None
-            trading_capital = None
-            total_equity = None
-
-            if self.paper_mode and self.reinvestment and self.reinvestment.enabled:
-                reinvest_result = self.reinvestment.calculate_daily_reinvestment(capital)
-                capital = reinvest_result['trading_capital']
-                reserve_fund = reinvest_result['reserve_fund']
-                trading_capital = reinvest_result['trading_capital']
-                total_equity = reinvest_result['total_equity']
-
-                # Log reserve fund info
-                if reinvest_result['reinvested']:
-                    print(f"  [Reinvest] Daily profit: ${reinvest_result['daily_profit']:.2f}")
-                    print(f"  [Reinvest] To reserve: ${reinvest_result['to_reserve']:.2f}")
-                    print(f"  [Reinvest] Trading capital: ${capital:.2f}")
-                    print(f"  [Reinvest] Reserve fund: ${reinvest_result['reserve_fund']:.2f}")
+                # Apply reinvestment if enabled (paper trading only)
+                if self.paper_mode and self.reinvestment and self.reinvestment.enabled:
+                    reinvest_result = self.reinvestment.calculate_daily_reinvestment(capital)
+                    capital = reinvest_result['trading_capital']
 
             position_size_usd = calculate_kelly_position_size(
                 capital=capital,
