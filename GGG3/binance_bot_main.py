@@ -572,7 +572,15 @@ class BinanceTradingBot:
 
         print(f"  Adaptive threshold: {p_threshold:.4f}")
 
-        top_opportunities = self.coin_selector.select_top_coins(
+        # ═══════════════════════════════════════════════════════════════════════
+        # ОПТИМИЗАЦИЯ: Один проход для топ-20, экономия ~30-60 минут!
+        # ═══════════════════════════════════════════════════════════════════════
+        # Сканируем рынок ОДИН РАЗ для получения топ-20 возможностей
+        # Затем используем:
+        #   - Все 20 для решений о закрытии существующих позиций
+        #   - Только первые 10 для открытия новых позиций
+        # ═══════════════════════════════════════════════════════════════════════
+        top_20_opportunities = self.coin_selector.select_top_coins(
             all_pairs=all_pairs,
             get_ticker_func=lambda s: self.exchange.get_ticker(s),
             get_ohlcv_func=lambda s, tf, lim: self.exchange.get_ohlcv(s, tf, lim),
@@ -581,28 +589,18 @@ class BinanceTradingBot:
             calculate_phase_func=detect_market_phase,
             get_predictions_func=self._get_predictions,  # Базовая логика для торговли
             collect_ml_predictions_func=self._collect_ml_predictions_for_meta,  # ML для META
-            top_n=config.TOP_N_COINS
+            top_n=20  # Получаем топ-20 за один проход
         )
 
-        print(f"\n  Top-{len(top_opportunities)} opportunities:")
-        for i, opp in enumerate(top_opportunities, 1):
-            print(f"    {i}. {opp['symbol']:<12} {opp['direction']:<6} "
+        print(f"\n  Top-20 opportunities (for closure decisions):")
+        for i, opp in enumerate(top_20_opportunities, 1):
+            marker = "✓" if i <= 10 else " "  # Отмечаем первые 10
+            print(f"    {marker} {i:2d}. {opp['symbol']:<12} {opp['direction']:<6} "
                   f"p_up={opp['p_up']:.3f}  EV={opp['ev']:.4f}")
 
-        # Закрываем позиции не в топ-20 (даем больше пространства)
-        # Получаем расширенный список топ-20 для проверки
-        top_20_opportunities = self.coin_selector.select_top_coins(
-            all_pairs=all_pairs,
-            get_ticker_func=lambda s: self.exchange.get_ticker(s),
-            get_ohlcv_func=lambda s, tf, lim: self.exchange.get_ohlcv(s, tf, lim),
-            feature_builder=self.feature_builder,
-            calculate_atr_func=calculate_atr,
-            calculate_phase_func=detect_market_phase,
-            get_predictions_func=self._get_predictions,
-            collect_ml_predictions_func=self._collect_ml_predictions_for_meta,
-            top_n=20  # Топ-20 для проверки закрытия
-        )
+        print(f"\n  Checking if existing positions should be closed (using top-20)...")
 
+        # Получаем символы из топ-20 для проверки закрытия позиций
         top_20_symbols = {opp['symbol'] for opp in top_20_opportunities}
 
         for position in list(self.position_manager.get_all_open()):
@@ -628,8 +626,9 @@ class BinanceTradingBot:
                 print(f"  [Reinvest] Trading capital: ${initial_trading_capital:.2f}")
                 print(f"  [Reinvest] Reserve fund: ${reinvest_result['reserve_fund']:.2f}")
 
-        # Открываем новые позиции
-        for opp in top_opportunities:
+        # Открываем новые позиции (используем только топ-10)
+        print(f"\n  Opening new positions (using top-10 only)...")
+        for opp in top_20_opportunities[:10]:
             if self.position_manager.has_position(opp['symbol']):
                 continue  # Уже открыта
 
@@ -663,7 +662,7 @@ class BinanceTradingBot:
                 'closed_positions': 0,  # TODO: track actual count
                 'opened_positions': 0,  # TODO: track actual count
                 'total_positions': final_positions,
-                'top_opportunities': top_opportunities[:5]  # Top 5
+                'top_opportunities': top_20_opportunities[:5]  # Top 5
             }
             self.telegram.notify_rebalance_stats(stats)
 
