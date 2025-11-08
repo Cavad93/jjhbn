@@ -226,17 +226,25 @@ class PositionManager:
     def __init__(
         self,
         max_positions: int = 10,
-        data_dir: str = '/home/user/jjhbn/GGG3/data/positions'
+        data_dir: str = None
     ):
         """
         Инициализация менеджера позиций
 
         Args:
             max_positions: Максимум одновременных позиций
-            data_dir: Директория для сохранения данных
+            data_dir: Директория для сохранения данных (по умолчанию: относительный путь)
         """
         self.max_positions = max_positions
-        self.data_dir = data_dir
+
+        # Используем относительный путь если не указан явно
+        if data_dir is None:
+            # Путь относительно текущей директории проекта
+            from pathlib import Path
+            project_root = Path(__file__).parent.parent  # GGG3/
+            self.data_dir = str(project_root / 'data' / 'positions')
+        else:
+            self.data_dir = data_dir
 
         # Открытые позиции: {symbol: Position}
         self.positions: Dict[str, Position] = {}
