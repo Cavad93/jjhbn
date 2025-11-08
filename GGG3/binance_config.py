@@ -28,6 +28,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Базовая директория проекта
+BASE_DIR = Path(__file__).parent
+
 
 # ============================================================================
 # 1. PAPER TRADING MODE
@@ -400,8 +403,7 @@ HAIKU_FALLBACK_STRATEGY = "tech_score"
 # 13. PATHS
 # ============================================================================
 
-# Базовая директория проекта
-BASE_DIR = Path(__file__).parent
+# Базовая директория проекта (BASE_DIR определена в начале файла)
 
 # Директория для данных
 DATA_DIR = BASE_DIR / 'data'
