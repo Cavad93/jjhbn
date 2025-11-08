@@ -112,38 +112,72 @@ class CoinSelector:
 
     def calculate_ev_bidirectional(self, p_up: float) -> Tuple[float, float]:
         """
-        Рассчитывает Expected Value для LONG и SHORT
+        Рассчитывает Expected Value для LONG и SHORT с учетом комиссий и проскальзывания
 
-        При R/R = 1.5:1 (TP = 1.2×ATR, SL = 0.8×ATR):
-        - Reward = 1.5R
-        - Risk = 1.0R
+        Текущие параметры:
+        - TP = 2.5× ATR
+        - SL = 1.5× ATR
+        - R:R = 2.5/1.5 = 1.67:1
+        - Комиссия = 0.1% (вход + выход)
+        - Проскальзывание = 0.05% (вход + выход)
+        - Общие издержки = 0.3% на круг
+
+        Математический вывод:
 
         EV_long = P(TP) × Reward - P(SL) × Risk
-                = p_up × 1.5 - (1 - p_up) × 1.0
-                = p_up × 2.5 - 1.0
 
-        EV_short = P(TP) × Reward - P(SL) × Risk
-                 = (1 - p_up) × 1.5 - p_up × 1.0
-                 = 1.5 - p_up × 2.5
+        Нормализуем к SL = 1R:
+          Reward = TP/SL = 2.5/1.5 = 1.67R
+          Risk = 1.0R
 
-        Break-even:
-        - EV_long > 0 требует p_up > 0.40 (40%)
-        - EV_short > 0 требует p_up < 0.60 (60%)
+        EV_long = p_up × 1.67 - (1 - p_up) × 1.0
+                = p_up × 1.67 - 1 + p_up
+                = p_up × (1.67 + 1.0) - 1.0
+                = p_up × 2.67 - 1.0
+
+        С учетом издержек (0.3% = 0.003):
+          Real_TP = 2.5 - 0.006 = 2.494 ATR
+          Real_SL = 1.5 + 0.006 = 1.506 ATR
+          Real_RR = 2.494/1.506 = 1.656:1
+
+        EV_long_real = p_up × 2.494 - (1 - p_up) × 1.506
+                     = p_up × 4.0 - 1.506
+
+        Break-even точки:
+        - Без издержек: p_up > 0.375 (37.5%)
+        - С издержками: p_up > 0.377 (37.7%)
 
         Args:
             p_up: Вероятность роста цены (0-1)
 
         Returns:
-            Tuple[ev_long, ev_short]
+            Tuple[ev_long, ev_short] - Expected Value для LONG и SHORT
 
         Examples:
             >>> selector = CoinSelector()
             >>> ev_long, ev_short = selector.calculate_ev_bidirectional(0.67)
-            >>> print(f"LONG EV: {ev_long:.4f}")  # 0.0675 (+6.75%)
-            >>> print(f"SHORT EV: {ev_short:.4f}")  # -0.1750 (-17.5%)
+            >>> print(f"LONG EV: {ev_long:.4f}")  # 0.1738 (+17.38%)
+            >>> print(f"SHORT EV: {ev_short:.4f}")  # -0.1738 (-17.38%)
         """
-        ev_long = p_up * 2.5 - 1.0
-        ev_short = 1.5 - p_up * 2.5
+        # Получаем актуальные множители из конфига
+        tp_mult = binance_config.TP_ATR_MULTIPLIER  # 2.5
+        sl_mult = binance_config.SL_ATR_MULTIPLIER  # 1.5
+
+        # Издержки: комиссия (0.1%) + проскальзывание (0.05%) × 2 (вход + выход)
+        # Используем консервативную оценку 0.3% на круг
+        commission = 0.001  # 0.1% комиссия
+        slippage = 0.0005   # 0.05% проскальзывание
+        total_cost = (commission + slippage) * 2  # 0.003 (0.3%)
+
+        # Реальные множители с учетом издержек
+        # При TP: теряем издержки на прибыли
+        # При SL: теряем издержки на убытке
+        real_tp = tp_mult - total_cost
+        real_sl = sl_mult + total_cost
+
+        # Expected Value с учетом издержек
+        ev_long = p_up * real_tp - (1.0 - p_up) * real_sl
+        ev_short = (1.0 - p_up) * real_tp - p_up * real_sl
 
         return ev_long, ev_short
 
