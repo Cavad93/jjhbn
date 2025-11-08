@@ -73,7 +73,7 @@ except Exception as e:
 
 try:
     # Feature Builder
-    from features.binance_feature_builder import BinanceFeatureBuilder
+    from features.builder import BinanceFeatureBuilder
     test_result(True, "BinanceFeatureBuilder импортирован")
 except Exception as e:
     test_result(False, f"BinanceFeatureBuilder: {e}")
@@ -399,7 +399,7 @@ try:
         position = test_exchange.open_position(
             symbol='BTCUSDT',
             side='LONG',
-            amount=0.01,
+            amount=0.008,  # ~$815 @ $101,845/BTC (хватит при капитале $1000)
             tp_price=110000,
             sl_price=95000
         )
@@ -479,8 +479,7 @@ test_header("COIN SELECTOR", "Проверка отбора монет для т
 
 try:
     from strategy.coin_selector import CoinSelector
-    from portfolio.risk_manager import calculate_atr
-    from strategy.market_phase import detect_market_phase
+    from features.target_calculator import calculate_atr, detect_market_phase
 
     selector = CoinSelector()
     test_result(True, "CoinSelector инициализирован")
