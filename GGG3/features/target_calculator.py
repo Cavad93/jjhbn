@@ -21,7 +21,9 @@ try:
     from .builder import BinanceFeatureBuilder
 except ImportError:
     import sys
-    sys.path.append('/home/user/jjhbn/GGG3')
+    from pathlib import Path
+    # Добавляем путь относительно текущего файла (features/ -> GGG3/)
+    sys.path.insert(0, str(Path(__file__).parent.parent))
     from features.builder import BinanceFeatureBuilder
 
 

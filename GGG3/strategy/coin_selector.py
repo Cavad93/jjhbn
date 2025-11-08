@@ -29,7 +29,9 @@ try:
     from .blacklist import is_blacklisted, is_high_risk, get_risk_level, get_max_allocation
 except ImportError:
     import sys
-    sys.path.append('/home/user/jjhbn/GGG3')
+    from pathlib import Path
+    # Добавляем путь относительно текущего файла
+    sys.path.insert(0, str(Path(__file__).parent.parent))
     from strategy.sector_config import get_coin_sector, get_sector_limit, count_coins_per_sector
     from strategy.blacklist import is_blacklisted, is_high_risk, get_risk_level, get_max_allocation
 
@@ -38,12 +40,14 @@ try:
     from features.context_features import build_context_features
 except ImportError:
     import sys
-    sys.path.append('/home/user/jjhbn/GGG3')
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent))
     from features.context_features import build_context_features
 
-# Импорт адаптивных множителей TP/SL
+# Импорт конфига
 import sys
-sys.path.append('/home/user/jjhbn/GGG3')
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 import binance_config
 
 

@@ -35,7 +35,9 @@ try:
     import binance_config as config
 except ImportError:
     import sys
-    sys.path.append('/home/user/jjhbn/GGG3')
+    from pathlib import Path
+    # Добавляем путь относительно текущего файла (portfolio/ -> GGG3/)
+    sys.path.insert(0, str(Path(__file__).parent.parent))
     import binance_config as config
 
 logger = logging.getLogger(__name__)
