@@ -140,6 +140,60 @@ def detect_price_jump(df: pd.DataFrame,
         return False
 
 
+def calculate_orderbook_imbalance(orderbook: dict, depth: int = 10) -> float:
+    """
+    Рассчитывает дисбаланс стакана заявок (Orderbook Imbalance)
+
+    Formula: (bid_volume - ask_volume) / (bid_volume + ask_volume)
+
+    Положительное значение = больше bid orders (покупательское давление)
+    Отрицательное значение = больше ask orders (продавательское давление)
+
+    Args:
+        orderbook: Словарь с ключами 'bids' и 'asks', каждый содержит [[price, volume], ...]
+        depth: Глубина стакана для анализа (по умолчанию 10 уровней)
+
+    Returns:
+        float: Дисбаланс в диапазоне [-1.0, 1.0]
+               0.0 если данных недостаточно или ошибка
+
+    Example:
+        >>> orderbook = {
+        ...     'bids': [[50000, 1.5], [49999, 2.0], ...],
+        ...     'asks': [[50001, 1.0], [50002, 1.2], ...]
+        ... }
+        >>> imbalance = calculate_orderbook_imbalance(orderbook, depth=10)
+        >>> print(f"Imbalance: {imbalance:.3f}")  # 0.143 (больше покупателей)
+    """
+    try:
+        if not orderbook or 'bids' not in orderbook or 'asks' not in orderbook:
+            return 0.0
+
+        bids = orderbook['bids'][:depth]
+        asks = orderbook['asks'][:depth]
+
+        if not bids or not asks:
+            return 0.0
+
+        # Суммируем объемы
+        bid_volume = sum(float(bid[1]) for bid in bids)
+        ask_volume = sum(float(ask[1]) for ask in asks)
+
+        total_volume = bid_volume + ask_volume
+
+        if total_volume == 0:
+            return 0.0
+
+        # Рассчитываем дисбаланс
+        imbalance = (bid_volume - ask_volume) / total_volume
+
+        # Клиппинг к диапазону [-1, 1] (теоретически уже должно быть в диапазоне)
+        return float(np.clip(imbalance, -1.0, 1.0))
+
+    except Exception:
+        return 0.0
+
+
 def calculate_atr_percentage(df: pd.DataFrame, period: int = 14) -> float:
     """
     Рассчитывает ATR в процентах от цены
@@ -182,13 +236,15 @@ def calculate_atr_percentage(df: pd.DataFrame, period: int = 14) -> float:
 
 
 def build_context_features(df_4h: pd.DataFrame,
-                           symbol: Optional[str] = None) -> Dict[str, float]:
+                           symbol: Optional[str] = None,
+                           exchange=None) -> Dict[str, float]:
     """
     Строит полный словарь контекстных фич для META
 
     Args:
         df_4h: DataFrame с 4h свечами
-        symbol: Символ монеты (опционально, для будущих расширений)
+        symbol: Символ монеты (опционально, для получения funding rate)
+        exchange: Exchange/Client объект для API запросов (опционально)
 
     Returns:
         Dict с 7 контекстными фичами:
@@ -196,7 +252,7 @@ def build_context_features(df_4h: pd.DataFrame,
             'vol_ratio': float,     # 0.8-1.4
             'trend_macd': float,    # -0.5 до 0.5
             'jump_detected': bool,  # True/False
-            'funding_sign': float,  # -1 до 1 (дефолт 0.0)
+            'funding_sign': float,  # -1 до 1 (реальное значение если exchange передан)
             'book_imb': float,      # -0.3 до 0.3 (дефолт 0.0)
             'ofi_15s': float,       # -0.2 до 0.2 (дефолт 0.0)
             'basis_pct': float      # -0.01 до 0.01 (дефолт 0.0)
@@ -213,13 +269,40 @@ def build_context_features(df_4h: pd.DataFrame,
     # 3. Price jump flag (реальное значение)
     context['jump_detected'] = detect_price_jump(df_4h, threshold_pct=3.0)
 
-    # 4. Funding rate sign (требует API, пока дефолт)
-    # TODO: Добавить запрос funding rate для Binance Futures
-    context['funding_sign'] = 0.0
+    # 4. Funding rate sign (реальное значение через API)
+    if exchange is not None and symbol is not None:
+        try:
+            # Получаем funding rate через API
+            if hasattr(exchange, 'get_funding_rate'):
+                funding_rate = exchange.get_funding_rate(symbol)
+                # Нормализуем к диапазону [-1, 1]
+                # Типичный funding rate: -0.001 до 0.001
+                # Умножаем на 1000 для нормализации
+                context['funding_sign'] = float(np.clip(funding_rate * 1000, -1.0, 1.0))
+            else:
+                context['funding_sign'] = 0.0
+        except Exception:
+            context['funding_sign'] = 0.0
+    else:
+        context['funding_sign'] = 0.0
 
-    # 5. Order book imbalance (требует orderbook API, пока дефолт)
-    # TODO: Добавить запрос orderbook и расчет дисбаланса
-    context['book_imb'] = 0.0
+    # 5. Order book imbalance (реальное значение через API)
+    if exchange is not None and symbol is not None:
+        try:
+            # Получаем orderbook через API
+            if hasattr(exchange, 'get_orderbook'):
+                orderbook = exchange.get_orderbook(symbol, limit=20)
+                # Рассчитываем дисбаланс (первые 10 уровней)
+                imbalance = calculate_orderbook_imbalance(orderbook, depth=10)
+                # Нормализуем к диапазону [-0.3, 0.3] для META
+                # Дисбаланс обычно не превышает ±30%
+                context['book_imb'] = float(np.clip(imbalance * 0.3, -0.3, 0.3))
+            else:
+                context['book_imb'] = 0.0
+        except Exception:
+            context['book_imb'] = 0.0
+    else:
+        context['book_imb'] = 0.0
 
     # 6. Order flow imbalance 15s (требует high-freq данных, пока дефолт)
     # TODO: Добавить расчет OFI из тиков

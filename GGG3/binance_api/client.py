@@ -725,3 +725,48 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Failed to get ticker for {symbol}: {e}")
             raise BinanceAPIError(f"Failed to get ticker: {e}")
+
+    def get_funding_rate(self, symbol: str) -> float:
+        """
+        Получает текущий funding rate для символа (Futures)
+
+        Funding rate показывает premium/discount между perpetual контрактом и spot ценой.
+        Положительный = LONG платят SHORT
+        Отрицательный = SHORT платят LONG
+
+        Args:
+            symbol: Торговая пара (например, BTCUSDT)
+
+        Returns:
+            float: Текущий funding rate (обычно в диапазоне -0.001 до 0.001)
+                   0.0 если не удалось получить данные
+
+        Example:
+            >>> funding_rate = client.get_funding_rate('BTCUSDT')
+            >>> print(f"Funding rate: {funding_rate:.6f}")  # 0.000100
+        """
+        try:
+            # Получаем последний funding rate
+            funding_info = self._retry_request(
+                self.client.futures_funding_rate,
+                symbol=symbol,
+                limit=1
+            )
+
+            if not funding_info:
+                logger.warning(f"No funding rate data for {symbol}")
+                return 0.0
+
+            # Берем последнее значение
+            latest = funding_info[-1]
+            funding_rate = float(latest['fundingRate'])
+
+            # Клиппинг к разумным значениям (-0.01 до 0.01, то есть -1% до 1%)
+            funding_rate = max(-0.01, min(funding_rate, 0.01))
+
+            return funding_rate
+
+        except Exception as e:
+            logger.warning(f"Failed to get funding rate for {symbol}: {e}")
+            # Не выбрасываем ошибку, так как это не критично
+            return 0.0

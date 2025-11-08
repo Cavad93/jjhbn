@@ -55,6 +55,7 @@ class BlackSwanProtection:
         self._event_triggered = False
         self._event_trigger_time = 0
         self._block_duration_hours = 2  # Блокировка на 2 часа после события
+        self._last_price_drop_pct = 0.0  # Последний рассчитанный процент падения BTC
 
     def update_btc_price(self, price: float):
         """
@@ -134,6 +135,9 @@ class BlackSwanProtection:
         # Рассчитываем падение в процентах
         price_drop = ((oldest_price - newest_price) / oldest_price) * 100
 
+        # Сохраняем для последующего использования
+        self._last_price_drop_pct = price_drop
+
         # Проверяем, превышен ли порог
         if price_drop >= self.price_drop_pct:
             print(f"\n⚠️  BLACK SWAN EVENT DETECTED!")
@@ -182,3 +186,13 @@ class BlackSwanProtection:
         remaining_time = (self._block_duration_hours * 3600) - time_since_event
 
         return max(0, remaining_time)
+
+    def get_last_price_drop_pct(self) -> float:
+        """
+        Возвращает последний рассчитанный процент падения BTC
+
+        Returns:
+            float: Процент падения BTC (положительное число означает падение)
+                   0.0 если событие не было обнаружено или недостаточно данных
+        """
+        return self._last_price_drop_pct

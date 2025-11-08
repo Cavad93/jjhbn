@@ -313,7 +313,8 @@ class CoinSelector:
         calculate_phase_func: callable,
         get_predictions_func: callable = None,
         collect_ml_predictions_func: callable = None,
-        top_n: int = 10
+        top_n: int = 10,
+        exchange=None
     ) -> List[dict]:
         """
         Отбирает топ-N торговых возможностей
@@ -491,7 +492,7 @@ class CoinSelector:
                 risk_level = get_risk_level(symbol)
 
                 # ✅ Вычисляем контекстные фичи для META (7D)
-                context_features = build_context_features(df_4h, symbol=symbol)
+                context_features = build_context_features(df_4h, symbol=symbol, exchange=exchange)
 
                 # Формируем opportunity
                 opportunity = {

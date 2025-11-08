@@ -525,8 +525,8 @@ class BinanceTradingBot:
 
             # Send Telegram notification
             if config.TELEGRAM_ALERT_TYPES.get('black_swan', True):
-                # Получаем процент падения BTC (если доступно)
-                btc_drop = 5.0  # TODO: получить реальное значение из black_swan
+                # Получаем реальный процент падения BTC из black_swan модуля
+                btc_drop = self.black_swan.get_last_price_drop_pct()
                 self.telegram.notify_black_swan_triggered(
                     btc_drop=btc_drop,
                     positions_closed=positions_closed
@@ -589,7 +589,8 @@ class BinanceTradingBot:
             calculate_phase_func=detect_market_phase,
             get_predictions_func=self._get_predictions,  # Базовая логика для торговли
             collect_ml_predictions_func=self._collect_ml_predictions_for_meta,  # ML для META
-            top_n=20  # Получаем топ-20 за один проход
+            top_n=20,  # Получаем топ-20 за один проход
+            exchange=self.exchange  # Для получения funding rate
         )
 
         print(f"\n  Top-20 opportunities (for closure decisions):")
@@ -600,6 +601,10 @@ class BinanceTradingBot:
 
         print(f"\n  Checking if existing positions should be closed (using top-20)...")
 
+        # Счетчик закрытых позиций
+        positions_before_close = len(self.position_manager.get_all_open())
+        closed_count = 0
+
         # Получаем символы из топ-20 для проверки закрытия позиций
         top_20_symbols = {opp['symbol'] for opp in top_20_opportunities}
 
@@ -607,6 +612,7 @@ class BinanceTradingBot:
             if position.symbol not in top_20_symbols:
                 print(f"\n  Closing {position.symbol}: not in top-20 anymore")
                 self.close_position_manual(position)
+                closed_count += 1
 
         # ═══════════════════════════════════════════════════════════════════════
         # КРИТИЧНО: Вычисляем торговый капитал ОДИН РАЗ для всех позиций
@@ -628,6 +634,9 @@ class BinanceTradingBot:
 
         # Открываем новые позиции (используем только топ-10)
         print(f"\n  Opening new positions (using top-10 only)...")
+        positions_before_open = len(self.position_manager.get_all_open())
+        opened_count = 0
+
         for opp in top_20_opportunities[:10]:
             if self.position_manager.has_position(opp['symbol']):
                 continue  # Уже открыта
@@ -649,18 +658,19 @@ class BinanceTradingBot:
                 break
 
             # Открываем позицию с фиксированным торговым капиталом
-            self.open_position(opp, initial_trading_capital=initial_trading_capital)
+            success = self.open_position(opp, initial_trading_capital=initial_trading_capital)
+            if success:
+                opened_count += 1
 
         final_positions = len(self.position_manager.get_all_open())
         print(f"\n  Portfolio status: {final_positions}/{config.MAX_POSITIONS} positions")
+        print(f"  Rebalance summary: closed {closed_count}, opened {opened_count}")
 
         # Send Telegram notification
         if config.TELEGRAM_ALERT_TYPES.get('rebalance', True):
-            # Подсчитываем изменения (приблизительно)
-            # В идеале нужно считать до и после, но это упрощенная версия
             stats = {
-                'closed_positions': 0,  # TODO: track actual count
-                'opened_positions': 0,  # TODO: track actual count
+                'closed_positions': closed_count,
+                'opened_positions': opened_count,
                 'total_positions': final_positions,
                 'top_opportunities': top_20_opportunities[:5]  # Top 5
             }
@@ -864,9 +874,12 @@ class BinanceTradingBot:
 
                 self.telegram.notify_position_opened(position_data)
 
+            return True  # ✅ Позиция успешно открыта
+
         except Exception as e:
             logger.error(f"Error opening position {symbol}: {e}", exc_info=True)
             print(f"  ❌ Error: {e}")
+            return False  # ❌ Ошибка при открытии
 
     def check_positions(self):
         """
