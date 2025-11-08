@@ -40,6 +40,10 @@ APScheduler>=3.10.0  # Task scheduling
 # === Telegram Bot (for notifications) ===
 python-telegram-bot>=20.0
 
+# === AI Analysis (Haiku 4.5 for fundamental analysis) ===
+anthropic>=0.40.0  # Claude Haiku 4.5 API
+feedparser>=6.0.0  # RSS парсинг новостей
+
 # === Testing ===
 pytest
 

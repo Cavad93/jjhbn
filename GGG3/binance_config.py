@@ -350,7 +350,54 @@ USE_ONLY_PROFITABLE_FOR_TRAINING = False  # False - использовать в�
 
 
 # ============================================================================
-# 12. PATHS
+# 12. HAIKU 4.5 FUNDAMENTAL ANALYSIS
+# ============================================================================
+
+# Включить анализ с Claude Haiku 4.5
+HAIKU_ANALYSIS_ENABLED = True
+
+# Anthropic API key (загружается из переменной окружения)
+ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
+
+# Модель Haiku 4.5
+HAIKU_MODEL_ID = "claude-haiku-4-5-20251001"
+
+# Batch размер (количество монет в одном запросе)
+# Рекомендуется 5 для оптимального баланса скорости и стоимости
+HAIKU_BATCH_SIZE = 5
+
+# Таймаут на один запрос (секунды)
+HAIKU_TIMEOUT = 60
+
+# Минимальный Haiku score для одобрения сделки
+# Логика: final = p_up IF (p_up > threshold AND haiku_score > 0.6)
+HAIKU_MIN_SCORE = 0.6
+
+# Директория для кэша результатов Haiku
+HAIKU_CACHE_DIR = BASE_DIR / 'data' / 'haiku_cache'
+HAIKU_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Время жизни кэша для разных типов монет
+HAIKU_CACHE_TTL_STABLE = 12 * 3600  # 12 часов для BTC, ETH, BNB
+HAIKU_CACHE_TTL_VOLATILE = 4 * 3600  # 4 часа для остальных
+
+# Статистика
+HAIKU_ENABLE_STATS = True
+HAIKU_STATS_FILE = HAIKU_CACHE_DIR / 'haiku_stats.json'
+
+# Бюджетный контроль
+HAIKU_MONTHLY_BUDGET_USD = 30.0  # Максимальный месячный бюджет
+HAIKU_WARN_THRESHOLD_PCT = 0.8   # Предупреждение при 80% бюджета
+
+# Fallback стратегия при ошибках API
+# "tech_score" - использовать только технический анализ
+# "skip" - пропустить монету
+# "neutral" - использовать нейтральный score 0.5
+HAIKU_FALLBACK_STRATEGY = "tech_score"
+
+
+# ============================================================================
+# 13. PATHS
 # ============================================================================
 
 # Базовая директория проекта

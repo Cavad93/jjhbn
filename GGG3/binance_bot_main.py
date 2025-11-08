@@ -47,6 +47,7 @@ from portfolio.capital_tracker import CapitalTracker
 from strategy.coin_selector import CoinSelector
 from strategy.threshold_adapter import get_adaptive_threshold
 from strategy.kelly_sizer import calculate_kelly_position_size
+from strategy.haiku_analyzer import HaikuAnalyzer, analyze_and_rank_top20
 
 # Features
 from features.builder import BinanceFeatureBuilder
@@ -188,6 +189,29 @@ class BinanceTradingBot:
             chat_id=config.TELEGRAM_CHAT_ID,
             enabled=config.TELEGRAM_ALERTS_ENABLED
         )
+
+        # Haiku 4.5 Fundamental Analyzer
+        if config.HAIKU_ANALYSIS_ENABLED and config.ANTHROPIC_API_KEY:
+            try:
+                self.haiku_analyzer = HaikuAnalyzer(
+                    api_key=config.ANTHROPIC_API_KEY,
+                    model=config.HAIKU_MODEL_ID,
+                    cache_dir=str(config.HAIKU_CACHE_DIR),
+                    batch_size=config.HAIKU_BATCH_SIZE,
+                    timeout=config.HAIKU_TIMEOUT,
+                    enable_stats=config.HAIKU_ENABLE_STATS
+                )
+                print(f"  Haiku 4.5 Analyzer: Enabled (batch_size={config.HAIKU_BATCH_SIZE})")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Haiku Analyzer: {e}")
+                self.haiku_analyzer = None
+                print(f"  Haiku 4.5 Analyzer: Disabled (initialization failed)")
+        else:
+            self.haiku_analyzer = None
+            if not config.HAIKU_ANALYSIS_ENABLED:
+                print(f"  Haiku 4.5 Analyzer: Disabled (config)")
+            else:
+                print(f"  Haiku 4.5 Analyzer: Disabled (no API key)")
 
         # Statistics
         self.total_closed_trades = len(self.position_manager.closed_positions)
@@ -474,6 +498,10 @@ class BinanceTradingBot:
 
                     self.rebalance_portfolio()
 
+                    # Выводим статистику Haiku после ребалансировки
+                    if self.haiku_analyzer is not None:
+                        print(self.haiku_analyzer.get_stats_summary())
+
                     last_4h_check = current_time
 
                 # ═══════════════════════════════════════════════════
@@ -599,6 +627,44 @@ class BinanceTradingBot:
             print(f"    {marker} {i:2d}. {opp['symbol']:<12} {opp['direction']:<6} "
                   f"p_up={opp['p_up']:.3f}  EV={opp['ev']:.4f}")
 
+        # ═══════════════════════════════════════════════════════════════════════
+        # HAIKU 4.5: Фундаментальный анализ TOP-20 для формирования финального TOP-10
+        # ═══════════════════════════════════════════════════════════════════════
+        if self.haiku_analyzer is not None:
+            print(f"\n🤖 Running Haiku 4.5 fundamental analysis on TOP-20...")
+            try:
+                # Анализ и переранжирование с учётом фундаментальных факторов
+                top_10_enriched = analyze_and_rank_top20(
+                    top_20_opportunities=top_20_opportunities,
+                    haiku_analyzer=self.haiku_analyzer,
+                    p_threshold=p_threshold
+                )
+
+                # Заменяем TOP-20 на обогащённый TOP-10
+                # (для закрытия позиций всё ещё используем все 20)
+                print(f"\n  Haiku 4.5 analysis completed: {len(top_10_enriched)} coins approved")
+
+                # Логируем решения Haiku
+                for i, opp in enumerate(top_10_enriched, 1):
+                    haiku_score = opp.get('haiku_score', 'N/A')
+                    haiku_reason = opp.get('haiku_reason', 'N/A')
+                    print(f"    {i:2d}. {opp['symbol']:<12} {opp['direction']:<6} "
+                          f"tech={opp['p_up']:.3f} fund={haiku_score:.3f if isinstance(haiku_score, float) else haiku_score} "
+                          f"EV={opp['ev']:.4f} ({haiku_reason})")
+
+                # Используем обогащённый список для открытия позиций
+                top_10_for_opening = top_10_enriched
+
+            except Exception as e:
+                logger.error(f"Haiku analysis failed: {e}")
+                print(f"  ⚠️  Haiku analysis failed: {e}")
+                print(f"  Fallback: using technical analysis only")
+                # Fallback: используем первые 10 из TOP-20
+                top_10_for_opening = top_20_opportunities[:10]
+        else:
+            # Haiku отключён - используем первые 10 из TOP-20
+            top_10_for_opening = top_20_opportunities[:10]
+
         print(f"\n  Checking if existing positions should be closed (using top-20)...")
 
         # Счетчик закрытых позиций
@@ -632,12 +698,12 @@ class BinanceTradingBot:
                 print(f"  [Reinvest] Trading capital: ${initial_trading_capital:.2f}")
                 print(f"  [Reinvest] Reserve fund: ${reinvest_result['reserve_fund']:.2f}")
 
-        # Открываем новые позиции (используем только топ-10)
-        print(f"\n  Opening new positions (using top-10 only)...")
+        # Открываем новые позиции (используем обогащённый Haiku топ-10)
+        print(f"\n  Opening new positions (using top-10 from Haiku analysis)...")
         positions_before_open = len(self.position_manager.get_all_open())
         opened_count = 0
 
-        for opp in top_20_opportunities[:10]:
+        for opp in top_10_for_opening:
             if self.position_manager.has_position(opp['symbol']):
                 continue  # Уже открыта
 
