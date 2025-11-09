@@ -144,6 +144,7 @@ class TelegramNotifier:
         sl_price = position_data.get('sl_price', 0.0)
         p_up = position_data.get('p_up', 0.0)
         ev = position_data.get('ev', 0.0)
+        atr = position_data.get('atr', 0.0)  # ATR в долях (0.02 = 2%)
 
         # Направление эмодзи
         direction_emoji = "🟢" if direction == "LONG" else "🔴"
@@ -153,6 +154,10 @@ class TelegramNotifier:
             rr_ratio = (tp_price - entry_price) / (entry_price - sl_price) if sl_price > 0 else 0
         else:
             rr_ratio = (entry_price - tp_price) / (sl_price - entry_price) if sl_price > 0 else 0
+
+        # ИСПРАВЛЕНИЕ: EV приходит в множителях ATR, конвертируем в проценты цены
+        # EV в множителях ATR (например, 1.57) × ATR в % (например, 2%) = EV в % цены (3.14%)
+        ev_percent = ev * atr if atr > 0 else ev
 
         text = f"""
 {direction_emoji} <b>ОТКРЫТА ПОЗИЦИЯ</b>
@@ -166,7 +171,7 @@ class TelegramNotifier:
 📈 R/R: {rr_ratio:.2f}
 
 🎯 P(up): {p_up:.1%}
-💰 EV: {ev:+.2%}
+💰 EV: {ev_percent:+.2%}
         """.strip()
 
         # Добавляем информацию о резервном фонде и капитале (если есть)
@@ -350,8 +355,11 @@ class TelegramNotifier:
             for i, opp in enumerate(opportunities[:5], 1):
                 symbol = opp.get('symbol', 'UNKNOWN')
                 ev = opp.get('ev', 0.0)
+                atr = opp.get('atr', 0.0)
                 p_up = opp.get('p_up', 0.0)
-                text += f"\n{i}. {symbol}: EV={ev:+.2%}, P(up)={p_up:.1%}"
+                # ИСПРАВЛЕНИЕ: EV в множителях ATR, конвертируем в проценты
+                ev_percent = ev * atr if atr > 0 else ev
+                text += f"\n{i}. {symbol}: EV={ev_percent:+.2%}, P(up)={p_up:.1%}"
 
         text += f"\n\n⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
 

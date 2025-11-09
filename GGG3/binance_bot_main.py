@@ -901,6 +901,7 @@ class BinanceTradingBot:
                     'sl_price': sl_price,
                     'p_up': opportunity['p_up'],
                     'ev': opportunity['ev'],
+                    'atr': opportunity.get('atr', 0.0),  # ATR в долях для расчета EV%
                     'predictions': opportunity.get('predictions', {})
                 }
 
@@ -1045,6 +1046,25 @@ class BinanceTradingBot:
 
             except Exception as e:
                 logger.error(f"Error checking position {position.symbol}: {e}", exc_info=True)
+
+        # HEARTBEAT: Записываем snapshot капитала каждые 5 минут
+        # Это решает проблему "дырявых" snapshot'ов когда позиции не открываются часами
+        if self.paper_mode and self.capital_tracker:
+            try:
+                current_equity = self.exchange.get_equity()
+                current_reserve = self.reinvestment.reserve_fund if self.reinvestment else 0.0
+                current_free_balance = self.exchange.get_balance('USDT')
+                locked_in_positions = current_equity - current_free_balance
+
+                self.capital_tracker.record_snapshot(
+                    free_balance=current_free_balance,
+                    locked_in_positions=locked_in_positions,
+                    reserve_fund=current_reserve,
+                    num_open_positions=len(self.position_manager.get_all_open())
+                )
+                logger.debug(f"Heartbeat snapshot recorded: equity=${current_equity + current_reserve:.2f}")
+            except Exception as e:
+                logger.warning(f"Failed to record heartbeat snapshot: {e}")
 
     def close_position(self, position: Position, exit_reason: str, exit_price: float):
         """
