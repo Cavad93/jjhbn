@@ -666,14 +666,28 @@ def analyze_and_rank_top20(
             logger.warning(f"[HaikuIntegration] REJECTED {opp['symbol']}: {opp.get('haiku_reason', 'critical')}")
             continue
 
-        # Применяем логику: final = p_up IF (p_up > threshold AND haiku_score > 0.6)
-        if opp['p_up'] > p_threshold and opp.get('haiku_score', 0.5) > 0.6:
+        # ════════════════════════════════════════════════════════════════
+        # ИСПРАВЛЕНИЕ: Учитываем направление позиции
+        # ════════════════════════════════════════════════════════════════
+        direction = opp.get('direction', 'LONG')
+
+        # Для LONG: p_up должна быть > threshold
+        # Для SHORT: p_down (1 - p_up) должна быть > threshold
+        if direction == 'LONG':
+            confidence = opp['p_up']
+            passes_threshold = confidence > p_threshold
+        else:  # SHORT
+            confidence = 1 - opp['p_up']  # p_down
+            passes_threshold = confidence > p_threshold
+
+        # Применяем логику: final = confidence IF (passes_threshold AND haiku_score > 0.6)
+        if passes_threshold and opp.get('haiku_score', 0.5) > 0.6:
             # Монета прошла оба фильтра
-            opp['final_score'] = opp['p_up']
+            opp['final_score'] = confidence
             opp['final_reason'] = 'tech+fund'
-        elif opp['p_up'] > p_threshold:
+        elif passes_threshold:
             # Только технический скор
-            opp['final_score'] = opp['p_up']
+            opp['final_score'] = confidence
             opp['final_reason'] = 'tech_only'
         else:
             # Не прошла порог
