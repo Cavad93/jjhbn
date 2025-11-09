@@ -355,7 +355,8 @@ class PaperExchange:
                      entry_price: Optional[float] = None,
                      tp_price: Optional[float] = None,
                      sl_price: Optional[float] = None,
-                     metadata: Optional[Dict] = None) -> dict:
+                     metadata: Optional[Dict] = None,
+                     leverage: float = 1.0) -> dict:
         """
         Открывает новую позицию (LONG или SHORT)
 
@@ -367,13 +368,33 @@ class PaperExchange:
             tp_price: Цена Take Profit (опционально)
             sl_price: Цена Stop Loss (опционально)
             metadata: Дополнительные данные (entry_snapshot и т.д.)
+            leverage: Плечо (по умолчанию 1x)
 
         Returns:
             dict: Данные открытой позиции
+
+        Raises:
+            InsufficientBalance: Недостаточно маржи для открытия позиции
         """
         side = side.upper()
         if side not in ['LONG', 'SHORT']:
             raise InvalidOrder(f"Invalid side: {side}. Must be 'LONG' or 'SHORT'")
+
+        # ФЬЮЧЕРСЫ: Проверяем достаточность маржи ПЕРЕД открытием
+        if entry_price is None:
+            entry_price = get_binance_price(symbol)
+
+        position_value = entry_price * amount
+        required_margin = position_value / leverage
+
+        free_margin = self.get_free_margin(leverage)
+
+        if required_margin > free_margin:
+            raise InsufficientBalance(
+                f"Insufficient margin to open position: "
+                f"need ${required_margin:.2f}, have ${free_margin:.2f} free margin "
+                f"(balance: ${self.balance:.2f}, used: ${self.get_used_margin(leverage):.2f})"
+            )
 
         # Открываем позицию через market order
         market_side = 'BUY' if side == 'LONG' else 'SELL'

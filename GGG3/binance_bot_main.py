@@ -814,7 +814,14 @@ class BinanceTradingBot:
                 # Fallback: вычисляем из текущего Equity (для фьючерсов)
                 # Balance не меняется в фьючерсах, поэтому используем Equity
                 if self.paper_mode:
-                    capital = self.exchange.get_equity()
+                    # ФЬЮЧЕРСЫ: Используем Equity, но НЕ превышаем свободную маржу
+                    # Это важно если есть открытые позиции с unrealized PnL
+                    equity = self.exchange.get_equity()
+                    free_margin = self.exchange.get_free_margin(leverage=config.LEVERAGE)
+
+                    # Используем минимум из equity и free_margin
+                    # чтобы не превысить доступные средства
+                    capital = min(equity, free_margin + equity * 0.1)  # +10% буфер от equity
                 else:
                     capital = self.exchange.get_balance('USDT')
 
@@ -830,6 +837,25 @@ class BinanceTradingBot:
                 recent_wr=self.stats['win_rate_last_100'],
                 rr_ratio=rr_ratio
             )
+
+            # ═══════════════════════════════════════════════════════════════
+            # ФЬЮЧЕРСЫ: Проверяем достаточность маржи ПЕРЕД открытием
+            # ═══════════════════════════════════════════════════════════════
+            if self.paper_mode:
+                free_margin = self.exchange.get_free_margin(leverage=config.LEVERAGE)
+
+                if position_size_usd > free_margin:
+                    logger.warning(
+                        f"Insufficient margin for {symbol}: "
+                        f"need ${position_size_usd:.2f}, have ${free_margin:.2f}. "
+                        f"Reducing position size to ${free_margin * 0.95:.2f} (95% of free margin)"
+                    )
+                    position_size_usd = free_margin * 0.95  # 95% для безопасности
+
+                    # Если даже 95% слишком мало, пропускаем
+                    if position_size_usd < config.MIN_POSITION_SIZE_USDT:
+                        logger.warning(f"Position size too small after margin check, skipping {symbol}")
+                        return False
 
             amount = position_size_usd / current_price
 
@@ -855,7 +881,8 @@ class BinanceTradingBot:
                 entry_price=current_price,
                 tp_price=tp_price,
                 sl_price=sl_price,
-                metadata={'entry_snapshot': entry_snapshot}
+                metadata={'entry_snapshot': entry_snapshot},
+                leverage=config.LEVERAGE  # Передаем плечо для проверки маржи
             )
 
             # Создаем Position объект с данными из биржи
@@ -915,7 +942,10 @@ class BinanceTradingBot:
 
                     # Для детализации в уведомлениях и логах
                     current_free_balance = self.exchange.get_balance('USDT')
-                    locked_in_positions = current_equity - current_free_balance  # Реальная стоимость открытых позиций с PnL
+
+                    # ФЬЮЧЕРСЫ: Используем используемую маржу, а не unrealized PnL
+                    # locked_in_positions теперь показывает реальную заблокированную маржу
+                    locked_in_positions = self.exchange.get_used_margin(leverage=config.LEVERAGE)
 
                     # Записываем snapshot
                     if self.capital_tracker:
@@ -1035,7 +1065,9 @@ class BinanceTradingBot:
                 current_equity = self.exchange.get_equity()
                 current_reserve = self.reinvestment.reserve_fund if self.reinvestment else 0.0
                 current_free_balance = self.exchange.get_balance('USDT')
-                locked_in_positions = current_equity - current_free_balance
+
+                # ФЬЮЧЕРСЫ: Используем используемую маржу, а не unrealized PnL
+                locked_in_positions = self.exchange.get_used_margin(leverage=config.LEVERAGE)
 
                 self.capital_tracker.record_snapshot(
                     free_balance=current_free_balance,
