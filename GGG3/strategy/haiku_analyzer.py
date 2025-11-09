@@ -7,7 +7,7 @@ Haiku 4.5 Fundamental Analysis Module
 - Интеграция с Claude Haiku 4.5 через Anthropic API
 - Batch обработка (5 монет в 1 запрос для экономии)
 - Агрессивное кэширование результатов (4-12 часов)
-- RSS парсинг новостей (бесплатные источники)
+- DuckDuckGo поиск новостей (бесплатно, с фильтрацией по дате)
 - Prompt caching для экономии до 90% на input токенах
 - Статистика эффективности решений
 
@@ -15,11 +15,11 @@ Haiku 4.5 Fundamental Analysis Module
 1. Batch processing: -35% расходов
 2. Smart caching: -35% запросов
 3. Compact prompts: -40% токенов
-4. RSS instead of search: -10% токенов
+4. DuckDuckGo news search: находит новости для всех монет (не только топ-10)
 5. Prompt caching (Anthropic): -90% на системных промптах
 
 Автор: Claude Code
-Дата: 2025-11-08
+Дата: 2025-11-09 (обновлено: DuckDuckGo вместо RSS)
 """
 
 import os
@@ -33,12 +33,12 @@ from pathlib import Path
 from threading import Lock
 import hashlib
 
-# RSS парсинг
+# DuckDuckGo поиск новостей
 try:
-    import feedparser
+    from ddgs import DDGS
 except ImportError:
-    feedparser = None
-    logging.warning("feedparser не установлен. RSS парсинг отключён. pip install feedparser")
+    DDGS = None
+    logging.warning("ddgs не установлен. pip install ddgs")
 
 # Anthropic API
 try:
@@ -46,10 +46,6 @@ try:
 except ImportError:
     Anthropic = None
     logging.warning("anthropic не установлен. pip install anthropic")
-
-# Для веб-запросов (fallback если нет RSS)
-import requests
-from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -201,31 +197,21 @@ class RateLimiter:
 
 
 # ============================================================================
-# 1. RSS NEWS PARSER (Бесплатные источники)
+# 1. DUCKDUCKGO NEWS SEARCH (Бесплатный поисковик с фильтрацией по дате)
 # ============================================================================
 
 class NewsCollector:
     """
-    Сборщик новостей из бесплатных RSS источников
+    Сборщик новостей через DuckDuckGo Search
 
-    Источники:
-    - CoinDesk RSS
-    - CoinTelegraph RSS
-    - Binance News
-    - Reddit r/cryptocurrency (через RSS)
+    Преимущества перед RSS:
+    - Находит новости по всем криптовалютам (не только топ-10)
+    - Фильтрация по дате (последние 24 часа)
+    - Бесплатно, без API ключей
+    - Более релевантные результаты
 
-    Улучшения:
-    - Regex поиск с word boundaries (избегает ложных срабатываний)
-    - Поддержка алиасов монет (Bitcoin = BTC)
-    - Расширенное логирование
+    Источник: DuckDuckGo News Search
     """
-
-    RSS_FEEDS = {
-        'coindesk': 'https://www.coindesk.com/arc/outboundfeeds/rss/',
-        'cointelegraph': 'https://cointelegraph.com/rss',
-        'binance': 'https://www.binance.com/en/feed/index/rss',
-        'reddit_crypto': 'https://www.reddit.com/r/cryptocurrency/.rss',
-    }
 
     def __init__(self, cache_ttl: int = HaikuConfig.NEWS_CACHE_TTL_SECONDS):
         """
@@ -235,22 +221,26 @@ class NewsCollector:
         self.cache_ttl = cache_ttl
         self._news_cache: Dict[str, Tuple[float, List[dict]]] = {}
 
-        logger.debug(f"[NewsCollector] Initialized with cache_ttl={cache_ttl}s")
+        if DDGS is None:
+            logger.error("[NewsCollector] duckduckgo_search not installed! Run: pip install duckduckgo-search")
+
+        logger.debug(f"[NewsCollector] Initialized with DuckDuckGo search, cache_ttl={cache_ttl}s")
 
     def get_recent_news(self, symbol: str, hours: int = HaikuConfig.NEWS_LOOKBACK_HOURS) -> List[dict]:
         """
-        Получить новости по монете за последние N часов
-
-        Использует regex с word boundaries для точного поиска
-        и поддерживает алиасы монет (Bitcoin = BTC)
+        Получить новости по монете за последние N часов через DuckDuckGo
 
         Args:
             symbol: Символ монеты (например, 'BTCUSDT')
-            hours: Количество часов назад
+            hours: Количество часов назад (по умолчанию 24)
 
         Returns:
-            Список новостей: [{'title': str, 'link': str, 'published': str, 'source': str}, ...]
+            Список новостей: [{'title': str, 'link': str, 'published': str, 'source': str, 'body': str}, ...]
         """
+        if DDGS is None:
+            logger.warning("[NewsCollector] DuckDuckGo search not available, returning empty news")
+            return []
+
         # Убираем USDT из символа для поиска
         coin_name = symbol.replace('USDT', '')
 
@@ -262,72 +252,80 @@ class NewsCollector:
                 logger.debug(f"[NewsCollector] Cache HIT for {coin_name} ({len(cached_news)} items)")
                 return cached_news
 
-        logger.debug(f"[NewsCollector] Cache MISS for {coin_name}, fetching from RSS feeds...")
+        logger.debug(f"[NewsCollector] Cache MISS for {coin_name}, searching DuckDuckGo...")
 
-        # Получаем все алиасы монеты
+        # Получаем все алиасы монеты для поиска
         search_terms = HaikuConfig.COIN_ALIASES.get(coin_name, [coin_name.lower()])
         if coin_name.lower() not in search_terms:
             search_terms.append(coin_name.lower())
 
-        # Компилируем regex паттерны с word boundaries для каждого алиаса
-        patterns = []
-        for term in search_terms:
-            # \b гарантирует, что "ADA" не совпадёт с "Canada"
-            pattern = r'\b' + re.escape(term) + r'\b'
-            patterns.append(re.compile(pattern, re.IGNORECASE))
-
         logger.debug(f"[NewsCollector] Search terms for {coin_name}: {search_terms}")
 
-        # Собираем новости из всех источников
+        # Используем первый (основной) алиас для поиска
+        # Для крипты это обычно полное название (bitcoin, ethereum и т.д.)
+        primary_term = search_terms[0] if search_terms else coin_name.lower()
+
+        # Формируем поисковый запрос
+        query = f"{primary_term} cryptocurrency"
+
         all_news = []
-        cutoff_time = datetime.now() - timedelta(hours=hours)
 
-        if feedparser is None:
-            logger.warning("[NewsCollector] feedparser not installed, returning empty news")
-            return []
+        try:
+            # ════════════════════════════════════════════════════════════════
+            # ПОИСК НОВОСТЕЙ ЧЕРЕЗ DUCKDUCKGO
+            # ════════════════════════════════════════════════════════════════
+            # timelimit='d' - последние 24 часа (day)
+            # max_results - максимум результатов
+            # ════════════════════════════════════════════════════════════════
 
-        for source_name, feed_url in self.RSS_FEEDS.items():
-            try:
-                logger.debug(f"[NewsCollector] Parsing {source_name}...")
-                feed = feedparser.parse(feed_url)
+            logger.debug(f"[NewsCollector] Searching DuckDuckGo: query='{query}', timelimit='d'")
 
-                for entry in feed.entries[:50]:  # Берём последние 50 записей
-                    # Проверяем наличие упоминания монеты через regex
-                    title = entry.get('title', '')
-                    summary = entry.get('summary', '')
-                    combined_text = title + ' ' + summary
+            with DDGS() as ddgs_client:
+                # Для hours <= 24 используем 'd' (day), для больших - 'w' (week)
+                time_limit = 'd' if hours <= 24 else 'w'
+
+                results = ddgs_client.news(
+                    query=query,
+                    timelimit=time_limit,
+                    max_results=HaikuConfig.MAX_NEWS_ITEMS
+                )
+
+                # Обрабатываем результаты
+                for result in results:
+                    # Проверяем упоминание монеты в заголовке или тексте
+                    title = result.get('title', '').lower()
+                    body = result.get('body', '').lower()
+                    combined_text = title + ' ' + body
 
                     # Проверяем по всем алиасам
                     match_found = False
-                    for pattern in patterns:
-                        if pattern.search(combined_text):
+                    for term in search_terms:
+                        # Используем word boundaries для точного поиска
+                        pattern = r'\b' + re.escape(term.lower()) + r'\b'
+                        if re.search(pattern, combined_text):
                             match_found = True
                             break
 
-                    if not match_found:
+                    # Если монета не упоминается явно - пропускаем
+                    # (защита от нерелевантных результатов)
+                    if not match_found and len(search_terms) > 1:
+                        logger.debug(f"[NewsCollector] Skipping irrelevant: {result.get('title', 'N/A')[:50]}")
                         continue
 
-                    # Парсим дату публикации
-                    published = entry.get('published_parsed')
-                    if published:
-                        pub_date = datetime(*published[:6])
-                        if pub_date < cutoff_time:
-                            continue
-
                     all_news.append({
-                        'title': entry.get('title', ''),
-                        'link': entry.get('link', ''),
-                        'published': entry.get('published', ''),
-                        'source': source_name,
-                        'summary': entry.get('summary', '')[:HaikuConfig.MAX_NEWS_SUMMARY_LENGTH]
+                        'title': result.get('title', ''),
+                        'link': result.get('url', ''),
+                        'published': result.get('date', ''),
+                        'source': result.get('source', 'DuckDuckGo'),
+                        'summary': result.get('body', '')[:HaikuConfig.MAX_NEWS_SUMMARY_LENGTH]
                     })
 
-            except Exception as e:
-                logger.warning(f"[NewsCollector] Failed to parse {source_name}: {e}")
-                continue
+            logger.info(f"[NewsCollector] Found {len(all_news)} news for {coin_name} via DuckDuckGo")
 
-        # Сортируем по дате (новые первыми)
-        all_news.sort(key=lambda x: x['published'], reverse=True)
+        except Exception as e:
+            logger.error(f"[NewsCollector] DuckDuckGo search failed for {coin_name}: {e}")
+            # Возвращаем пустой список вместо падения
+            all_news = []
 
         # Ограничиваем до максимума
         all_news = all_news[:HaikuConfig.MAX_NEWS_ITEMS]
@@ -335,7 +333,6 @@ class NewsCollector:
         # Кэшируем результат
         self._news_cache[cache_key] = (time.time(), all_news)
 
-        logger.info(f"[NewsCollector] Found {len(all_news)} news for {coin_name} from {len(self.RSS_FEEDS)} sources")
         return all_news
 
     def get_condensed_news_text(self, symbol: str, hours: int = HaikuConfig.NEWS_LOOKBACK_HOURS) -> str:
