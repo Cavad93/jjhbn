@@ -73,17 +73,49 @@ def test_filter_logic():
             'direction': 'SHORT',
             'p_up': 0.48,  # p_down = 0.52 < threshold
             'haiku_score': 0.78,  # Отличные новости для SHORT!
+            'haiku_reason': 'positive news',  # Реально проанализировано
             'p_threshold': 0.58,
             'expected': 'APPROVED (fund_only)',
             'expected_final_score': 0.78 * 0.9
         },
+        {
+            'name': 'SKIPPED: высокий p_up, но не анализировалось (КЛЮЧЕВОЙ КЕЙС)',
+            'symbol': 'MATICUSDT',
+            'direction': 'LONG',
+            'p_up': 0.68,  # Высокий!
+            'haiku_score': 0.68,  # = p_up (для skipped)
+            'haiku_reason': 'skipped: weak signal',  # НЕ анализировалось!
+            'p_threshold': 0.58,
+            'expected': 'APPROVED (tech_only)',  # Должно быть tech_only, НЕ fund!
+            'expected_final_score': 0.68
+        },
+        {
+            'name': 'ERROR: высокий haiku_score, но ошибка API',
+            'symbol': 'LINKUSDT',
+            'direction': 'LONG',
+            'p_up': 0.55,
+            'haiku_score': 0.72,
+            'haiku_reason': 'api_error: timeout',  # Ошибка!
+            'p_threshold': 0.58,
+            'expected': 'REJECTED',  # НЕ проходит ни один фильтр
+            'expected_final_score': None
+        },
     ]
 
+    print(f"\nВсего тест-кейсов: {len(test_cases)}")
+    print(f"Включая 2 новых для проверки 'skipped' и 'error' логики\n")
+
     # Симулируем логику фильтрации
+    passed_tests = 0
+    failed_tests = 0
+
     for i, case in enumerate(test_cases, 1):
         print(f"\n{i}. {case['name']}")
         print(f"   Symbol: {case['symbol']} {case['direction']}")
         print(f"   p_up: {case['p_up']:.3f}, haiku_score: {case['haiku_score']:.3f}")
+        haiku_reason = case.get('haiku_reason', '')
+        if haiku_reason:
+            print(f"   haiku_reason: '{haiku_reason}'")
         print(f"   p_threshold: {case['p_threshold']:.3f}")
 
         # Вычисляем confidence для направления
@@ -94,7 +126,10 @@ def test_filter_logic():
             confidence = 1 - case['p_up']
 
         passes_threshold = confidence > case['p_threshold']
-        haiku_approved = case['haiku_score'] > SCORE_THRESHOLD_APPROVE
+
+        # ИСПРАВЛЕНИЕ: Проверяем, была ли монета реально проанализирована
+        was_analyzed = 'skipped' not in haiku_reason and 'error' not in haiku_reason
+        haiku_approved = was_analyzed and (case['haiku_score'] > SCORE_THRESHOLD_APPROVE)
 
         # Применяем новую логику
         if not (passes_threshold or haiku_approved):
@@ -113,8 +148,10 @@ def test_filter_logic():
         # Проверяем результат
         if result.startswith(case['expected'][:10]):
             status = "✅ PASS"
+            passed_tests += 1
         else:
             status = "❌ FAIL"
+            failed_tests += 1
 
         print(f"   Expected: {case['expected']}")
         print(f"   Got: {result}")
@@ -125,12 +162,30 @@ def test_filter_logic():
         print(f"   {status}")
 
     print("\n" + "=" * 70)
-    print("ВЫВОД:")
+    print("РЕЗУЛЬТАТЫ ТЕСТИРОВАНИЯ:")
     print("=" * 70)
-    print("✅ Новая логика позволяет Haiku одобрять монеты с отличными")
-    print("   фундаментальными показателями, даже если технический сигнал слабый!")
+    print(f"Всего тестов: {len(test_cases)}")
+    print(f"✅ Прошли: {passed_tests}")
+    print(f"❌ Провалились: {failed_tests}")
     print("")
-    print("❌ Старая логика отклоняла такие монеты полностью.")
+    if failed_tests == 0:
+        print("🎉 ВСЕ ТЕСТЫ ПРОШЛИ!")
+    else:
+        print("⚠️  ЕСТЬ ПРОВАЛЕННЫЕ ТЕСТЫ - требуется доработка")
+    print("")
+    print("КЛЮЧЕВЫЕ УЛУЧШЕНИЯ:")
+    print("=" * 70)
+    print("✅ 1. Логика ИЛИ вместо И: монета одобряется если проходит")
+    print("      хотя бы один фильтр (технический ИЛИ фундаментальный)")
+    print("")
+    print("✅ 2. 'Skipped' монеты НЕ считаются прошедшими фундаментальный фильтр")
+    print("      (т.к. они вообще не были проанализированы Haiku)")
+    print("")
+    print("✅ 3. Монеты с ошибками API также НЕ проходят фундаментальный фильтр")
+    print("")
+    print("❌ Старая логика:")
+    print("   - Отклоняла монеты с отличным fund score, но слабым tech score")
+    print("   - 'Skipped' монеты ошибочно проходили как fund_only")
     print("=" * 70)
 
 if __name__ == "__main__":

@@ -990,7 +990,19 @@ def analyze_and_rank_top20(
         # ════════════════════════════════════════════════════════════════
 
         haiku_score = opp.get('haiku_score', 0.5)
-        haiku_approved = haiku_score > HaikuConfig.SCORE_THRESHOLD_APPROVE
+        haiku_reason = opp.get('haiku_reason', '')
+
+        # ════════════════════════════════════════════════════════════════
+        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ #2: Проверка на "skipped" монеты
+        # ════════════════════════════════════════════════════════════════
+        # Монеты с haiku_reason="skipped: weak signal" НЕ были проанализированы Haiku,
+        # поэтому их haiku_score (который равен p_up) НЕ должен использоваться
+        # для фундаментального одобрения. Они могут пройти только технический фильтр.
+        # ════════════════════════════════════════════════════════════════
+
+        # Фундаментальное одобрение только если монета была РЕАЛЬНО проанализирована Haiku
+        was_analyzed_by_haiku = 'skipped' not in haiku_reason and 'error' not in haiku_reason
+        haiku_approved = was_analyzed_by_haiku and (haiku_score > HaikuConfig.SCORE_THRESHOLD_APPROVE)
 
         # Проверяем: прошла ли монета хотя бы один фильтр?
         if not (passes_threshold or haiku_approved):
