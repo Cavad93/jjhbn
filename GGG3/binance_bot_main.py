@@ -460,19 +460,32 @@ class BinanceTradingBot:
             else:
                 logger.info(f"[ExpertStats] {expert_name.upper()}: No data yet")
 
-    def _get_expert_win_rates(self) -> Dict[str, float]:
+    def _get_expert_win_rates(self) -> Dict[str, Dict]:
         """
         Получает текущие винрейты всех экспертов
 
         Returns:
-            Dict с винрейтами: {'base': 0.53, 'xgb': 0.55, ...}
+            Dict с полной статистикой:
+            {
+                'base': {'win_rate': 0.53, 'wins': 10, 'losses': 9, 'total': 19},
+                'xgb': {'win_rate': 0.55, 'wins': 11, 'losses': 9, 'total': 20},
+                ...
+            }
         """
         win_rates = {}
         for expert_name, stats in self.expert_stats.items():
             if stats['total'] > 0:
-                win_rates[expert_name] = stats['wins'] / stats['total']
+                win_rate = stats['wins'] / stats['total']
             else:
-                win_rates[expert_name] = 0.0  # Нет данных
+                win_rate = 0.0  # Нет данных
+
+            # ✅ Возвращаем полную структуру (не только float!)
+            win_rates[expert_name] = {
+                'win_rate': win_rate,
+                'wins': stats['wins'],
+                'losses': stats['losses'],
+                'total': stats['total']
+            }
         return win_rates
 
     def _maybe_calibrate_base_weights(self):
