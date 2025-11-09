@@ -696,9 +696,52 @@ class PaperExchange:
 
         return executed_orders
 
+    def get_used_margin(self, leverage: float = 1.0) -> float:
+        """
+        Рассчитывает используемую маржу (заблокированную в позициях)
+
+        ФЬЮЧЕРСЫ: Маржа = сумма всех position_value / leverage
+
+        Args:
+            leverage: Плечо (по умолчанию 1x)
+
+        Returns:
+            Используемая маржа в USDT
+        """
+        used_margin = 0.0
+
+        for position in self.positions.values():
+            # Position value при входе
+            position_value = position['entry_price'] * position['amount']
+            # С плечом 1x: маржа = position_value
+            # С плечом 10x: маржа = position_value / 10
+            used_margin += position_value / leverage
+
+        return used_margin
+
+    def get_free_margin(self, leverage: float = 1.0) -> float:
+        """
+        Рассчитывает свободную маржу (доступную для новых позиций)
+
+        ФЬЮЧЕРСЫ: Free Margin = Balance - Used Margin
+
+        Args:
+            leverage: Плечо (по умолчанию 1x)
+
+        Returns:
+            Свободная маржа в USDT
+        """
+        used_margin = self.get_used_margin(leverage)
+        free_margin = self.balance - used_margin
+        return max(0.0, free_margin)  # Не может быть отрицательной
+
     def get_balance(self, asset: str = 'USDT') -> float:
         """
-        Возвращает текущий свободный баланс
+        Возвращает текущий баланс (без учета маржи)
+
+        ВАЖНО ДЛЯ ФЬЮЧЕРСОВ:
+        - Этот метод возвращает ПОЛНЫЙ баланс
+        - Для расчета доступных средств используйте get_free_margin()
 
         Args:
             asset: Актив ('USDT' по умолчанию) - для совместимости с BinanceClient

@@ -686,11 +686,16 @@ class BinanceTradingBot:
         # КРИТИЧНО: Вычисляем торговый капитал ОДИН РАЗ для всех позиций
         # Kelly будет рассчитываться от ПОЛНОГО баланса, а не от остатка
         # ═══════════════════════════════════════════════════════════════════════
-        initial_trading_capital = self.exchange.get_balance('USDT')
+        # ФЬЮЧЕРСЫ: Для reinvestment используем Equity (не Balance!)
+        # Balance не меняется в фьючерсах, поэтому нужен Equity
+        if self.paper_mode:
+            current_equity = self.exchange.get_equity()
+        else:
+            current_equity = self.exchange.get_balance('USDT')
 
         # Apply reinvestment if enabled (paper trading only)
         if self.paper_mode and self.reinvestment and self.reinvestment.enabled:
-            reinvest_result = self.reinvestment.calculate_daily_reinvestment(initial_trading_capital)
+            reinvest_result = self.reinvestment.calculate_daily_reinvestment(current_equity)
             initial_trading_capital = reinvest_result['trading_capital']
 
             # Log reserve fund info
@@ -699,6 +704,8 @@ class BinanceTradingBot:
                 print(f"  [Reinvest] To reserve: ${reinvest_result['to_reserve']:.2f}")
                 print(f"  [Reinvest] Trading capital: ${initial_trading_capital:.2f}")
                 print(f"  [Reinvest] Reserve fund: ${reinvest_result['reserve_fund']:.2f}")
+        else:
+            initial_trading_capital = current_equity
 
         # Открываем новые позиции (используем обогащённый Haiku топ-10)
         print(f"\n  Opening new positions (using top-10 from Haiku analysis)...", flush=True)
@@ -804,8 +811,12 @@ class BinanceTradingBot:
                 # Используем переданный фиксированный капитал
                 capital = initial_trading_capital
             else:
-                # Fallback: вычисляем из текущего баланса (старое поведение)
-                capital = self.exchange.get_balance('USDT')
+                # Fallback: вычисляем из текущего Equity (для фьючерсов)
+                # Balance не меняется в фьючерсах, поэтому используем Equity
+                if self.paper_mode:
+                    capital = self.exchange.get_equity()
+                else:
+                    capital = self.exchange.get_balance('USDT')
 
                 # Apply reinvestment if enabled (paper trading only)
                 if self.paper_mode and self.reinvestment and self.reinvestment.enabled:
