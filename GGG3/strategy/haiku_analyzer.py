@@ -978,18 +978,57 @@ def analyze_and_rank_top20(
             confidence = 1 - opp['p_up']  # p_down
             passes_threshold = confidence > p_threshold
 
-        # Применяем логику: final = confidence IF (passes_threshold AND haiku_score > 0.6)
-        if passes_threshold and opp.get('haiku_score', 0.5) > 0.6:
-            # Монета прошла оба фильтра
-            opp['final_score'] = confidence
+        # ════════════════════════════════════════════════════════════════
+        # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Логика фильтрации ИЛИ, а не И
+        # ════════════════════════════════════════════════════════════════
+        # Монета одобряется если проходит ХОТЯ БЫ ОДИН фильтр:
+        # 1. Технический (passes_threshold) ИЛИ
+        # 2. Фундаментальный (haiku_score > 0.6)
+        #
+        # Это позволяет Haiku находить монеты с отличными новостями,
+        # даже если технический сигнал слабоват
+        # ════════════════════════════════════════════════════════════════
+
+        haiku_score = opp.get('haiku_score', 0.5)
+        haiku_approved = haiku_score > HaikuConfig.SCORE_THRESHOLD_APPROVE
+
+        # Проверяем: прошла ли монета хотя бы один фильтр?
+        if not (passes_threshold or haiku_approved):
+            # Не прошла ни один фильтр - отклоняем
+            logger.debug(
+                f"[HaikuIntegration] FILTERED OUT {opp['symbol']}: "
+                f"tech={confidence:.3f} (threshold={p_threshold:.3f}), "
+                f"fund={haiku_score:.3f} (min={HaikuConfig.SCORE_THRESHOLD_APPROVE})"
+            )
+            continue
+
+        # Монета прошла хотя бы один фильтр - определяем финальный скор
+        if passes_threshold and haiku_approved:
+            # Прошла оба фильтра - используем комбинированный скор
+            # Используем взвешенное среднее: 60% техника + 40% фундамент
+            opp['final_score'] = confidence * 0.6 + haiku_score * 0.4
             opp['final_reason'] = 'tech+fund'
+            logger.debug(
+                f"[HaikuIntegration] APPROVED (both) {opp['symbol']}: "
+                f"final={opp['final_score']:.3f} (tech={confidence:.3f}, fund={haiku_score:.3f})"
+            )
         elif passes_threshold:
-            # Только технический скор
+            # Прошла только технический фильтр
             opp['final_score'] = confidence
             opp['final_reason'] = 'tech_only'
+            logger.debug(
+                f"[HaikuIntegration] APPROVED (tech) {opp['symbol']}: "
+                f"final={opp['final_score']:.3f} (fund={haiku_score:.3f} too low)"
+            )
         else:
-            # Не прошла порог
-            continue
+            # Прошла только фундаментальный фильтр
+            # Используем haiku_score, но с небольшим снижением для осторожности
+            opp['final_score'] = haiku_score * 0.9
+            opp['final_reason'] = 'fund_only'
+            logger.info(
+                f"[HaikuIntegration] APPROVED (fund) {opp['symbol']}: "
+                f"final={opp['final_score']:.3f} (tech={confidence:.3f} below threshold)"
+            )
 
         filtered.append(opp)
 
