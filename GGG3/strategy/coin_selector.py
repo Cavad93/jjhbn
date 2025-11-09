@@ -385,13 +385,13 @@ class CoinSelector:
             >>>     print(f"{opp['symbol']:15s} {opp['direction']:5s} EV={opp['ev']:+.4f}")
         """
         if self.verbose:
-            print("="*80)
-            print("СКРИНИНГ МОНЕТ ДЛЯ ТОРГОВЫХ ВОЗМОЖНОСТЕЙ")
-            print("="*80)
-            print(f"Всего пар для скрининга: {len(all_pairs)}")
-            print(f"Минимальный EV: {self.min_ev_threshold*100:.1f}%")
-            print(f"Целевое количество: {top_n}")
-            print()
+            print("="*80, flush=True)
+            print("СКРИНИНГ МОНЕТ ДЛЯ ТОРГОВЫХ ВОЗМОЖНОСТЕЙ", flush=True)
+            print("="*80, flush=True)
+            print(f"Всего пар для скрининга: {len(all_pairs)}", flush=True)
+            print(f"Минимальный EV: {self.min_ev_threshold*100:.1f}%", flush=True)
+            print(f"Целевое количество: {top_n}", flush=True)
+            print(flush=True)
 
         # Сброс статистики
         for key in self.filter_stats:
@@ -400,8 +400,14 @@ class CoinSelector:
         self.filter_stats['total_pairs'] = len(all_pairs)
 
         opportunities: List[dict] = []
+        processed_count = 0
+        total_pairs = len(all_pairs)
 
         for symbol in all_pairs:
+            processed_count += 1
+            # Показываем прогресс каждые 50 монет
+            if self.verbose and processed_count % 50 == 0:
+                print(f"  Progress: {processed_count}/{total_pairs} pairs scanned...", flush=True)
             try:
                 # Получаем ticker данные
                 ticker_data = get_ticker_func(symbol)

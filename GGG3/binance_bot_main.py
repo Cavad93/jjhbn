@@ -476,9 +476,10 @@ class BinanceTradingBot:
     def run(self):
         """Главный торговый цикл"""
 
-        print(f"\n{'='*80}")
-        print(f"🚀 STARTING BINANCE TRADING BOT")
-        print(f"{'='*80}\n")
+        print(f"\n{'='*80}", flush=True)
+        print(f"🚀 STARTING BINANCE TRADING BOT", flush=True)
+        print(f"{'='*80}\n", flush=True)
+        print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n", flush=True)
 
         last_4h_check = 0
         last_5m_check = 0
@@ -598,7 +599,7 @@ class BinanceTradingBot:
             last_trade_time=self.last_trade_time
         )
 
-        print(f"  Adaptive threshold: {p_threshold:.4f}")
+        print(f"  Adaptive threshold: {p_threshold:.4f}", flush=True)
 
         # ═══════════════════════════════════════════════════════════════════════
         # ОПТИМИЗАЦИЯ: Один проход для топ-20, экономия ~30-60 минут!
@@ -621,11 +622,11 @@ class BinanceTradingBot:
             exchange=self.exchange  # Для получения funding rate
         )
 
-        print(f"\n  Top-20 opportunities (for closure decisions):")
+        print(f"\n  Top-20 opportunities (for closure decisions):", flush=True)
         for i, opp in enumerate(top_20_opportunities, 1):
             marker = "✓" if i <= 10 else " "  # Отмечаем первые 10
             print(f"    {marker} {i:2d}. {opp['symbol']:<12} {opp['direction']:<6} "
-                  f"p_up={opp['p_up']:.3f}  EV={opp['ev']:.4f}")
+                  f"p_up={opp['p_up']:.3f}  EV={opp['ev']:.4f}", flush=True)
 
         # ═══════════════════════════════════════════════════════════════════════
         # HAIKU 4.5: Фундаментальный анализ TOP-20 для формирования финального TOP-10

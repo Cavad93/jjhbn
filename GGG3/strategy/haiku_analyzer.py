@@ -32,13 +32,14 @@ from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 from threading import Lock
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 # DuckDuckGo поиск новостей
 try:
-    from ddgs import DDGS
+    from duckduckgo_search import DDGS
 except ImportError:
     DDGS = None
-    logging.warning("ddgs не установлен. pip install ddgs")
+    logging.warning("duckduckgo_search не установлен. pip install duckduckgo-search")
 
 # Anthropic API
 try:
@@ -272,53 +273,66 @@ class NewsCollector:
 
         try:
             # ════════════════════════════════════════════════════════════════
-            # ПОИСК НОВОСТЕЙ ЧЕРЕЗ DUCKDUCKGO
+            # ПОИСК НОВОСТЕЙ ЧЕРЕЗ DUCKDUCKGO С ТАЙМАУТОМ
             # ════════════════════════════════════════════════════════════════
             # timelimit='d' - последние 24 часа (day)
             # max_results - максимум результатов
+            # timeout - таймаут для предотвращения зависаний (30 сек)
             # ════════════════════════════════════════════════════════════════
 
             logger.debug(f"[NewsCollector] Searching DuckDuckGo: query='{query}', timelimit='d'")
 
-            with DDGS() as ddgs_client:
-                # Для hours <= 24 используем 'd' (day), для больших - 'w' (week)
-                time_limit = 'd' if hours <= 24 else 'w'
+            def _search_news():
+                """Вспомогательная функция для поиска с таймаутом"""
+                with DDGS() as ddgs_client:
+                    # Для hours <= 24 используем 'd' (day), для больших - 'w' (week)
+                    time_limit = 'd' if hours <= 24 else 'w'
 
-                results = ddgs_client.news(
-                    query=query,
-                    timelimit=time_limit,
-                    max_results=HaikuConfig.MAX_NEWS_ITEMS
-                )
+                    results = ddgs_client.news(
+                        query=query,
+                        timelimit=time_limit,
+                        max_results=HaikuConfig.MAX_NEWS_ITEMS
+                    )
+                    return list(results)  # Материализуем generator
 
-                # Обрабатываем результаты
-                for result in results:
-                    # Проверяем упоминание монеты в заголовке или тексте
-                    title = result.get('title', '').lower()
-                    body = result.get('body', '').lower()
-                    combined_text = title + ' ' + body
+            # Запускаем поиск с таймаутом 30 секунд
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_search_news)
+                try:
+                    results = future.result(timeout=30.0)  # 30 сек таймаут
+                except FuturesTimeoutError:
+                    logger.warning(f"[NewsCollector] DuckDuckGo search timeout for {coin_name} (30s)")
+                    raise TimeoutError(f"DuckDuckGo search timeout for {coin_name}")
 
-                    # Проверяем по всем алиасам
-                    match_found = False
-                    for term in search_terms:
-                        # Используем word boundaries для точного поиска
-                        pattern = r'\b' + re.escape(term.lower()) + r'\b'
-                        if re.search(pattern, combined_text):
-                            match_found = True
-                            break
+            # Обрабатываем результаты
+            for result in results:
+                # Проверяем упоминание монеты в заголовке или тексте
+                title = result.get('title', '').lower()
+                body = result.get('body', '').lower()
+                combined_text = title + ' ' + body
 
-                    # Если монета не упоминается явно - пропускаем
-                    # (защита от нерелевантных результатов)
-                    if not match_found and len(search_terms) > 1:
-                        logger.debug(f"[NewsCollector] Skipping irrelevant: {result.get('title', 'N/A')[:50]}")
-                        continue
+                # Проверяем по всем алиасам
+                match_found = False
+                for term in search_terms:
+                    # Используем word boundaries для точного поиска
+                    pattern = r'\b' + re.escape(term.lower()) + r'\b'
+                    if re.search(pattern, combined_text):
+                        match_found = True
+                        break
 
-                    all_news.append({
-                        'title': result.get('title', ''),
-                        'link': result.get('url', ''),
-                        'published': result.get('date', ''),
-                        'source': result.get('source', 'DuckDuckGo'),
-                        'summary': result.get('body', '')[:HaikuConfig.MAX_NEWS_SUMMARY_LENGTH]
-                    })
+                # Если монета не упоминается явно - пропускаем
+                # (защита от нерелевантных результатов)
+                if not match_found and len(search_terms) > 1:
+                    logger.debug(f"[NewsCollector] Skipping irrelevant: {result.get('title', 'N/A')[:50]}")
+                    continue
+
+                all_news.append({
+                    'title': result.get('title', ''),
+                    'link': result.get('url', ''),
+                    'published': result.get('date', ''),
+                    'source': result.get('source', 'DuckDuckGo'),
+                    'summary': result.get('body', '')[:HaikuConfig.MAX_NEWS_SUMMARY_LENGTH]
+                })
 
             logger.info(f"[NewsCollector] Found {len(all_news)} news for {coin_name} via DuckDuckGo")
 
