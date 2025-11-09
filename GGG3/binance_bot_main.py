@@ -835,12 +835,24 @@ class BinanceTradingBot:
                 'base_signals': opportunity.get('base_signals', {})  # ✅ BASE сигналы [M, S, B, R] для калибровки
             }
 
-            # Создаем Position объект
+            # Открываем позицию на бирже (фьючерсная логика)
+            # ВАЖНО: exchange.open_position() сам создаст ордера и вернет position_data
+            exchange_position = self.exchange.open_position(
+                symbol=symbol,
+                side=direction,  # 'LONG' или 'SHORT'
+                amount=amount,
+                entry_price=current_price,
+                tp_price=tp_price,
+                sl_price=sl_price,
+                metadata={'entry_snapshot': entry_snapshot}
+            )
+
+            # Создаем Position объект с данными из биржи
             position = Position(
                 symbol=symbol,
                 direction=direction,
                 entry_time=datetime.now(),
-                entry_price=current_price,
+                entry_price=exchange_position['entry_price'],
                 amount=amount,
                 position_value=position_size_usd,
                 tp_price=tp_price,
@@ -848,37 +860,11 @@ class BinanceTradingBot:
                 atr_value=atr,
                 entry_snapshot=entry_snapshot,  # ✅ SNAPSHOT SAVED
                 status='OPEN',
-                entry_order_id=None,
-                tp_order_id=None,
-                sl_order_id=None
+                entry_order_id=exchange_position['entry_order_id'],
+                tp_order_id=exchange_position.get('tp_order_id'),
+                sl_order_id=exchange_position.get('sl_order_id'),
+                exchange_position_id=exchange_position['id']  # ✅ ID позиции в PaperExchange
             )
-
-            # Открываем на бирже
-            # Entry order
-            entry_order = self.exchange.create_market_order(
-                symbol=symbol,
-                side='BUY' if direction == 'LONG' else 'SELL',
-                amount=amount
-            )
-            position.entry_order_id = entry_order['id']
-
-            # TP order
-            tp_order = self.exchange.create_limit_order(
-                symbol=symbol,
-                side='SELL' if direction == 'LONG' else 'BUY',
-                amount=amount,
-                price=tp_price
-            )
-            position.tp_order_id = tp_order['id']
-
-            # SL order
-            sl_order = self.exchange.create_stop_market_order(
-                symbol=symbol,
-                side='SELL' if direction == 'LONG' else 'BUY',
-                amount=amount,
-                stop_price=sl_price
-            )
-            position.sl_order_id = sl_order['id']
 
             # Добавляем в портфель
             self.position_manager.add_position(position)
@@ -969,40 +955,20 @@ class BinanceTradingBot:
                     # Paper mode: проверяем достижение уровней вручную
                     if position.direction == 'LONG':
                         if current_price >= position.tp_price:
-                            # Закрываем позицию на бирже (КРИТИЧНО: возвращает деньги на баланс!)
-                            self.exchange.create_market_order(
-                                symbol=position.symbol,
-                                side='SELL',
-                                amount=position.amount
-                            )
+                            # close_position() сам вызовет exchange.create_market_order()
                             self.close_position(position, 'TP', position.tp_price)
                             continue
                         elif current_price <= position.sl_price:
-                            # Закрываем позицию на бирже (КРИТИЧНО: возвращает деньги на баланс!)
-                            self.exchange.create_market_order(
-                                symbol=position.symbol,
-                                side='SELL',
-                                amount=position.amount
-                            )
+                            # close_position() сам вызовет exchange.create_market_order()
                             self.close_position(position, 'SL', position.sl_price)
                             continue
                     else:  # SHORT
                         if current_price <= position.tp_price:
-                            # Закрываем позицию на бирже (КРИТИЧНО: возвращает деньги на баланс!)
-                            self.exchange.create_market_order(
-                                symbol=position.symbol,
-                                side='BUY',
-                                amount=position.amount
-                            )
+                            # close_position() сам вызовет exchange.create_market_order()
                             self.close_position(position, 'TP', position.tp_price)
                             continue
                         elif current_price >= position.sl_price:
-                            # Закрываем позицию на бирже (КРИТИЧНО: возвращает деньги на баланс!)
-                            self.exchange.create_market_order(
-                                symbol=position.symbol,
-                                side='BUY',
-                                amount=position.amount
-                            )
+                            # close_position() сам вызовет exchange.create_market_order()
                             self.close_position(position, 'SL', position.sl_price)
                             continue
 
@@ -1027,6 +993,10 @@ class BinanceTradingBot:
                     )
                     position.sl_order_id = sl_order['id']
                     position.sl_price = new_sl
+
+                    # ФЬЮЧЕРСЫ: Также обновляем sl_order_id в позиции PaperExchange
+                    if position.exchange_position_id and position.exchange_position_id in self.exchange.positions:
+                        self.exchange.positions[position.exchange_position_id]['sl_order_id'] = sl_order['id']
 
                     # Send Telegram notification
                     if config.TELEGRAM_ALERT_TYPES.get('trailing_stop', True):
@@ -1133,29 +1103,22 @@ class BinanceTradingBot:
         except Exception as e:
             logger.error(f"Error recording result to META: {e}")
 
-        # Отменяем TP/SL ордера в exchange (для paper trading, если они существуют)
-        if self.paper_mode and hasattr(self.exchange, 'orders'):
-            try:
-                if position.tp_order_id and position.tp_order_id in self.exchange.orders:
-                    self.exchange.cancel_order(position.symbol, position.tp_order_id)
-                if position.sl_order_id and position.sl_order_id in self.exchange.orders:
-                    self.exchange.cancel_order(position.symbol, position.sl_order_id)
-            except Exception as e:
-                logger.warning(f"Failed to cancel TP/SL orders for {position.symbol}: {e}")
-
         # ═══════════════════════════════════════════════════════════════════════
-        # КРИТИЧНО: Закрываем позицию в exchange для возврата баланса
-        # Без этого баланс "застревает" в закрытых позициях!
+        # КРИТИЧНО: Закрываем позицию в exchange (ФЬЮЧЕРСНАЯ ЛОГИКА)
+        # exchange.close_position() сам создаст market order И добавит PnL в баланс
         # ═══════════════════════════════════════════════════════════════════════
-        if self.paper_mode:
+        if self.paper_mode and position.exchange_position_id:
             try:
-                # Создаем market order для закрытия позиции
-                close_side = 'SELL' if position.direction == 'LONG' else 'BUY'
-                self.exchange.create_market_order(
-                    symbol=position.symbol,
-                    side=close_side,
-                    amount=position.amount
+                # Закрываем позицию в PaperExchange (фьючерсная логика)
+                # Метод close_position() сам:
+                # 1. Создаст closing market order
+                # 2. Рассчитает PnL
+                # 3. Добавит PnL в balance
+                closed_exchange_position = self.exchange.close_position(
+                    position_id=position.exchange_position_id,
+                    reason=exit_reason.lower()
                 )
+                logger.debug(f"Closed position in PaperExchange: {closed_exchange_position.get('pnl_after_commission', 0):.2f} USDT")
             except Exception as e:
                 logger.error(f"Failed to close position in exchange for {position.symbol}: {e}")
 
@@ -1193,20 +1156,7 @@ class BinanceTradingBot:
         try:
             current_price = self.exchange.get_current_price(position.symbol)
 
-            # Отменяем TP/SL ордера (если они существуют)
-            if self.paper_mode and hasattr(self.exchange, 'orders'):
-                if position.tp_order_id and position.tp_order_id in self.exchange.orders:
-                    self.exchange.cancel_order(position.symbol, position.tp_order_id)
-                if position.sl_order_id and position.sl_order_id in self.exchange.orders:
-                    self.exchange.cancel_order(position.symbol, position.sl_order_id)
-
-            # Закрываем по рынку
-            self.exchange.create_market_order(
-                symbol=position.symbol,
-                side='SELL' if position.direction == 'LONG' else 'BUY',
-                amount=position.amount
-            )
-
+            # close_position() сам вызовет exchange.close_position(), который отменит TP/SL ордера
             self.close_position(position, 'MANUAL', current_price)
 
         except Exception as e:

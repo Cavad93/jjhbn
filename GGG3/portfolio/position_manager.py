@@ -47,6 +47,7 @@ class Position:
     entry_order_id: Optional[str] = None    # ID entry ордера
     tp_order_id: Optional[str] = None       # ID TP ордера
     sl_order_id: Optional[str] = None       # ID SL ордера
+    exchange_position_id: Optional[str] = None  # ID позиции в PaperExchange (для фьючерсов)
 
     # ✅ КРИТИЧНО: Snapshot на момент входа (temporal consistency)
     entry_snapshot: Dict[str, Any] = field(default_factory=dict)

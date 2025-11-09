@@ -278,15 +278,19 @@ class PaperExchange:
         print(f"[PaperExchange] Initialized with capital: {initial_capital} USDT")
 
     def create_market_order(self, symbol: str, side: str, amount: float,
-                           position_id: Optional[str] = None) -> dict:
+                           position_id: Optional[str] = None, is_closing: bool = False) -> dict:
         """
         Симулирует рыночный ордер (market order)
+
+        ФЬЮЧЕРСЫ: Balance НЕ меняется при открытии позиции!
+        Balance меняется только при ЗАКРЫТИИ позиции (добавляется PnL).
 
         Args:
             symbol: Торговая пара (например, 'BTCUSDT')
             side: Направление ('BUY' или 'SELL')
             amount: Количество базовой валюты
             position_id: ID позиции (для закрытия позиции)
+            is_closing: True если это закрытие позиции
 
         Returns:
             dict: Данные исполненного ордера
@@ -318,18 +322,8 @@ class PaperExchange:
         cost = amount * exec_price
         commission_amount = cost * self.commission
 
-        # Проверяем баланс для покупки
-        if side == 'BUY':
-            total_cost = cost + commission_amount
-            if total_cost > self.balance:
-                raise InsufficientBalance(
-                    f"Need {total_cost:.2f} USDT, have {self.balance:.2f} USDT"
-                )
-            self.balance -= total_cost
-        else:  # SELL
-            # При продаже получаем деньги минус комиссия
-            received = cost - commission_amount
-            self.balance += received
+        # ФЬЮЧЕРСЫ: Balance НЕ меняется при открытии!
+        # Balance изменяется только при ЗАКРЫТИИ позиции в методе close_position()
 
         # Создаем запись о сделке
         order = {
@@ -346,7 +340,8 @@ class PaperExchange:
             'status': 'filled',
             'timestamp': time.time(),
             'datetime': datetime.now().isoformat(),
-            'position_id': position_id
+            'position_id': position_id,
+            'is_closing': is_closing
         }
 
         self.trades_history.append(order.copy())
@@ -453,7 +448,8 @@ class PaperExchange:
                 position['symbol'],
                 close_side,
                 position['amount'],
-                position_id=position_id
+                position_id=position_id,
+                is_closing=True
             )
         except Exception as e:
             raise Exception(f"Failed to close position: {e}")
@@ -474,6 +470,9 @@ class PaperExchange:
 
         pnl_after_commission = pnl - total_commission
         pnl_percent = (pnl_after_commission / (position['entry_price'] * position['amount'])) * 100
+
+        # ФЬЮЧЕРСЫ: Добавляем PnL в balance при закрытии
+        self.balance += pnl_after_commission
 
         # Обновляем позицию
         position['status'] = 'closed'
@@ -726,27 +725,49 @@ class PaperExchange:
 
     def get_equity(self) -> float:
         """
-        Рассчитывает полный капитал (баланс + стоимость активов)
+        Рассчитывает полный капитал (баланс + unrealized PnL)
 
-        ВАЖНО: PaperExchange симулирует СПОТОВУЮ торговлю!
-        При покупке актива balance уменьшается, актив переходит в позицию.
-        Equity = свободный баланс + текущая стоимость всех активов.
+        ФЬЮЧЕРСЫ: Balance НЕ меняется при открытии позиции!
+        Equity = balance + unrealized_pnl всех открытых позиций.
+
+        При открытии:
+        - balance остается прежним (маржа блокируется, но баланс НЕ меняется)
+        - unrealized_pnl = 0 (цена не изменилась)
+        - equity = balance
+
+        При изменении цены:
+        - balance НЕ меняется
+        - unrealized_pnl растет/падает
+        - equity = balance + unrealized_pnl
+
+        При закрытии:
+        - balance += pnl_after_commission
+        - позиция удаляется
+        - equity = balance (новый)
 
         Returns:
             float: Общий капитал в USDT
         """
-        equity = self.balance  # Свободные деньги
+        equity = self.balance  # Баланс фиксирован до закрытия позиций
 
-        # Добавляем текущую стоимость всех открытых позиций
+        # Добавляем нереализованный PnL всех открытых позиций
         for position in self.positions.values():
             try:
                 current_price = get_binance_price(position['symbol'])
 
-                # СПОТ: Считаем текущую стоимость актива
-                # (для фьючерсов было бы unrealized_pnl, но у нас СПОТ!)
-                current_position_value = current_price * position['amount']
+                # ФЬЮЧЕРСЫ: Считаем unrealized PnL
+                if position['side'] == 'LONG':
+                    unrealized_pnl = (current_price - position['entry_price']) * position['amount']
+                else:  # SHORT
+                    unrealized_pnl = (position['entry_price'] - current_price) * position['amount']
 
-                equity += current_position_value
+                # Вычитаем комиссию на вход (комиссия на выход будет при закрытии)
+                for trade in reversed(self.trades_history):
+                    if trade['id'] == position['entry_order_id']:
+                        unrealized_pnl -= trade['commission']
+                        break
+
+                equity += unrealized_pnl
 
             except Exception as e:
                 print(f"[PaperExchange] Warning: Failed to get equity for {position['id']}: {e}")
