@@ -36,10 +36,10 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 
 # DuckDuckGo поиск новостей
 try:
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS  # ✅ Обновлено на новую библиотеку ddgs
 except ImportError:
     DDGS = None
-    logging.warning("duckduckgo_search не установлен. pip install duckduckgo-search")
+    logging.warning("ddgs library not installed. Install with: pip install ddgs")
 
 # Anthropic API
 try:
@@ -288,8 +288,9 @@ class NewsCollector:
                     # Для hours <= 24 используем 'd' (day), для больших - 'w' (week)
                     time_limit = 'd' if hours <= 24 else 'w'
 
+                    # ✅ В новой библиотеке ddgs: query - позиционный аргумент
                     results = ddgs_client.news(
-                        query=query,
+                        query,  # Позиционный аргумент (не keyword!)
                         timelimit=time_limit,
                         max_results=HaikuConfig.MAX_NEWS_ITEMS
                     )
@@ -337,7 +338,14 @@ class NewsCollector:
             logger.info(f"[NewsCollector] Found {len(all_news)} news for {coin_name} via DuckDuckGo")
 
         except Exception as e:
-            logger.error(f"[NewsCollector] DuckDuckGo search failed for {coin_name}: {e}")
+            # ✅ Специальная обработка SSL/сертификат ошибок
+            error_str = str(e)
+            if 'CERTIFICATE_VERIFY_FAILED' in error_str or 'SSL' in error_str or 'TLS' in error_str:
+                logger.warning(f"[NewsCollector] SSL/Certificate error for {coin_name}. "
+                             f"This is an environment issue (proxy/antivirus/firewall blocking HTTPS). "
+                             f"Continuing without news for this coin.")
+            else:
+                logger.error(f"[NewsCollector] DuckDuckGo search failed for {coin_name}: {e}")
             # Возвращаем пустой список вместо падения
             all_news = []
 
