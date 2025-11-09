@@ -906,20 +906,18 @@ class BinanceTradingBot:
 
                 # ПРАВИЛЬНЫЙ расчет капитала ПОСЛЕ открытия позиции
                 if self.paper_mode:
-                    # Получаем текущий свободный баланс (после открытия позиции)
-                    current_free_balance = self.exchange.get_balance('USDT')
-
-                    # Рассчитываем стоимость всех открытых позиций
-                    locked_in_positions = sum(
-                        pos.position_value
-                        for pos in self.position_manager.get_all_open()
-                    )
+                    # Для PaperExchange используем get_equity() - он УЖЕ учитывает unrealized PnL
+                    current_equity = self.exchange.get_equity()
 
                     # Резервный фонд
                     current_reserve = self.reinvestment.reserve_fund if self.reinvestment else 0.0
 
-                    # Общий капитал = Свободный + Заблокированный + Резерв
-                    actual_total_equity = current_free_balance + locked_in_positions + current_reserve
+                    # Общий капитал = Equity (баланс + unrealized PnL) + Резерв
+                    actual_total_equity = current_equity + current_reserve
+
+                    # Для детализации в уведомлениях и логах
+                    current_free_balance = self.exchange.get_balance('USDT')
+                    locked_in_positions = current_equity - current_free_balance  # Реальная стоимость открытых позиций с PnL
 
                     # Записываем snapshot
                     if self.capital_tracker:
@@ -1245,7 +1243,9 @@ class BinanceTradingBot:
             print("💰 FINAL BALANCE")
             print("="*80)
 
-            current_balance = self.exchange.get_balance('USDT')
+            # Используем get_equity() для правильного учета unrealized PnL (если позиции не закрылись)
+            current_equity = self.exchange.get_equity()
+            current_free_balance = self.exchange.get_balance('USDT')
             initial_balance = self.exchange.initial_capital
 
             # Подсчитываем общий PnL из закрытых позиций
@@ -1269,19 +1269,20 @@ class BinanceTradingBot:
 
             print(f"\n💵 Account Balance:")
             print(f"  Initial balance:  ${initial_balance:,.2f}")
-            print(f"  Current balance:  ${current_balance:,.2f}")
-            print(f"  Net change:       ${current_balance - initial_balance:+,.2f}")
+            print(f"  Free balance:     ${current_free_balance:,.2f}")
+            print(f"  Current equity:   ${current_equity:,.2f}")
+            print(f"  Net change:       ${current_equity - initial_balance:+,.2f}")
 
             # Если есть резервный фонд
             if self.reinvestment and self.reinvestment.reserve_fund > 0:
                 reserve = self.reinvestment.reserve_fund
-                total_equity = current_balance + reserve
+                total_equity = current_equity + reserve
                 print(f"\n  Reserve fund:     ${reserve:,.2f}")
                 print(f"  Total equity:     ${total_equity:,.2f}")
                 print(f"  Total change:     ${total_equity - initial_balance:+,.2f}")
 
-            # ROI
-            roi = ((current_balance - initial_balance) / initial_balance) * 100
+            # ROI (на основе equity, не balance)
+            roi = ((current_equity - initial_balance) / initial_balance) * 100
             print(f"\n  ROI:              {roi:+.2f}%")
             print("="*80)
 
