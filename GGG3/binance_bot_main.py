@@ -1086,6 +1086,16 @@ class BinanceTradingBot:
         КРИТИЧНО: Использует СОХРАНЕННЫЕ фичи из entry_snapshot (t0)
         """
 
+        # ════════════════════════════════════════════════════════════════
+        # ЗАЩИТА: Проверяем, что позиция еще не закрыта
+        # ════════════════════════════════════════════════════════════════
+        if position.status == 'CLOSED':
+            logger.warning(f"Position {position.symbol} is already CLOSED, skipping duplicate close")
+            return
+
+        logger.info(f"[close_position] Called for {position.symbol} {position.direction}, "
+                   f"reason={exit_reason}, exchange_position_id={position.exchange_position_id}")
+
         print(f"\n[EXIT] {position.symbol} {position.direction} - {exit_reason}")
 
         # Обновляем Position
@@ -1152,16 +1162,21 @@ class BinanceTradingBot:
         # ═══════════════════════════════════════════════════════════════════════
         if self.paper_mode and position.exchange_position_id:
             try:
-                # Закрываем позицию в PaperExchange (фьючерсная логика)
-                # Метод close_position() сам:
-                # 1. Создаст closing market order
-                # 2. Рассчитает PnL
-                # 3. Добавит PnL в balance
-                closed_exchange_position = self.exchange.close_position(
-                    position_id=position.exchange_position_id,
-                    reason=exit_reason.lower()
-                )
-                logger.debug(f"Closed position in PaperExchange: {closed_exchange_position.get('pnl_after_commission', 0):.2f} USDT")
+                # ЗАЩИТА: Проверяем, что позиция все еще существует в exchange
+                if position.exchange_position_id not in self.exchange.positions:
+                    logger.warning(f"Position {position.symbol} ({position.exchange_position_id}) "
+                                 f"already closed in exchange, skipping")
+                else:
+                    # Закрываем позицию в PaperExchange (фьючерсная логика)
+                    # Метод close_position() сам:
+                    # 1. Создаст closing market order
+                    # 2. Рассчитает PnL
+                    # 3. Добавит PnL в balance
+                    closed_exchange_position = self.exchange.close_position(
+                        position_id=position.exchange_position_id,
+                        reason=exit_reason.lower()
+                    )
+                    logger.debug(f"Closed position in PaperExchange: {closed_exchange_position.get('pnl_after_commission', 0):.2f} USDT")
             except Exception as e:
                 logger.error(f"Failed to close position in exchange for {position.symbol}: {e}")
 
@@ -1252,6 +1267,11 @@ class BinanceTradingBot:
         # ═══════════════════════════════════════════════════════════
 
         if self.paper_mode:
+            # ════════════════════════════════════════════════════════════════
+            # ВАЛИДАЦИЯ БАЛАНСА: Проверяем корректность расчетов
+            # ════════════════════════════════════════════════════════════════
+            validation_result = self.exchange.validate_balance()
+
             print("\n" + "="*80)
             print("💰 FINAL BALANCE")
             print("="*80)

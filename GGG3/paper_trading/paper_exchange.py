@@ -461,6 +461,20 @@ class PaperExchange:
 
         position = self.positions[position_id]
 
+        # ════════════════════════════════════════════════════════════════
+        # ЗАЩИТА ОТ ДВОЙНОГО ЗАКРЫТИЯ
+        # ════════════════════════════════════════════════════════════════
+        if position.get('is_closing', False):
+            print(f"[PaperExchange] WARNING: Position {position_id} ({position['symbol']}) "
+                  f"is already being closed. Ignoring duplicate close request.")
+            return position
+
+        # Помечаем позицию как закрывающуюся
+        position['is_closing'] = True
+
+        print(f"[PaperExchange] Closing position {position_id}: {position['side']} {position['symbol']} "
+              f"@ entry={position['entry_price']:.6f}, balance_before={self.balance:.2f}")
+
         # Закрываем позицию противоположным ордером
         close_side = 'SELL' if position['side'] == 'LONG' else 'BUY'
 
@@ -473,6 +487,8 @@ class PaperExchange:
                 is_closing=True
             )
         except Exception as e:
+            # Снимаем флаг при ошибке
+            position['is_closing'] = False
             raise Exception(f"Failed to close position: {e}")
 
         # Рассчитываем PnL
@@ -492,8 +508,14 @@ class PaperExchange:
         pnl_after_commission = pnl - total_commission
         pnl_percent = (pnl_after_commission / (position['entry_price'] * position['amount'])) * 100
 
+        # ════════════════════════════════════════════════════════════════
         # ФЬЮЧЕРСЫ: Добавляем PnL в balance при закрытии
+        # КРИТИЧНО: Это должно произойти ТОЛЬКО ОДИН РАЗ!
+        # ════════════════════════════════════════════════════════════════
+        old_balance = self.balance
         self.balance += pnl_after_commission
+
+        print(f"[PaperExchange] Balance updated: {old_balance:.2f} + {pnl_after_commission:.2f} = {self.balance:.2f}")
 
         # Обновляем позицию
         position['status'] = 'closed'
@@ -1089,6 +1111,45 @@ class PaperExchange:
             'roi': (total_pnl / self.initial_capital) * 100,
             'current_equity': self.get_equity()
         }
+
+    def validate_balance(self) -> dict:
+        """
+        Проверяет корректность баланса на основе истории сделок
+
+        Должно быть:
+        balance = initial_capital + sum(all closed positions PnL)
+
+        Returns:
+            dict: Результаты валидации с detalями любых несоответствий
+        """
+        # Рассчитываем ожидаемый баланс
+        total_pnl = sum(p['pnl_after_commission'] for p in self.closed_positions)
+        expected_balance = self.initial_capital + total_pnl
+        actual_balance = self.balance
+
+        difference = actual_balance - expected_balance
+        is_valid = abs(difference) < 0.01  # Допускаем погрешность округления
+
+        result = {
+            'is_valid': is_valid,
+            'initial_capital': self.initial_capital,
+            'total_pnl_from_history': total_pnl,
+            'expected_balance': expected_balance,
+            'actual_balance': actual_balance,
+            'difference': difference,
+            'total_closed_positions': len(self.closed_positions)
+        }
+
+        if not is_valid:
+            print(f"\n⚠️  BALANCE VALIDATION FAILED!")
+            print(f"   Expected: ${expected_balance:.2f}")
+            print(f"   Actual:   ${actual_balance:.2f}")
+            print(f"   Diff:     ${difference:.2f}")
+            print(f"   This indicates positions may have been closed multiple times!")
+        else:
+            print(f"\n✅ Balance validation passed: ${actual_balance:.2f}")
+
+        return result
 
     def save_state(self, filepath: str = "paper_exchange_state.json"):
         """
