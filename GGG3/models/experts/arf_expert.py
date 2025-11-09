@@ -17,7 +17,7 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 try:
-    from river import ensemble, tree
+    from river import forest
     from river.drift import ADWIN
     HAVE_RIVER = True
 except ImportError:
@@ -70,17 +70,17 @@ class AdaptiveRFExpert:
 
     def _init_model(self):
         """Инициализация модели"""
-        # Создаем Adaptive Random Forest
+        # Создаем Adaptive Random Forest (ARFClassifier из river.forest)
         # Используем минимальные параметры для совместимости
         try:
-            self.model = ensemble.AdaptiveRandomForestClassifier(
+            self.model = forest.ARFClassifier(
                 n_models=self.n_models,
                 seed=self.random_state
             )
         except Exception as e:
             print(f"Ошибка создания ARF: {e}")
             # Fallback к базовой версии
-            self.model = ensemble.AdaptiveRandomForestClassifier(
+            self.model = forest.ARFClassifier(
                 n_models=self.n_models
             )
 

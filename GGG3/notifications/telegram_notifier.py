@@ -227,6 +227,7 @@ class TelegramNotifier:
                 - pnl_percent: PnL в процентах
                 - exit_reason: Причина закрытия (TP/SL/timeout/manual)
                 - holding_time: Время удержания позиции
+                - win_rates: Win rates экспертов (опционально)
         """
         symbol = position_data.get('symbol', 'UNKNOWN')
         direction = position_data.get('direction', 'UNKNOWN')
@@ -236,6 +237,7 @@ class TelegramNotifier:
         pnl_percent = position_data.get('pnl_percent', 0.0)
         exit_reason = position_data.get('exit_reason', 'UNKNOWN')
         holding_time = position_data.get('holding_time', 'N/A')
+        win_rates = position_data.get('win_rates', {})
 
         # Эмодзи в зависимости от результата
         if pnl > 0:
@@ -268,9 +270,29 @@ class TelegramNotifier:
 💵 PnL: ${pnl:+.2f} ({pnl_percent:+.2f}%)
 📝 Причина: {reason_text}
 ⏱ Время: {holding_time}
-
-⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
         """.strip()
+
+        # ✅ Добавляем Win Rates экспертов если доступны
+        if win_rates:
+            text += "\n\n<b>📊 Win Rates:</b>"
+            # Порядок отображения: BASE, XGB, RF, ARF, NN, META
+            expert_order = [
+                ('BASE', 'base'),
+                ('XGB', 'xgb'),
+                ('RF', 'rf'),
+                ('ARF', 'arf'),
+                ('NN', 'nn'),
+                ('META', 'meta')
+            ]
+            for display_name, expert_key in expert_order:
+                if expert_key in win_rates:
+                    wr_data = win_rates[expert_key]
+                    wr = wr_data['win_rate']
+                    total = wr_data['total']
+                    if total > 0:
+                        text += f"\n  • {display_name}: {wr:.1%} ({total} сделок)"
+
+        text += f"\n\n⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
 
         self._send_message(text)
 

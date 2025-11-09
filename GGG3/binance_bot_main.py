@@ -67,7 +67,7 @@ from features.base_logic import BaseLogicMultiTF
 from features.target_calculator import calculate_atr, detect_market_phase
 
 # Models
-from models.experts import XGBoostExpert, RandomForestExpert, NeuralNetworkExpert
+from models.experts import XGBoostExpert, RandomForestExpert, AdaptiveRFExpert, NeuralNetworkExpert
 from meta_neural_cem import MetaNeuralCEM
 
 # Risk management
@@ -233,6 +233,21 @@ class BinanceTradingBot:
             'recent_hour_trades': 0
         }
 
+        # ════════════════════════════════════════════════════════════════════════
+        # EXPERT WIN RATE TRACKING
+        # ════════════════════════════════════════════════════════════════════════
+        # Отслеживание винрейтов по каждому эксперту и базовой логике
+        self.expert_stats = {
+            'base': {'wins': 0, 'losses': 0, 'total': 0},  # Базовая логика
+            'xgb': {'wins': 0, 'losses': 0, 'total': 0},   # XGBoost
+            'rf': {'wins': 0, 'losses': 0, 'total': 0},    # RandomForest
+            'arf': {'wins': 0, 'losses': 0, 'total': 0},   # AdaptiveRF
+            'nn': {'wins': 0, 'losses': 0, 'total': 0},    # NeuralNet
+            'meta': {'wins': 0, 'losses': 0, 'total': 0}   # META
+        }
+        # Восстанавливаем статистику из истории закрытых позиций
+        self._restore_expert_stats()
+
         # Track last trade time for adaptive threshold
         self.last_trade_time = None
 
@@ -341,9 +356,28 @@ class BinanceTradingBot:
         else:
             experts['rf'] = None
 
-        # ARF (fallback)
-        experts['arf'] = None
-        print(f"    ⚠ ARF (using fallback)")
+        # Adaptive Random Forest (онлайн обучение)
+        arf_path = config.MODELS_DIR / 'saved' / 'arf_expert.pkl'
+        if arf_path.exists():
+            try:
+                experts['arf'] = AdaptiveRFExpert.load(str(arf_path))
+                print(f"    ✓ AdaptiveRF (loaded)")
+            except Exception as e:
+                print(f"    ⚠ AdaptiveRF load failed: {e}, creating new")
+                try:
+                    experts['arf'] = AdaptiveRFExpert(n_models=10, random_state=42)
+                    print(f"    ✓ AdaptiveRF (new, will learn online)")
+                except Exception as e2:
+                    print(f"    ✗ AdaptiveRF init failed: {e2}")
+                    experts['arf'] = None
+        else:
+            # Создаем новый ARF для онлайн обучения
+            try:
+                experts['arf'] = AdaptiveRFExpert(n_models=10, random_state=42)
+                print(f"    ✓ AdaptiveRF (new, will learn online)")
+            except Exception as e:
+                print(f"    ✗ AdaptiveRF init failed: {e}")
+                experts['arf'] = None
 
         # Neural Network
         nn_path = config.MODELS_DIR / 'saved' / 'nn_expert.pkl'
@@ -380,6 +414,66 @@ class BinanceTradingBot:
 
         wins = sum(1 for p in closed if p.pnl > 0)
         return wins / len(closed)
+
+    def _restore_expert_stats(self):
+        """
+        Восстанавливает статистику экспертов из истории закрытых позиций
+
+        Анализирует predictions сохраненные в позициях и обновляет винрейты.
+        """
+        logger.info("[ExpertStats] Restoring expert statistics from closed positions...")
+
+        for pos in self.position_manager.closed_positions:
+            is_win = pos.pnl > 0
+
+            # Если в позиции сохранены predictions от экспертов
+            if hasattr(pos, 'ml_predictions') and pos.ml_predictions:
+                # Обновляем статистику каждого эксперта
+                for expert_name, pred in pos.ml_predictions.items():
+                    if expert_name in self.expert_stats:
+                        self.expert_stats[expert_name]['total'] += 1
+                        if is_win:
+                            self.expert_stats[expert_name]['wins'] += 1
+                        else:
+                            self.expert_stats[expert_name]['losses'] += 1
+
+            # Базовая логика (всегда есть)
+            self.expert_stats['base']['total'] += 1
+            if is_win:
+                self.expert_stats['base']['wins'] += 1
+            else:
+                self.expert_stats['base']['losses'] += 1
+
+            # META (если была активна)
+            if hasattr(pos, 'meta_prediction') and pos.meta_prediction is not None:
+                self.expert_stats['meta']['total'] += 1
+                if is_win:
+                    self.expert_stats['meta']['wins'] += 1
+                else:
+                    self.expert_stats['meta']['losses'] += 1
+
+        # Логируем восстановленную статистику
+        for expert_name, stats in self.expert_stats.items():
+            if stats['total'] > 0:
+                wr = stats['wins'] / stats['total'] * 100
+                logger.info(f"[ExpertStats] {expert_name.upper()}: {wr:.1f}% WR ({stats['wins']}/{stats['total']})")
+            else:
+                logger.info(f"[ExpertStats] {expert_name.upper()}: No data yet")
+
+    def _get_expert_win_rates(self) -> Dict[str, float]:
+        """
+        Получает текущие винрейты всех экспертов
+
+        Returns:
+            Dict с винрейтами: {'base': 0.53, 'xgb': 0.55, ...}
+        """
+        win_rates = {}
+        for expert_name, stats in self.expert_stats.items():
+            if stats['total'] > 0:
+                win_rates[expert_name] = stats['wins'] / stats['total']
+            else:
+                win_rates[expert_name] = 0.0  # Нет данных
+        return win_rates
 
     def _maybe_calibrate_base_weights(self):
         """
@@ -528,6 +622,15 @@ class BinanceTradingBot:
                         predictions['rf'] = float(p_rf)
                 except Exception as e:
                     logger.debug(f"{symbol}: RandomForest prediction failed: {e}")
+
+            # Adaptive Random Forest (онлайн обучение)
+            if self.experts.get('arf') is not None:
+                try:
+                    p_arf = self.experts['arf'].predict_proba(features.reshape(1, -1))[0]
+                    if np.isfinite(p_arf) and 0 <= p_arf <= 1:
+                        predictions['arf'] = float(p_arf)
+                except Exception as e:
+                    logger.debug(f"{symbol}: AdaptiveRF prediction failed: {e}")
 
             # Neural Network
             if self.experts.get('nn') is not None:
@@ -1212,6 +1315,33 @@ class BinanceTradingBot:
 
                 # Определяем фактический результат
                 y_up = 1 if position.pnl > 0 else 0
+                is_win = y_up == 1
+
+                # ✅ Обновляем статистику экспертов
+                # Обновляем для каждого эксперта, который делал предсказание
+                for expert_name in ['xgb', 'rf', 'arf', 'nn']:
+                    if expert_name in ml_preds and expert_name in self.expert_stats:
+                        self.expert_stats[expert_name]['total'] += 1
+                        if is_win:
+                            self.expert_stats[expert_name]['wins'] += 1
+                        else:
+                            self.expert_stats[expert_name]['losses'] += 1
+
+                # Обновляем статистику BASE логики
+                if 'base' in self.expert_stats:
+                    self.expert_stats['base']['total'] += 1
+                    if is_win:
+                        self.expert_stats['base']['wins'] += 1
+                    else:
+                        self.expert_stats['base']['losses'] += 1
+
+                # Обновляем статистику META
+                if 'meta' in self.expert_stats:
+                    self.expert_stats['meta']['total'] += 1
+                    if is_win:
+                        self.expert_stats['meta']['wins'] += 1
+                    else:
+                        self.expert_stats['meta']['losses'] += 1
 
                 # ✅ Формируем полный контекст из snapshot (реальные значения из t0)
                 context = snapshot.get('context', {})
@@ -1230,7 +1360,7 @@ class BinanceTradingBot:
                 self.meta.record_result(
                     p_xgb=ml_preds.get('xgb'),
                     p_rf=ml_preds.get('rf'),
-                    p_arf=None,  # У нас нет ARF
+                    p_arf=ml_preds.get('arf'),  # ✅ Включен ARF
                     p_nn=ml_preds.get('nn'),
                     p_base=snapshot.get('p_meta'),  # Предсказание базовой логики
                     y_up=y_up,
@@ -1282,6 +1412,9 @@ class BinanceTradingBot:
 
         # Send Telegram notification
         if config.TELEGRAM_ALERT_TYPES.get('position_closed', True):
+            # Получаем win rates экспертов
+            win_rates = self._get_expert_win_rates()
+
             position_data = {
                 'symbol': position.symbol,
                 'direction': position.direction,
@@ -1291,7 +1424,8 @@ class BinanceTradingBot:
                 'pnl': position.pnl,
                 'pnl_percent': position.pnl_pct,
                 'exit_reason': exit_reason,
-                'holding_time': f"{duration:.1f}h"
+                'holding_time': f"{duration:.1f}h",
+                'win_rates': win_rates  # ✅ Добавляем win rates экспертов
             }
             self.telegram.notify_position_closed(position_data)
 

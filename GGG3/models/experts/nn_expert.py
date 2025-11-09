@@ -34,54 +34,60 @@ except ImportError:
     print("WARNING: torch not installed. Install with: pip install torch")
 
 
-class BinaryClassifierNN(nn.Module):
-    """
-    Нейронная сеть для бинарной классификации
+if HAVE_TORCH:
+    class BinaryClassifierNN(nn.Module):
+        """
+        Нейронная сеть для бинарной классификации
 
-    Architecture: 68 -> 128 -> 64 -> 32 -> 1
-    """
+        Architecture: 68 -> 128 -> 64 -> 32 -> 1
+        """
 
-    def __init__(self, input_dim: int = 68, dropout: float = 0.2):
-        super(BinaryClassifierNN, self).__init__()
+        def __init__(self, input_dim: int = 68, dropout: float = 0.2):
+            super(BinaryClassifierNN, self).__init__()
 
-        self.fc1 = nn.Linear(input_dim, 128)
-        self.bn1 = nn.BatchNorm1d(128)
-        self.dropout1 = nn.Dropout(dropout)
+            self.fc1 = nn.Linear(input_dim, 128)
+            self.bn1 = nn.BatchNorm1d(128)
+            self.dropout1 = nn.Dropout(dropout)
 
-        self.fc2 = nn.Linear(128, 64)
-        self.bn2 = nn.BatchNorm1d(64)
-        self.dropout2 = nn.Dropout(dropout)
+            self.fc2 = nn.Linear(128, 64)
+            self.bn2 = nn.BatchNorm1d(64)
+            self.dropout2 = nn.Dropout(dropout)
 
-        self.fc3 = nn.Linear(64, 32)
-        self.bn3 = nn.BatchNorm1d(32)
-        self.dropout3 = nn.Dropout(dropout)
+            self.fc3 = nn.Linear(64, 32)
+            self.bn3 = nn.BatchNorm1d(32)
+            self.dropout3 = nn.Dropout(dropout)
 
-        self.fc4 = nn.Linear(32, 1)
+            self.fc4 = nn.Linear(32, 1)
 
-    def forward(self, x):
-        # Layer 1
-        x = self.fc1(x)
-        x = self.bn1(x)
-        x = torch.relu(x)
-        x = self.dropout1(x)
+        def forward(self, x):
+            # Layer 1
+            x = self.fc1(x)
+            x = self.bn1(x)
+            x = torch.relu(x)
+            x = self.dropout1(x)
 
-        # Layer 2
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = torch.relu(x)
-        x = self.dropout2(x)
+            # Layer 2
+            x = self.fc2(x)
+            x = self.bn2(x)
+            x = torch.relu(x)
+            x = self.dropout2(x)
 
-        # Layer 3
-        x = self.fc3(x)
-        x = self.bn3(x)
-        x = torch.relu(x)
-        x = self.dropout3(x)
+            # Layer 3
+            x = self.fc3(x)
+            x = self.bn3(x)
+            x = torch.relu(x)
+            x = self.dropout3(x)
 
-        # Output
-        x = self.fc4(x)
-        x = torch.sigmoid(x)
+            # Output
+            x = self.fc4(x)
+            x = torch.sigmoid(x)
 
-        return x
+            return x
+else:
+    # Dummy class when torch is not available
+    class BinaryClassifierNN:
+        def __init__(self, *args, **kwargs):
+            pass
 
 
 class NeuralNetworkExpert:
