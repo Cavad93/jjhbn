@@ -57,6 +57,94 @@ C_M, C_S, C_B, C_R = 2.5, 3.0, 2.0, 1.6
 
 
 # ============================================================================
+# PHASE DETECTION
+# ============================================================================
+
+# Market phase constants
+PHASE_TRENDING = 1
+PHASE_RANGING = 2
+
+# Phase detection parameters
+PHASE_ADX_PERIOD = 14
+PHASE_TREND_THRESHOLD = 25  # ADX > 25 = trending
+
+
+def detect_market_phase(df: pd.DataFrame) -> int:
+    """
+    Определяет фазу рынка: TRENDING (тренд) или RANGING (боковик)
+
+    Использует упрощённый ADX-подобный индикатор:
+    - Высокий trend strength = TRENDING
+    - Низкий trend strength = RANGING
+
+    Args:
+        df: DataFrame с OHLCV данными
+
+    Returns:
+        PHASE_TRENDING или PHASE_RANGING
+    """
+    if len(df) < PHASE_ADX_PERIOD + 5:
+        return PHASE_RANGING  # Default для малых данных
+
+    # Вычисляем True Range
+    tr = true_range(df)
+    atr = rma(tr, PHASE_ADX_PERIOD)
+
+    # Directional movement
+    high_diff = df['high'] - df['high'].shift(1)
+    low_diff = df['low'].shift(1) - df['low']
+
+    pos_dm = pd.Series(0.0, index=df.index)
+    neg_dm = pd.Series(0.0, index=df.index)
+
+    # +DM when high_diff > low_diff and > 0
+    pos_mask = (high_diff > low_diff) & (high_diff > 0)
+    pos_dm[pos_mask] = high_diff[pos_mask]
+
+    # -DM when low_diff > high_diff and > 0
+    neg_mask = (low_diff > high_diff) & (low_diff > 0)
+    neg_dm[neg_mask] = low_diff[neg_mask]
+
+    # Smoothed directional indicators
+    pos_di = 100 * rma(pos_dm, PHASE_ADX_PERIOD) / (atr + 1e-10)
+    neg_di = 100 * rma(neg_dm, PHASE_ADX_PERIOD) / (atr + 1e-10)
+
+    # DX = |+DI - -DI| / (+DI + -DI)
+    dx = 100 * (pos_di - neg_di).abs() / (pos_di + neg_di + 1e-10)
+
+    # ADX = smoothed DX
+    adx = rma(dx, PHASE_ADX_PERIOD)
+
+    # Классификация на основе последнего значения ADX
+    current_adx = adx.iloc[-1] if len(adx) > 0 else 0
+
+    if current_adx > PHASE_TREND_THRESHOLD:
+        return PHASE_TRENDING
+    else:
+        return PHASE_RANGING
+
+
+def get_phase_modulation(phase: int) -> np.ndarray:
+    """
+    Возвращает модуляционные множители для весов [M, S, B, R] в зависимости от фазы
+
+    Эти множители УМНОЖАЮТСЯ на калиброванные веса, а не заменяют их!
+
+    Args:
+        phase: PHASE_TRENDING или PHASE_RANGING
+
+    Returns:
+        Модуляционные множители [M, S, B, R]
+    """
+    if phase == PHASE_TRENDING:
+        # Тренд: усиливаем Momentum и Breakout, ослабляем Reversion
+        return np.array([1.3, 1.0, 1.2, 0.6], dtype=float)
+    else:  # PHASE_RANGING
+        # Боковик: усиливаем Reversion, ослабляем Momentum
+        return np.array([0.7, 1.0, 0.8, 1.4], dtype=float)
+
+
+# ============================================================================
 # ТЕХНИЧЕСКИЕ ИНДИКАТОРЫ
 # ============================================================================
 
@@ -122,6 +210,59 @@ def session_vwap(df: pd.DataFrame, src: pd.Series) -> pd.Series:
     return vwap
 
 
+def rolling_vwap(df: pd.DataFrame, src: pd.Series, period: int) -> pd.Series:
+    """
+    Rolling VWAP с фиксированным окном
+
+    Для высоких таймфреймов (4h) более подходит, чем session VWAP,
+    так как даёт постоянный lookback период вместо сброса каждый день
+
+    Args:
+        df: DataFrame с OHLCV
+        src: Цена для VWAP (обычно типичная цена)
+        period: Количество свечей для расчета (например, 24 свечи = 4 дня на 4h)
+
+    Returns:
+        Rolling VWAP Series
+    """
+    pv = (src * df["volume"]).rolling(window=period, min_periods=1).sum()
+    vv = df["volume"].rolling(window=period, min_periods=1).sum()
+    vwap = (pv / vv.replace(0.0, np.nan)).ffill()
+    return vwap
+
+
+def detect_timeframe(df: pd.DataFrame) -> str:
+    """
+    Определяет таймфрейм DataFrame по интервалу между свечами
+
+    Args:
+        df: DataFrame с DatetimeIndex
+
+    Returns:
+        Строка таймфрейма: '5m', '15m', '30m', '4h', etc.
+    """
+    if len(df) < 2:
+        return '5m'  # Default
+
+    # Вычисляем средний интервал между свечами
+    time_diffs = df.index[1:] - df.index[:-1]
+    avg_diff = pd.Timedelta(time_diffs.mean())
+
+    # Классифицируем
+    if avg_diff <= pd.Timedelta(minutes=5):
+        return '5m'
+    elif avg_diff <= pd.Timedelta(minutes=15):
+        return '15m'
+    elif avg_diff <= pd.Timedelta(minutes=30):
+        return '30m'
+    elif avg_diff <= pd.Timedelta(hours=1):
+        return '1h'
+    elif avg_diff <= pd.Timedelta(hours=4):
+        return '4h'
+    else:
+        return '1d'
+
+
 # ============================================================================
 # НОРМАЛИЗАЦИЯ И SOFTMAX
 # ============================================================================
@@ -177,6 +318,67 @@ def adaptive_temperature(volAmp: float, atr_norm: float) -> float:
         return 1.0  # дефолт
 
 
+def adaptive_kc_multiplier(atr_norm: float) -> float:
+    """
+    Адаптивный множитель для Keltner Channels на основе волатильности
+
+    Идея: В высокую волатильность расширяем каналы, чтобы избежать ложных пробоев
+    В низкую волатильность сужаем каналы для более чувствительного обнаружения пробоев
+
+    Args:
+        atr_norm: Нормализованный ATR (atr / atr_sma)
+
+    Returns:
+        KC_MULT: Множитель для Keltner Channels (default 2.0)
+    """
+    atr_norm = max(0.3, min(3.0, float(atr_norm)))
+
+    if atr_norm > 1.5:
+        # Высокая волатильность → расширяем каналы (2.5-3.0)
+        return 2.0 + (atr_norm - 1.5) * 1.0  # Linear scaling
+    elif atr_norm < 0.7:
+        # Низкая волатильность → сужаем каналы (1.5-2.0)
+        return 2.0 - (0.7 - atr_norm) * 0.8
+    else:
+        # Нормальная волатильность → дефолт
+        return 2.0
+
+
+def adaptive_bb_threshold(phase: int, atr_norm: float) -> float:
+    """
+    Адаптивный порог для Bollinger Bands mean reversion
+
+    Идея:
+    - В трендовой фазе: выше порог (меньше ложных реверсий)
+    - В боковике: ниже порог (больше возможностей для реверсии)
+    - Высокая волатильность: выше порог (избегаем шума)
+
+    Args:
+        phase: PHASE_TRENDING или PHASE_RANGING
+        atr_norm: Нормализованный ATR
+
+    Returns:
+        BB_Z: Порог для срабатывания реверсии (default 1.2)
+    """
+    atr_norm = max(0.3, min(3.0, float(atr_norm)))
+
+    # Базовый порог зависит от фазы
+    if phase == PHASE_TRENDING:
+        base_threshold = 1.5  # Выше в тренде
+    else:  # PHASE_RANGING
+        base_threshold = 1.0  # Ниже в боковике
+
+    # Корректируем на волатильность
+    if atr_norm > 1.5:
+        # Высокая волатильность → увеличиваем порог
+        return base_threshold + (atr_norm - 1.5) * 0.4
+    elif atr_norm < 0.7:
+        # Низкая волатильность → уменьшаем порог
+        return base_threshold - (0.7 - atr_norm) * 0.3
+    else:
+        return base_threshold
+
+
 # ============================================================================
 # РАСЧЕТ СИГНАЛОВ
 # ============================================================================
@@ -187,8 +389,8 @@ def features_from_binance(df: pd.DataFrame) -> Dict[str, pd.Series]:
 
     M (Momentum): Weighted momentum с тремя периодами
     S (VWAP Slope): Наклон VWAP
-    B (Breakout): Keltner Channels breakout
-    R (Reversion): Bollinger Bands mean reversion
+    B (Breakout): Keltner Channels breakout (ADAPTIVE KC_MULT)
+    R (Reversion): Bollinger Bands mean reversion (ADAPTIVE BB_Z)
 
     Args:
         df: DataFrame с колонками ['open', 'high', 'low', 'close', 'volume']
@@ -197,6 +399,11 @@ def features_from_binance(df: pd.DataFrame) -> Dict[str, pd.Series]:
     Returns:
         dict: Словарь с сигналами и доп. фичами
     """
+    # === PHASE & TIMEFRAME DETECTION ===
+    # Вычисляем заранее для адаптивных параметров
+    timeframe = detect_timeframe(df)
+    phase = detect_market_phase(df)
+
     # Range-based volatility normalization
     ln_hl = np.log(df["high"] / df["low"]).clip(lower=1e-12)
     sigP = np.sqrt((1.0 / (4.0 * np.log(2.0))) * (ln_hl ** 2))
@@ -215,9 +422,15 @@ def features_from_binance(df: pd.DataFrame) -> Dict[str, pd.Series]:
     sigRB = ema(sigRB, RB_LEN)
     normGain = 1.0 / np.maximum(sigRB.values, 1e-10)
 
-    # ATR
+    # ATR (нужен для adaptive параметров)
     atr_series = atr_wilder(df, ATR_LEN)
     atr_sma = sma(atr_series, ATR_SMOOTH)
+
+    # === ADAPTIVE PARAMETERS ===
+    # Вычисляем адаптивные параметры на основе текущей волатильности
+    atr_norm_last = float(atr_series.iloc[-1] / (atr_sma.iloc[-1] + 1e-12))
+    kc_mult_adaptive = adaptive_kc_multiplier(atr_norm_last)
+    bb_z_adaptive = adaptive_bb_threshold(phase, atr_norm_last)
 
     # === M (Momentum) ===
     r1 = np.log(df["close"] / df["close"].shift(M1)).fillna(0.0)
@@ -227,30 +440,35 @@ def features_from_binance(df: pd.DataFrame) -> Dict[str, pd.Series]:
     M_up = norm_feat(Mraw.values * normGain, 2.5, C_M, USE_LORENTZ)
     M_dn = norm_feat(-Mraw.values * normGain, 2.5, C_M, USE_LORENTZ)
 
-    # === S (VWAP Slope) ===
+    # === S (VWAP Slope) - ADAPTIVE ===
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    vwap = session_vwap(df, tp)
+    if timeframe == '4h':
+        # Rolling VWAP для 4h (24 свечи = 4 дня)
+        vwap = rolling_vwap(df, tp, period=24)
+    else:
+        # Session VWAP для более низких таймфреймов
+        vwap = session_vwap(df, tp)
     vslp = ((vwap - vwap.shift(VWAP_LOOK)) / vwap.replace(0.0, np.nan)).fillna(0.0)
     S_up = norm_feat(vslp.values * normGain, 3.0, C_S, USE_LORENTZ)
     S_dn = norm_feat(-vslp.values * normGain, 3.0, C_S, USE_LORENTZ)
 
-    # === B (Breakout - Keltner) ===
+    # === B (Breakout - Keltner) - ADAPTIVE KC_MULT ===
     basisKC = ema(df["close"], KC_LEN)
     rngKC = atr_wilder(df, KC_LEN)
-    upKC = basisKC + KC_MULT * rngKC
-    dnKC = basisKC - KC_MULT * rngKC
-    distUp = ((df["close"] - upKC) / (KC_MULT * rngKC.replace(0, np.nan))).replace([np.inf, -np.inf], 0.0).fillna(0.0)
-    distDn = ((dnKC - df["close"]) / (KC_MULT * rngKC.replace(0, np.nan))).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    upKC = basisKC + kc_mult_adaptive * rngKC
+    dnKC = basisKC - kc_mult_adaptive * rngKC
+    distUp = ((df["close"] - upKC) / (kc_mult_adaptive * rngKC.replace(0, np.nan))).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    distDn = ((dnKC - df["close"]) / (kc_mult_adaptive * rngKC.replace(0, np.nan))).replace([np.inf, -np.inf], 0.0).fillna(0.0)
     B_up = norm_feat(distUp.values, 2.0, C_B, USE_LORENTZ)
     B_dn = norm_feat(distDn.values, 2.0, C_B, USE_LORENTZ)
 
-    # === R (Reversion - Bollinger) ===
+    # === R (Reversion - Bollinger) - ADAPTIVE BB_Z ===
     bb_basis = sma(df["close"], BB_LEN)
     bb_dev = stdev(df["close"], BB_LEN).replace(0.0, np.nan)
     Zs = ((df["close"] - bb_basis) / bb_dev).replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
-    R_up = norm_feat(np.maximum(0.0, -Zs - BB_Z).values, 1.6, C_R, USE_LORENTZ)
-    R_dn = norm_feat(np.maximum(0.0,  Zs - BB_Z).values, 1.6, C_R, USE_LORENTZ)
+    R_up = norm_feat(np.maximum(0.0, -Zs - bb_z_adaptive).values, 1.6, C_R, USE_LORENTZ)
+    R_dn = norm_feat(np.maximum(0.0,  Zs - bb_z_adaptive).values, 1.6, C_R, USE_LORENTZ)
 
     # === Volume Amplitude ===
     vol_usd = df["volume"] * df["close"]
@@ -272,6 +490,8 @@ def features_from_binance(df: pd.DataFrame) -> Dict[str, pd.Series]:
         atr_sma=pd.Series(atr_sma, index=df.index),
         volAmp=pd.Series(volAmp, index=df.index),
         Zs=Zs,
+        phase=phase,  # Фаза рынка для phase-adaptive весов
+        timeframe=timeframe,  # Таймфрейм для отладки
     )
 
 
@@ -338,6 +558,21 @@ def prob_up_down_at_time(
         w_sum = np.sum(np.abs(w))
         if w_sum < 0.8 or w_sum > 1.5:
             w = w / (w_sum + 1e-12)
+
+    # === PHASE-ADAPTIVE WEIGHT MODULATION ===
+    # Применяем модуляцию весов в зависимости от фазы рынка
+    # Это НЕ заменяет калибровку, а дополняет её!
+    phase = feats.get('phase', PHASE_RANGING)  # Default to ranging if not present
+    phase_mod = get_phase_modulation(phase)
+
+    # Применяем модуляцию
+    w_modulated = w * phase_mod
+
+    # Ре-нормализуем (L1 norm = 1)
+    w_sum_mod = np.sum(np.abs(w_modulated))
+    if w_sum_mod > 1e-8:
+        w = w_modulated / w_sum_mod
+    # Если w_sum_mod слишком мал, оставляем w без изменений
 
     w_mom, w_vwp, w_brk, w_rev = w
 
