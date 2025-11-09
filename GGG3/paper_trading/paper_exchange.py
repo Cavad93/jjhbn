@@ -726,31 +726,27 @@ class PaperExchange:
 
     def get_equity(self) -> float:
         """
-        Рассчитывает полный капитал (баланс + нереализованный PnL)
+        Рассчитывает полный капитал (баланс + стоимость активов)
+
+        ВАЖНО: PaperExchange симулирует СПОТОВУЮ торговлю!
+        При покупке актива balance уменьшается, актив переходит в позицию.
+        Equity = свободный баланс + текущая стоимость всех активов.
 
         Returns:
             float: Общий капитал в USDT
         """
-        equity = self.balance
+        equity = self.balance  # Свободные деньги
 
-        # Добавляем нереализованный PnL открытых позиций
+        # Добавляем текущую стоимость всех открытых позиций
         for position in self.positions.values():
             try:
                 current_price = get_binance_price(position['symbol'])
 
-                # Рассчитываем нереализованный PnL
-                if position['side'] == 'LONG':
-                    unrealized_pnl = (current_price - position['entry_price']) * position['amount']
-                else:  # SHORT
-                    unrealized_pnl = (position['entry_price'] - current_price) * position['amount']
+                # СПОТ: Считаем текущую стоимость актива
+                # (для фьючерсов было бы unrealized_pnl, но у нас СПОТ!)
+                current_position_value = current_price * position['amount']
 
-                # Вычитаем комиссию на вход
-                for trade in reversed(self.trades_history):
-                    if trade['id'] == position['entry_order_id']:
-                        unrealized_pnl -= trade['commission']
-                        break
-
-                equity += unrealized_pnl
+                equity += current_position_value
 
             except Exception as e:
                 print(f"[PaperExchange] Warning: Failed to get equity for {position['id']}: {e}")
