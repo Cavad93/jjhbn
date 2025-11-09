@@ -28,6 +28,18 @@ import pickle
 import numpy as np
 import pandas as pd
 import signal
+import io
+import threading
+
+# ════════════════════════════════════════════════════════════════════════════════
+# ЗАЩИТА ОТ БЛОКИРУЮЩЕГО ВВОДА
+# ════════════════════════════════════════════════════════════════════════════════
+# Перенаправляем stdin на пустой поток, чтобы любые input() или блокирующие
+# чтения (в т.ч. в сторонних библиотеках) сразу получали EOF вместо зависания.
+# Это предотвращает ситуации, когда бот зависает в ожидании ввода от пользователя.
+# ════════════════════════════════════════════════════════════════════════════════
+sys.stdin = io.StringIO('')
+print("[STARTUP] stdin redirected to empty stream (protection against blocking input)", flush=True)
 
 # Добавляем путь к GGG3
 sys.path.insert(0, str(Path(__file__).parent))
@@ -224,12 +236,24 @@ class BinanceTradingBot:
         # Track last trade time for adaptive threshold
         self.last_trade_time = None
 
+        # ════════════════════════════════════════════════════════════════════════
+        # WATCHDOG: Защита от зависаний
+        # ════════════════════════════════════════════════════════════════════════
+        self._last_activity = time.time()
+        self._watchdog_enabled = True
+        self._watchdog_thread = threading.Thread(target=self._watchdog_monitor, daemon=True)
+        self._activity_lock = threading.Lock()
+
         print("\n✅ Bot initialized successfully\n")
         print("="*80)
 
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+
+        # Запускаем watchdog thread
+        self._watchdog_thread.start()
+        print("[WATCHDOG] Started (timeout: 600s)", flush=True)
 
         # Send bot started notification
         if config.TELEGRAM_ALERT_TYPES.get('bot_started', True):
@@ -238,6 +262,56 @@ class BinanceTradingBot:
                 initial_capital=config.PAPER_INITIAL_BALANCE if self.paper_mode else 0.0,
                 max_positions=config.MAX_POSITIONS
             )
+
+    def _update_activity(self):
+        """Обновляет timestamp последней активности для watchdog"""
+        with self._activity_lock:
+            self._last_activity = time.time()
+
+    def _watchdog_monitor(self):
+        """
+        Watchdog thread для мониторинга зависаний
+
+        Если бот не проявляет активность более 10 минут (600 сек),
+        выводит предупреждение и может предпринять действия.
+        """
+        TIMEOUT_SECONDS = 600  # 10 минут
+        CHECK_INTERVAL = 30    # Проверка каждые 30 секунд
+
+        logger.info("[WATCHDOG] Monitoring thread started")
+
+        while self._watchdog_enabled:
+            try:
+                time.sleep(CHECK_INTERVAL)
+
+                with self._activity_lock:
+                    idle_time = time.time() - self._last_activity
+
+                if idle_time > TIMEOUT_SECONDS:
+                    # Бот завис!
+                    logger.error(f"[WATCHDOG] ⚠️ BOT APPEARS FROZEN! No activity for {idle_time:.0f}s")
+                    print(f"\n{'='*80}", flush=True)
+                    print(f"[WATCHDOG] ⚠️ WARNING: Bot appears frozen!", flush=True)
+                    print(f"[WATCHDOG] No activity detected for {idle_time:.0f} seconds", flush=True)
+                    print(f"[WATCHDOG] Last activity: {datetime.fromtimestamp(self._last_activity)}", flush=True)
+                    print(f"{'='*80}\n", flush=True)
+
+                    # Обновляем активность чтобы не спамить
+                    self._update_activity()
+
+                    # Можно добавить более агрессивные действия:
+                    # - Отправка Telegram уведомления
+                    # - Принудительный перезапуск операции
+                    # - Завершение с ошибкой
+
+                elif idle_time > 300:  # 5 минут
+                    # Предупреждение о долгой операции
+                    logger.warning(f"[WATCHDOG] Long-running operation: {idle_time:.0f}s since last activity")
+
+            except Exception as e:
+                logger.error(f"[WATCHDOG] Error in watchdog thread: {e}")
+
+        logger.info("[WATCHDOG] Monitoring thread stopped")
 
     def _load_experts(self) -> Dict:
         """Загружает ML экспертов"""
@@ -539,6 +613,8 @@ class BinanceTradingBot:
         3. Закрываем позиции не в топ-10
         4. Открываем новые позиции
         """
+        # Обновляем активность в начале ребалансировки
+        self._update_activity()
 
         # Защитные режимы
         is_black_swan = self.black_swan.check_black_swan_event()
@@ -628,11 +704,15 @@ class BinanceTradingBot:
             print(f"    {marker} {i:2d}. {opp['symbol']:<12} {opp['direction']:<6} "
                   f"p_up={opp['p_up']:.3f}  EV={opp['ev']:.4f}", flush=True)
 
+        # Обновляем активность после скрининга
+        self._update_activity()
+
         # ═══════════════════════════════════════════════════════════════════════
         # HAIKU 4.5: Фундаментальный анализ TOP-20 для формирования финального TOP-10
         # ═══════════════════════════════════════════════════════════════════════
         if self.haiku_analyzer is not None:
             print(f"\n🤖 Running Haiku 4.5 fundamental analysis on TOP-20...", flush=True)
+            self._update_activity()  # Перед запуском Haiku
             try:
                 # Анализ и переранжирование с учётом фундаментальных факторов
                 top_10_enriched = analyze_and_rank_top20(
@@ -658,15 +738,20 @@ class BinanceTradingBot:
                 # Используем обогащённый список для открытия позиций
                 top_10_for_opening = top_10_enriched
 
+                # Обновляем активность после Haiku
+                self._update_activity()
+
             except Exception as e:
                 logger.error(f"Haiku analysis failed: {e}")
                 print(f"  ⚠️  Haiku analysis failed: {e}")
                 print(f"  Fallback: using technical analysis only")
                 # Fallback: используем первые 10 из TOP-20
                 top_10_for_opening = top_20_opportunities[:10]
+                self._update_activity()
         else:
             # Haiku отключён - используем первые 10 из TOP-20
             top_10_for_opening = top_20_opportunities[:10]
+            self._update_activity()
 
         print(f"\n  Checking if existing positions should be closed (using top-20)...", flush=True)
 
