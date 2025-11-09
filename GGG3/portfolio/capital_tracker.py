@@ -150,7 +150,16 @@ class CapitalTracker:
                 min_diff = diff
                 closest_snapshot = snapshot
 
-        return closest_snapshot
+        # КРИТИЧНО: Проверяем что snapshot НЕ слишком далеко от нужного времени
+        # Если разница больше 25% от запрошенного периода - возвращаем None
+        max_allowed_diff = hours_ago * 3600 * 0.25  # 25% от периода
+
+        if closest_snapshot and min_diff <= max_allowed_diff:
+            return closest_snapshot
+        else:
+            # Snapshot слишком далеко - считаем что данных нет
+            logger.debug(f"Snapshot for {hours_ago}h ago not found (closest is {min_diff/3600:.1f}h away)")
+            return None
 
     def get_change_over_period(
         self,

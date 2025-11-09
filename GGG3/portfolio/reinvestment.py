@@ -81,6 +81,7 @@ class ReinvestmentManager:
         # Состояние
         self.reserve_fund = 0.0
         self.last_reinvest_date = datetime.now().date()
+        self.previous_day_equity = self.initial_capital  # Капитал в начале предыдущего дня
         self.total_profit_accumulated = 0.0
         self.total_to_reserve_accumulated = 0.0
         self.daily_history = []  # История дневных результатов
@@ -128,8 +129,8 @@ class ReinvestmentManager:
             # Новый день - делаем расчёт
 
             # Рассчитываем дневную прибыль/убыток
-            # Для упрощения считаем как отклонение от initial_capital
-            daily_pnl = current_equity - self.initial_capital
+            # ИСПРАВЛЕНО: считаем от капитала в начале ПРЕДЫДУЩЕГО дня, а не от initial_capital
+            daily_pnl = current_equity - self.previous_day_equity
 
             if daily_pnl > 0:
                 # ПРИБЫЛЬНЫЙ ДЕНЬ: процент прибыли → резерв
@@ -162,6 +163,7 @@ class ReinvestmentManager:
                 )
 
                 self.last_reinvest_date = today
+                self.previous_day_equity = trading_capital + self.reserve_fund  # Обновляем для следующего дня
                 self._save_state()
 
                 return {
@@ -203,6 +205,7 @@ class ReinvestmentManager:
                 )
 
                 self.last_reinvest_date = today
+                self.previous_day_equity = trading_capital + self.reserve_fund  # Обновляем для следующего дня
                 self._save_state()
 
                 return {
@@ -218,6 +221,7 @@ class ReinvestmentManager:
             else:
                 # БЕЗ ИЗМЕНЕНИЙ (daily_pnl == 0)
                 self.last_reinvest_date = today
+                self.previous_day_equity = current_equity + self.reserve_fund  # Обновляем для следующего дня
                 self._save_state()
 
                 return {
@@ -324,6 +328,7 @@ class ReinvestmentManager:
                 'initial_capital': self.initial_capital,
                 'reserve_fund': self.reserve_fund,
                 'last_reinvest_date': str(self.last_reinvest_date),
+                'previous_day_equity': self.previous_day_equity,
                 'total_profit_accumulated': self.total_profit_accumulated,
                 'total_to_reserve_accumulated': self.total_to_reserve_accumulated,
                 'daily_history': self.daily_history[-30:]  # Сохраняем последние 30 дней
@@ -352,6 +357,7 @@ class ReinvestmentManager:
                 self.last_reinvest_date = datetime.fromisoformat(
                     state.get('last_reinvest_date', str(datetime.now().date()))
                 ).date()
+                self.previous_day_equity = state.get('previous_day_equity', self.initial_capital)
                 self.total_profit_accumulated = state.get('total_profit_accumulated', 0.0)
                 self.total_to_reserve_accumulated = state.get('total_to_reserve_accumulated', 0.0)
                 self.daily_history = state.get('daily_history', [])
