@@ -26,9 +26,11 @@ import os
 import time
 import json
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
+from threading import Lock
 import hashlib
 
 # RSS парсинг
@@ -53,6 +55,152 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# КОНСТАНТЫ (вместо магических чисел)
+# ============================================================================
+
+class HaikuConfig:
+    """Конфигурационные константы для Haiku анализатора"""
+
+    # Кэширование
+    CACHE_BLOCK_HOURS = 4  # Блоки кэширования для волатильных монет
+    STABLE_CACHE_HOURS = 12  # Кэш для стабильных монет (BTC, ETH, BNB)
+    VOLATILE_CACHE_HOURS = 4  # Кэш для волатильных монет
+    NEWS_CACHE_TTL_SECONDS = 1800  # 30 минут
+
+    # Новости
+    MAX_NEWS_ITEMS = 10  # Максимум новостей на монету
+    NEWS_LOOKBACK_HOURS = 24  # Период поиска новостей
+    MAX_NEWS_TITLE_LENGTH = 80  # Максимальная длина заголовка в промпте
+    MAX_NEWS_IN_PROMPT = 5  # Максимум новостей в промпте
+    MAX_NEWS_SUMMARY_LENGTH = 200  # Максимальная длина summary
+
+    # Промпты
+    MAX_PROMPT_LENGTH = 10000  # Максимальная длина промпта (символы)
+    MAX_NEWS_TEXT_LENGTH = 300  # Максимальная длина текста новостей на монету
+    BATCH_SIZE_DEFAULT = 5  # Количество монет в batch
+
+    # API
+    API_TIMEOUT_SECONDS = 60
+    API_MAX_TOKENS = 2048
+    API_TEMPERATURE = 0.0  # Детерминированный вывод
+
+    # Rate Limiting (Anthropic tier 1 limits)
+    RATE_LIMIT_MAX_CALLS = 50  # Максимум запросов
+    RATE_LIMIT_PERIOD_SECONDS = 60  # За период
+
+    # Стоимость
+    ESTIMATED_COST_PER_BATCH = 0.0135  # $0.0135 за batch из 5 монет
+
+    # Скоринг
+    SCORE_THRESHOLD_REJECT = 0.4  # Ниже этого - отклонение
+    SCORE_THRESHOLD_APPROVE = 0.6  # Выше этого - одобрение
+    MIN_P_UP_FOR_ANALYSIS = 0.35  # Минимальный p_up для анализа
+
+    # Стабильные монеты (более длинный кэш)
+    STABLE_COINS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT']
+
+    # Алиасы монет для улучшенного поиска новостей
+    COIN_ALIASES = {
+        'BTC': ['bitcoin', 'btc'],
+        'ETH': ['ethereum', 'eth', 'ether'],
+        'BNB': ['binance coin', 'bnb'],
+        'ADA': ['cardano', 'ada'],
+        'SOL': ['solana', 'sol'],
+        'DOT': ['polkadot', 'dot'],
+        'DOGE': ['dogecoin', 'doge'],
+        'MATIC': ['polygon', 'matic'],
+        'AVAX': ['avalanche', 'avax'],
+        'UNI': ['uniswap', 'uni'],
+        'LINK': ['chainlink', 'link'],
+        'XRP': ['ripple', 'xrp'],
+        'LTC': ['litecoin', 'ltc'],
+        'ATOM': ['cosmos', 'atom'],
+        'XLM': ['stellar', 'xlm'],
+        'ALGO': ['algorand', 'algo'],
+        'NEAR': ['near protocol', 'near'],
+        'APT': ['aptos', 'apt'],
+        'ARB': ['arbitrum', 'arb'],
+        'OP': ['optimism', 'op'],
+    }
+
+
+# ============================================================================
+# RATE LIMITER
+# ============================================================================
+
+class RateLimiter:
+    """
+    Ограничитель частоты запросов к API
+
+    Защита от превышения лимитов Anthropic API:
+    - Tier 1: 50 requests/minute
+    - Tier 2: 1000 requests/minute
+    """
+
+    def __init__(
+        self,
+        max_calls: int = HaikuConfig.RATE_LIMIT_MAX_CALLS,
+        period: float = HaikuConfig.RATE_LIMIT_PERIOD_SECONDS
+    ):
+        """
+        Args:
+            max_calls: Максимум вызовов за период
+            period: Период в секундах
+        """
+        self.max_calls = max_calls
+        self.period = period
+        self.calls: List[float] = []
+        self.lock = Lock()
+
+        logger.info(f"[RateLimiter] Initialized: {max_calls} calls per {period}s")
+
+    def wait_if_needed(self):
+        """
+        Блокирует выполнение если превышен лимит
+
+        Автоматически ждёт до освобождения слота
+        """
+        with self.lock:
+            now = time.time()
+
+            # Удаляем старые вызовы за пределами окна
+            self.calls = [call_time for call_time in self.calls if now - call_time < self.period]
+
+            # Если достигнут лимит - ждём
+            if len(self.calls) >= self.max_calls:
+                # Вычисляем время ожидания до освобождения самого старого слота
+                oldest_call = self.calls[0]
+                wait_time = self.period - (now - oldest_call) + 0.1  # +0.1s буфер
+
+                if wait_time > 0:
+                    logger.warning(
+                        f"[RateLimiter] Rate limit reached ({len(self.calls)}/{self.max_calls}). "
+                        f"Waiting {wait_time:.1f}s..."
+                    )
+                    time.sleep(wait_time)
+                    now = time.time()
+                    # Обновляем список после ожидания
+                    self.calls = [call_time for call_time in self.calls if now - call_time < self.period]
+
+            # Регистрируем текущий вызов
+            self.calls.append(now)
+            logger.debug(f"[RateLimiter] Calls in window: {len(self.calls)}/{self.max_calls}")
+
+    def get_stats(self) -> dict:
+        """Получить статистику использования"""
+        with self.lock:
+            now = time.time()
+            active_calls = [c for c in self.calls if now - c < self.period]
+
+            return {
+                'calls_in_window': len(active_calls),
+                'max_calls': self.max_calls,
+                'utilization_pct': (len(active_calls) / self.max_calls) * 100 if self.max_calls > 0 else 0,
+                'period_seconds': self.period
+            }
+
+
+# ============================================================================
 # 1. RSS NEWS PARSER (Бесплатные источники)
 # ============================================================================
 
@@ -65,6 +213,11 @@ class NewsCollector:
     - CoinTelegraph RSS
     - Binance News
     - Reddit r/cryptocurrency (через RSS)
+
+    Улучшения:
+    - Regex поиск с word boundaries (избегает ложных срабатываний)
+    - Поддержка алиасов монет (Bitcoin = BTC)
+    - Расширенное логирование
     """
 
     RSS_FEEDS = {
@@ -74,17 +227,22 @@ class NewsCollector:
         'reddit_crypto': 'https://www.reddit.com/r/cryptocurrency/.rss',
     }
 
-    def __init__(self, cache_ttl: int = 1800):
+    def __init__(self, cache_ttl: int = HaikuConfig.NEWS_CACHE_TTL_SECONDS):
         """
         Args:
-            cache_ttl: Время жизни кэша новостей (секунды), по умолчанию 30 минут
+            cache_ttl: Время жизни кэша новостей (секунды)
         """
         self.cache_ttl = cache_ttl
         self._news_cache: Dict[str, Tuple[float, List[dict]]] = {}
 
-    def get_recent_news(self, symbol: str, hours: int = 24) -> List[dict]:
+        logger.debug(f"[NewsCollector] Initialized with cache_ttl={cache_ttl}s")
+
+    def get_recent_news(self, symbol: str, hours: int = HaikuConfig.NEWS_LOOKBACK_HOURS) -> List[dict]:
         """
         Получить новости по монете за последние N часов
+
+        Использует regex с word boundaries для точного поиска
+        и поддерживает алиасы монет (Bitcoin = BTC)
 
         Args:
             symbol: Символ монеты (например, 'BTCUSDT')
@@ -101,8 +259,24 @@ class NewsCollector:
         if cache_key in self._news_cache:
             cached_time, cached_news = self._news_cache[cache_key]
             if time.time() - cached_time < self.cache_ttl:
-                logger.debug(f"[NewsCollector] Using cached news for {coin_name}")
+                logger.debug(f"[NewsCollector] Cache HIT for {coin_name} ({len(cached_news)} items)")
                 return cached_news
+
+        logger.debug(f"[NewsCollector] Cache MISS for {coin_name}, fetching from RSS feeds...")
+
+        # Получаем все алиасы монеты
+        search_terms = HaikuConfig.COIN_ALIASES.get(coin_name, [coin_name.lower()])
+        if coin_name.lower() not in search_terms:
+            search_terms.append(coin_name.lower())
+
+        # Компилируем regex паттерны с word boundaries для каждого алиаса
+        patterns = []
+        for term in search_terms:
+            # \b гарантирует, что "ADA" не совпадёт с "Canada"
+            pattern = r'\b' + re.escape(term) + r'\b'
+            patterns.append(re.compile(pattern, re.IGNORECASE))
+
+        logger.debug(f"[NewsCollector] Search terms for {coin_name}: {search_terms}")
 
         # Собираем новости из всех источников
         all_news = []
@@ -114,14 +288,23 @@ class NewsCollector:
 
         for source_name, feed_url in self.RSS_FEEDS.items():
             try:
+                logger.debug(f"[NewsCollector] Parsing {source_name}...")
                 feed = feedparser.parse(feed_url)
 
                 for entry in feed.entries[:50]:  # Берём последние 50 записей
-                    # Проверяем наличие упоминания монеты
-                    title = entry.get('title', '').lower()
-                    summary = entry.get('summary', '').lower()
+                    # Проверяем наличие упоминания монеты через regex
+                    title = entry.get('title', '')
+                    summary = entry.get('summary', '')
+                    combined_text = title + ' ' + summary
 
-                    if coin_name.lower() not in title and coin_name.lower() not in summary:
+                    # Проверяем по всем алиасам
+                    match_found = False
+                    for pattern in patterns:
+                        if pattern.search(combined_text):
+                            match_found = True
+                            break
+
+                    if not match_found:
                         continue
 
                     # Парсим дату публикации
@@ -136,7 +319,7 @@ class NewsCollector:
                         'link': entry.get('link', ''),
                         'published': entry.get('published', ''),
                         'source': source_name,
-                        'summary': entry.get('summary', '')[:200]  # Первые 200 символов
+                        'summary': entry.get('summary', '')[:HaikuConfig.MAX_NEWS_SUMMARY_LENGTH]
                     })
 
             except Exception as e:
@@ -146,16 +329,16 @@ class NewsCollector:
         # Сортируем по дате (новые первыми)
         all_news.sort(key=lambda x: x['published'], reverse=True)
 
-        # Ограничиваем до 10 самых свежих
-        all_news = all_news[:10]
+        # Ограничиваем до максимума
+        all_news = all_news[:HaikuConfig.MAX_NEWS_ITEMS]
 
         # Кэшируем результат
         self._news_cache[cache_key] = (time.time(), all_news)
 
-        logger.info(f"[NewsCollector] Found {len(all_news)} news for {coin_name}")
+        logger.info(f"[NewsCollector] Found {len(all_news)} news for {coin_name} from {len(self.RSS_FEEDS)} sources")
         return all_news
 
-    def get_condensed_news_text(self, symbol: str, hours: int = 24) -> str:
+    def get_condensed_news_text(self, symbol: str, hours: int = HaikuConfig.NEWS_LOOKBACK_HOURS) -> str:
         """
         Получить сжатый текст новостей для промпта
 
@@ -164,20 +347,35 @@ class NewsCollector:
             hours: Количество часов назад
 
         Returns:
-            Компактный текст новостей (максимум 500 символов)
+            Компактный текст новостей (ограничен по длине для промпта)
         """
         news = self.get_recent_news(symbol, hours)
 
         if not news:
+            logger.debug(f"[NewsCollector] No news for {symbol}")
             return "No recent news found."
 
         # Формируем компактный текст
         lines = []
-        for i, item in enumerate(news[:5], 1):  # Максимум 5 новостей
-            line = f"{i}. {item['title'][:80]}"  # Обрезаем до 80 символов
-            lines.append(line)
+        total_length = 0
+        max_total_length = HaikuConfig.MAX_NEWS_TEXT_LENGTH
 
-        return "\n".join(lines)
+        for i, item in enumerate(news[:HaikuConfig.MAX_NEWS_IN_PROMPT], 1):
+            # Обрезаем заголовок до максимальной длины
+            title = item['title'][:HaikuConfig.MAX_NEWS_TITLE_LENGTH]
+            line = f"{i}. {title}"
+
+            # Проверяем, не превысим ли мы лимит
+            if total_length + len(line) + 1 > max_total_length:
+                break
+
+            lines.append(line)
+            total_length += len(line) + 1  # +1 для \n
+
+        result = "\n".join(lines)
+        logger.debug(f"[NewsCollector] Condensed {len(news)} news into {len(result)} chars for {symbol}")
+
+        return result
 
 
 # ============================================================================
@@ -222,9 +420,10 @@ Output: JSON only, no explanations."""
         api_key: Optional[str] = None,
         model: str = "claude-haiku-4-5-20251001",
         cache_dir: str = "./data/haiku_cache",
-        batch_size: int = 5,
-        timeout: int = 60,
-        enable_stats: bool = True
+        batch_size: int = HaikuConfig.BATCH_SIZE_DEFAULT,
+        timeout: int = HaikuConfig.API_TIMEOUT_SECONDS,
+        enable_stats: bool = True,
+        enable_rate_limiting: bool = True
     ):
         """
         Args:
@@ -234,6 +433,7 @@ Output: JSON only, no explanations."""
             batch_size: Количество монет в одном запросе (рекомендуется 5)
             timeout: Таймаут на запрос (секунды)
             enable_stats: Вести статистику эффективности
+            enable_rate_limiting: Включить защиту от превышения лимитов API
         """
         # API клиент
         if Anthropic is None:
@@ -247,6 +447,10 @@ Output: JSON only, no explanations."""
         self.model = model
         self.batch_size = batch_size
         self.timeout = timeout
+
+        # Rate limiting
+        self.rate_limiter = RateLimiter() if enable_rate_limiting else None
+        logger.info(f"[HaikuAnalyzer] Rate limiting: {'ENABLED' if enable_rate_limiting else 'DISABLED'}")
 
         # Кэширование
         self.cache_dir = Path(cache_dir)
@@ -298,10 +502,18 @@ Output: JSON only, no explanations."""
             logger.warning(f"[HaikuAnalyzer] Failed to save stats: {e}")
 
     def _get_cache_key(self, symbol: str) -> str:
-        """Генерация ключа для кэша"""
-        # Используем хэш от символа и текущего 4-часового блока
-        block_4h = int(time.time() / (4 * 3600))
-        return hashlib.md5(f"{symbol}_{block_4h}".encode()).hexdigest()
+        """
+        Генерация ключа для кэша
+
+        Использует временные блоки для автоматической инвалидации кэша
+        """
+        # Используем хэш от символа и текущего блока
+        block_hours = HaikuConfig.CACHE_BLOCK_HOURS
+        current_block = int(time.time() / (block_hours * 3600))
+        cache_key = hashlib.md5(f"{symbol}_{current_block}".encode()).hexdigest()
+
+        logger.debug(f"[HaikuAnalyzer] Cache key for {symbol}: {cache_key} (block {current_block})")
+        return cache_key
 
     def _get_cached_result(self, symbol: str) -> Optional[dict]:
         """
@@ -309,12 +521,13 @@ Output: JSON only, no explanations."""
 
         Логика кэширования:
         - Стабильные монеты (BTC, ETH, BNB): 12 часов
-        - Волатильные: 4 часа (по условию задачи)
+        - Волатильные: 4 часа
         """
         cache_key = self._get_cache_key(symbol)
         cache_file = self.cache_dir / f"{cache_key}.json"
 
         if not cache_file.exists():
+            logger.debug(f"[HaikuAnalyzer] Cache MISS for {symbol}: file not found")
             return None
 
         try:
@@ -325,16 +538,17 @@ Output: JSON only, no explanations."""
             cached_time = cached.get('timestamp', 0)
             age_hours = (time.time() - cached_time) / 3600
 
-            # Стабильные монеты - кэш на 12 часов
-            stable_coins = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT']
-            max_age = 12 if symbol in stable_coins else 4
+            # Стабильные монеты - более длинный кэш
+            max_age = (HaikuConfig.STABLE_CACHE_HOURS
+                      if symbol in HaikuConfig.STABLE_COINS
+                      else HaikuConfig.VOLATILE_CACHE_HOURS)
 
             if age_hours > max_age:
-                logger.debug(f"[HaikuAnalyzer] Cache expired for {symbol} (age={age_hours:.1f}h)")
+                logger.debug(f"[HaikuAnalyzer] Cache EXPIRED for {symbol} (age={age_hours:.1f}h > {max_age}h)")
                 return None
 
             self.stats['cache_hits'] += 1
-            logger.info(f"[HaikuAnalyzer] Cache HIT for {symbol} (age={age_hours:.1f}h)")
+            logger.info(f"[HaikuAnalyzer] Cache HIT for {symbol} (age={age_hours:.1f}h, max={max_age}h)")
             return cached['result']
 
         except Exception as e:
@@ -361,14 +575,21 @@ Output: JSON only, no explanations."""
         Проверка: нужно ли анализировать монету?
 
         Пропускаем если:
-        - p_up слишком низкий (< 0.35) - заведомо плохая сделка
+        - p_up слишком низкий (< MIN_P_UP_FOR_ANALYSIS) - заведомо плохая сделка
         - Монета стабильная и была недавно проанализирована
         """
+        symbol = opportunity.get('symbol', 'UNKNOWN')
+        p_up = opportunity.get('p_up', 0.5)
+
         # Пропускаем очень слабые сигналы
-        if opportunity.get('p_up', 0.5) < 0.35:
-            logger.debug(f"[HaikuAnalyzer] Skipping {opportunity['symbol']}: p_up too low")
+        if p_up < HaikuConfig.MIN_P_UP_FOR_ANALYSIS:
+            logger.info(
+                f"[HaikuAnalyzer] SKIP {symbol}: p_up={p_up:.3f} < "
+                f"threshold {HaikuConfig.MIN_P_UP_FOR_ANALYSIS}"
+            )
             return True
 
+        logger.debug(f"[HaikuAnalyzer] Will analyze {symbol}: p_up={p_up:.3f}")
         return False
 
     def analyze_batch(self, opportunities: List[dict]) -> List[dict]:
@@ -385,7 +606,10 @@ Output: JSON only, no explanations."""
             - haiku_reason: str (краткое объяснение)
         """
         if not opportunities:
+            logger.debug("[HaikuAnalyzer] No opportunities to analyze")
             return []
+
+        logger.info(f"[HaikuAnalyzer] ══════ Starting batch analysis of {len(opportunities)} coins ══════")
 
         # Фильтруем уже закэшированные
         to_analyze = []
@@ -416,13 +640,19 @@ Output: JSON only, no explanations."""
 
         # Если все в кэше - возвращаем
         if not to_analyze:
-            logger.info(f"[HaikuAnalyzer] All {len(opportunities)} coins from cache")
+            logger.info(f"[HaikuAnalyzer] All {len(opportunities)} coins served from cache ✓")
             return results
+
+        logger.info(f"[HaikuAnalyzer] Need fresh analysis for {len(to_analyze)} coins")
 
         # Разбиваем на batch по N монет
         batches = [to_analyze[i:i+self.batch_size] for i in range(0, len(to_analyze), self.batch_size)]
+        logger.info(f"[HaikuAnalyzer] Split into {len(batches)} batches (batch_size={self.batch_size})")
 
-        for batch in batches:
+        for batch_idx, batch in enumerate(batches, 1):
+            batch_symbols = [o['symbol'] for o in batch]
+            logger.info(f"[HaikuAnalyzer] Processing batch {batch_idx}/{len(batches)}: {batch_symbols}")
+
             try:
                 batch_results = self._analyze_batch_api(batch)
 
@@ -432,11 +662,16 @@ Output: JSON only, no explanations."""
                         opp.update(batch_results[i])
                         self._save_to_cache(opp['symbol'], batch_results[i])
                         results.append(opp)
+                        logger.debug(
+                            f"  ✓ {opp['symbol']}: score={batch_results[i].get('haiku_score', 0):.2f}, "
+                            f"critical={batch_results[i].get('haiku_critical', False)}"
+                        )
 
                 self.stats['cache_misses'] += len(batch)
+                logger.info(f"[HaikuAnalyzer] Batch {batch_idx}/{len(batches)} completed successfully ✓")
 
             except Exception as e:
-                logger.error(f"[HaikuAnalyzer] Batch API failed: {e}")
+                logger.error(f"[HaikuAnalyzer] Batch {batch_idx}/{len(batches)} FAILED: {e}")
                 self.stats['api_errors'] += 1
 
                 # Fallback: используем технический скор
@@ -446,8 +681,10 @@ Output: JSON only, no explanations."""
                     opp['haiku_reason'] = f"api_error: {str(e)[:50]}"
                     results.append(opp)
                     self.stats['fallback_used'] += 1
+                    logger.warning(f"  ⚠ {opp['symbol']}: Using fallback (tech score only)")
 
         self._save_stats()
+        logger.info(f"[HaikuAnalyzer] ══════ Batch analysis complete: {len(results)} results ══════")
         return results
 
     def _analyze_batch_api(self, batch: List[dict]) -> List[dict]:
@@ -460,11 +697,23 @@ Output: JSON only, no explanations."""
         Returns:
             Список результатов анализа
         """
+        # ════════════════════════════════════════════════════════════════
+        # RATE LIMITING: Проверяем и ждём если превышен лимит
+        # ════════════════════════════════════════════════════════════════
+        if self.rate_limiter:
+            logger.debug("[HaikuAnalyzer] Checking rate limits...")
+            self.rate_limiter.wait_if_needed()
+
         # Собираем новости для каждой монеты
         coins_data = []
+        logger.debug(f"[HaikuAnalyzer] Collecting news for {len(batch)} coins...")
+
         for opp in batch:
             symbol = opp['symbol']
-            news_text = self.news_collector.get_condensed_news_text(symbol, hours=24)
+            news_text = self.news_collector.get_condensed_news_text(
+                symbol,
+                hours=HaikuConfig.NEWS_LOOKBACK_HOURS
+            )
 
             coins_data.append({
                 'symbol': symbol,
@@ -476,16 +725,17 @@ Output: JSON only, no explanations."""
 
         # Формируем компактный промпт
         prompt = self._build_batch_prompt(coins_data)
+        prompt_length = len(prompt)
 
         # API запрос с prompt caching
-        logger.info(f"[HaikuAnalyzer] Sending batch request for {len(batch)} coins")
+        logger.info(f"[HaikuAnalyzer] Sending API request: {len(batch)} coins, prompt={prompt_length} chars")
         start_time = time.time()
 
         try:
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=2048,
-                temperature=0.0,  # Детерминированный вывод
+                max_tokens=HaikuConfig.API_MAX_TOKENS,
+                temperature=HaikuConfig.API_TEMPERATURE,
                 system=[
                     {
                         "type": "text",
@@ -499,48 +749,80 @@ Output: JSON only, no explanations."""
             )
 
             elapsed = time.time() - start_time
-            logger.info(f"[HaikuAnalyzer] API response received in {elapsed:.2f}s")
+            logger.info(f"[HaikuAnalyzer] ✓ API response received in {elapsed:.2f}s")
 
             # Обновляем статистику
             self.stats['total_requests'] += 1
             self.stats['total_coins_analyzed'] += len(batch)
 
             # Оцениваем стоимость (примерно)
-            # Input: ~3.5K tokens × $1/M = $0.0035
-            # Output: ~2K tokens × $5/M = $0.01
-            estimated_cost = 0.0135  # $0.0135 за batch из 5 монет
+            estimated_cost = HaikuConfig.ESTIMATED_COST_PER_BATCH
             self.stats['total_cost_usd'] += estimated_cost
+            logger.debug(f"[HaikuAnalyzer] Estimated cost: ${estimated_cost:.4f}, total: ${self.stats['total_cost_usd']:.2f}")
 
             # Парсим JSON ответ
             response_text = response.content[0].text
+            logger.debug(f"[HaikuAnalyzer] Response length: {len(response_text)} chars")
+
             return self._parse_batch_response(response_text, batch)
 
         except Exception as e:
-            logger.error(f"[HaikuAnalyzer] API request failed: {e}")
+            logger.error(f"[HaikuAnalyzer] ✗ API request failed: {e}")
             raise
 
     def _build_batch_prompt(self, coins_data: List[dict]) -> str:
         """
-        Построение компактного batch промпта
+        Построение компактного batch промпта с валидацией длины
 
         Args:
             coins_data: Данные монет [{'symbol': ..., 'direction': ..., 'news': ...}, ...]
 
         Returns:
-            Компактный промпт
+            Компактный промпт (с валидацией длины)
+
+        Raises:
+            ValueError: Если промпт превышает MAX_PROMPT_LENGTH
         """
         lines = ["Analyze these coins (24h news):"]
 
         for i, coin in enumerate(coins_data, 1):
             line = f"{i}. {coin['symbol']} {coin['direction']} p={coin['p_up']:.2f} EV={coin['ev']*100:.1f}%"
             lines.append(line)
-            lines.append(f"   News: {coin['news']}")
+
+            # Обрезаем новости если они слишком длинные
+            news_text = coin['news']
+            if len(news_text) > HaikuConfig.MAX_NEWS_TEXT_LENGTH:
+                news_text = news_text[:HaikuConfig.MAX_NEWS_TEXT_LENGTH] + "..."
+                logger.debug(f"[HaikuAnalyzer] Truncated news for {coin['symbol']} to {HaikuConfig.MAX_NEWS_TEXT_LENGTH} chars")
+
+            lines.append(f"   News: {news_text}")
 
         lines.append("")
         lines.append("JSON format:")
         lines.append('[{"symbol":"BTCUSDT","score":0.75,"critical":false,"reason":"positive partnership"},...]')
 
-        return "\n".join(lines)
+        prompt = "\n".join(lines)
+        prompt_length = len(prompt)
+
+        # ════════════════════════════════════════════════════════════════
+        # ВАЛИДАЦИЯ ДЛИНЫ ПРОМПТА
+        # ════════════════════════════════════════════════════════════════
+        if prompt_length > HaikuConfig.MAX_PROMPT_LENGTH:
+            logger.error(
+                f"[HaikuAnalyzer] Prompt TOO LONG: {prompt_length} chars > "
+                f"max {HaikuConfig.MAX_PROMPT_LENGTH} chars"
+            )
+            raise ValueError(
+                f"Prompt length {prompt_length} exceeds maximum {HaikuConfig.MAX_PROMPT_LENGTH}. "
+                f"Reduce batch size or news length."
+            )
+
+        logger.debug(
+            f"[HaikuAnalyzer] Built prompt: {prompt_length} chars "
+            f"({prompt_length/HaikuConfig.MAX_PROMPT_LENGTH*100:.1f}% of max)"
+        )
+
+        return prompt
 
     def _parse_batch_response(self, response_text: str, batch: List[dict]) -> List[dict]:
         """
@@ -553,6 +835,8 @@ Output: JSON only, no explanations."""
         Returns:
             Список результатов
         """
+        logger.debug(f"[HaikuAnalyzer] Parsing response for {len(batch)} coins...")
+
         try:
             # Пытаемся найти JSON в ответе
             json_start = response_text.find('[')
@@ -564,20 +848,30 @@ Output: JSON only, no explanations."""
             json_text = response_text[json_start:json_end]
             parsed = json.loads(json_text)
 
+            logger.debug(f"[HaikuAnalyzer] Successfully parsed {len(parsed)} items from JSON")
+
             # Обрабатываем результаты
             results = []
-            for item in parsed:
+            for i, item in enumerate(parsed):
                 score = float(item.get('score', 0.5))
                 critical = bool(item.get('critical', False))
                 reason = item.get('reason', '')[:50]  # Максимум 50 символов
 
                 # Обновляем статистику решений
-                if score < 0.4:
+                if score < HaikuConfig.SCORE_THRESHOLD_REJECT:
                     self.stats['decisions']['rejected'] += 1
-                elif score > 0.6:
+                    decision = 'REJECT'
+                elif score > HaikuConfig.SCORE_THRESHOLD_APPROVE:
                     self.stats['decisions']['approved'] += 1
+                    decision = 'APPROVE'
                 else:
                     self.stats['decisions']['neutral'] += 1
+                    decision = 'NEUTRAL'
+
+                logger.debug(
+                    f"  [{i+1}/{len(parsed)}] {item.get('symbol', 'UNKNOWN')}: "
+                    f"score={score:.2f} ({decision}), critical={critical}, reason='{reason}'"
+                )
 
                 results.append({
                     'haiku_score': score,
@@ -585,14 +879,15 @@ Output: JSON only, no explanations."""
                     'haiku_reason': reason
                 })
 
+            logger.info(f"[HaikuAnalyzer] Parsed {len(results)} results successfully")
             return results
 
         except Exception as e:
             logger.error(f"[HaikuAnalyzer] Failed to parse response: {e}")
-            logger.debug(f"Response text: {response_text[:500]}")
+            logger.debug(f"Response text (first 500 chars): {response_text[:500]}")
 
             # Fallback: нейтральные скоры
-            return [
+            fallback_results = [
                 {
                     'haiku_score': 0.5,
                     'haiku_critical': False,
@@ -600,6 +895,9 @@ Output: JSON only, no explanations."""
                 }
                 for _ in batch
             ]
+
+            logger.warning(f"[HaikuAnalyzer] Using fallback neutral scores for {len(fallback_results)} coins")
+            return fallback_results
 
     def get_stats_summary(self) -> str:
         """Получить сводку статистики"""
