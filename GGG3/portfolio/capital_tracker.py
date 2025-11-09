@@ -58,7 +58,7 @@ class CapitalTracker:
         try:
             data = {
                 'history': self.history,
-                'last_updated': datetime.now().isoformat()
+                'last_updated': datetime.utcnow().isoformat() + 'Z'  # UTC время
             }
 
             with open(self.state_file, 'w') as f:
@@ -88,7 +88,7 @@ class CapitalTracker:
 
         snapshot = {
             'timestamp': time.time(),
-            'datetime': datetime.now().isoformat(),
+            'datetime': datetime.utcnow().isoformat() + 'Z',  # UTC время с маркером Z
             'free_balance': free_balance,
             'locked_in_positions': locked_in_positions,
             'reserve_fund': reserve_fund,
@@ -125,6 +125,56 @@ class CapitalTracker:
         if removed > 0:
             logger.info(f"Cleaned up {removed} old snapshots (older than {days} days)")
 
+    def _is_snapshot_suspicious(self, snapshot: Dict, max_jump_pct: float = 50.0) -> bool:
+        """
+        Проверяет snapshot на подозрительные скачки капитала
+
+        ЗАЩИТА ОТ АРТЕФАКТОВ: Если капитал изменился более чем на X% за короткий период
+        без очевидных причин (перезапуск, смена backend, пополнение) -
+        помечаем snapshot как подозрительный.
+
+        Args:
+            snapshot: Snapshot для проверки
+            max_jump_pct: Максимальное допустимое изменение за 1 час (%)
+
+        Returns:
+            True если snapshot подозрительный
+        """
+        # Находим предыдущий snapshot
+        idx = self.history.index(snapshot)
+        if idx == 0:
+            return False  # Первый snapshot не проверяем
+
+        prev_snapshot = self.history[idx - 1]
+
+        # Вычисляем изменение
+        time_diff_hours = (snapshot['timestamp'] - prev_snapshot['timestamp']) / 3600
+        if time_diff_hours < 0.1:  # Меньше 6 минут - скипаем
+            return False
+
+        prev_equity = prev_snapshot['total_equity']
+        curr_equity = snapshot['total_equity']
+
+        if prev_equity <= 0:
+            return False
+
+        # Процентное изменение
+        pct_change = abs((curr_equity / prev_equity - 1) * 100)
+
+        # Нормализуем на время (скачок за 1 час)
+        pct_per_hour = pct_change / max(time_diff_hours, 0.1)
+
+        # Если изменение больше max_jump_pct% в час - подозрительно
+        if pct_per_hour > max_jump_pct:
+            logger.warning(
+                f"Suspicious snapshot detected: {pct_change:.1f}% change "
+                f"in {time_diff_hours:.1f}h ({pct_per_hour:.1f}%/h) "
+                f"from ${prev_equity:.2f} to ${curr_equity:.2f}"
+            )
+            return True
+
+        return False
+
     def get_snapshot_at_time(self, hours_ago: float) -> Optional[Dict]:
         """
         Получает ближайший snapshot за указанное время назад
@@ -155,6 +205,13 @@ class CapitalTracker:
         max_allowed_diff = hours_ago * 3600 * 0.25  # 25% от периода
 
         if closest_snapshot and min_diff <= max_allowed_diff:
+            # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: Санity-check на подозрительные скачки
+            if self._is_snapshot_suspicious(closest_snapshot):
+                logger.debug(
+                    f"Snapshot for {hours_ago}h ago rejected (suspicious capital jump)"
+                )
+                return None
+
             return closest_snapshot
         else:
             # Snapshot слишком далеко - считаем что данных нет
