@@ -69,6 +69,8 @@ from features.target_calculator import calculate_atr, detect_market_phase
 # Models
 from models.experts import XGBoostExpert, RandomForestExpert, AdaptiveRFExpert, NeuralNetworkExpert
 from simplified_ensemble_meta import SimplifiedEnsembleMETA
+from models.transfer_learning import TransferLearningManager, PretrainingConfig
+from models.diversity_metric import DiversityMonitor, AlertType
 
 # Risk management
 from risk.trailing_stop import TrailingStopManager
@@ -161,6 +163,15 @@ class BinanceTradingBot:
         print("\n  Loading ML models...")
         self.experts = self._load_experts()
         self.meta = self._load_meta()
+
+        # Diversity Monitor (для мониторинга разнообразия экспертов)
+        self.diversity_monitor = DiversityMonitor(
+            window_size=100,
+            low_diversity_threshold=0.05,
+            high_disagreement_threshold=0.20,
+            high_correlation_threshold=0.95
+        )
+        print("    ✓ Diversity Monitor initialized (window=100)")
 
         # BASE logic
         self.base_logic = BaseLogicMultiTF()
@@ -329,34 +340,73 @@ class BinanceTradingBot:
         logger.info("[WATCHDOG] Monitoring thread stopped")
 
     def _load_experts(self) -> Dict:
-        """Загружает ML экспертов"""
+        """Загружает ML экспертов (с поддержкой Transfer Learning)"""
         experts = {}
 
-        # XGBoost
-        xgb_path = config.MODELS_DIR / 'saved' / 'xgb_expert.pkl'
-        if xgb_path.exists():
+        # ========== TRANSFER LEARNING: Попытка загрузить pretrained модели ==========
+        pretrained_dir = config.MODELS_DIR / 'pretrained'
+        use_pretrained = False
+
+        if pretrained_dir.exists():
             try:
-                experts['xgb'] = XGBoostExpert.load(str(xgb_path))
-                print(f"    ✓ XGBoost")
+                print("    🎓 Attempting to load pretrained models (Transfer Learning)...")
+                tl_config = PretrainingConfig(
+                    historical_data_path="",  # Не нужен для загрузки
+                    experts_to_pretrain=['xgb', 'rf', 'nn'],
+                    pretrained_save_dir=str(pretrained_dir),
+                    verbose=False
+                )
+                tl_manager = TransferLearningManager(tl_config)
+                pretrained_experts = tl_manager.load_pretrained_experts()
+
+                # Используем pretrained если успешно загрузили
+                if pretrained_experts:
+                    experts.update(pretrained_experts)
+                    use_pretrained = True
+                    print(f"    ✅ Loaded {len(pretrained_experts)} pretrained experts")
             except Exception as e:
-                print(f"    ⚠ XGBoost failed: {e}")
+                print(f"    ⚠️  Pretrained loading failed: {e}")
+                print(f"    → Falling back to regular model loading")
+
+        # ========== FALLBACK: Обычная загрузка моделей ==========
+        if not use_pretrained:
+            # XGBoost
+            xgb_path = config.MODELS_DIR / 'saved' / 'xgb_expert.pkl'
+            if xgb_path.exists():
+                try:
+                    experts['xgb'] = XGBoostExpert.load(str(xgb_path))
+                    print(f"    ✓ XGBoost")
+                except Exception as e:
+                    print(f"    ⚠ XGBoost failed: {e}")
+                    experts['xgb'] = None
+            else:
                 experts['xgb'] = None
-        else:
-            experts['xgb'] = None
 
-        # Random Forest
-        rf_path = config.MODELS_DIR / 'saved' / 'rf_expert.pkl'
-        if rf_path.exists():
-            try:
-                experts['rf'] = RandomForestExpert.load(str(rf_path))
-                print(f"    ✓ RandomForest")
-            except Exception as e:
-                print(f"    ⚠ RandomForest failed: {e}")
+            # Random Forest
+            rf_path = config.MODELS_DIR / 'saved' / 'rf_expert.pkl'
+            if rf_path.exists():
+                try:
+                    experts['rf'] = RandomForestExpert.load(str(rf_path))
+                    print(f"    ✓ RandomForest")
+                except Exception as e:
+                    print(f"    ⚠ RandomForest failed: {e}")
+                    experts['rf'] = None
+            else:
                 experts['rf'] = None
-        else:
-            experts['rf'] = None
 
-        # Adaptive Random Forest (онлайн обучение)
+            # Neural Network
+            nn_path = config.MODELS_DIR / 'saved' / 'nn_expert.pkl'
+            if nn_path.exists():
+                try:
+                    experts['nn'] = NeuralNetworkExpert.load(str(nn_path))
+                    print(f"    ✓ NeuralNet")
+                except Exception as e:
+                    print(f"    ⚠ NeuralNet failed: {e}")
+                    experts['nn'] = None
+            else:
+                experts['nn'] = None
+
+        # ========== ADAPTIVE RF: Всегда загружается отдельно (online learning) ==========
         arf_path = config.MODELS_DIR / 'saved' / 'arf_expert.pkl'
         if arf_path.exists():
             try:
@@ -378,18 +428,6 @@ class BinanceTradingBot:
             except Exception as e:
                 print(f"    ✗ AdaptiveRF init failed: {e}")
                 experts['arf'] = None
-
-        # Neural Network
-        nn_path = config.MODELS_DIR / 'saved' / 'nn_expert.pkl'
-        if nn_path.exists():
-            try:
-                experts['nn'] = NeuralNetworkExpert.load(str(nn_path))
-                print(f"    ✓ NeuralNet")
-            except Exception as e:
-                print(f"    ⚠ NeuralNet failed: {e}")
-                experts['nn'] = None
-        else:
-            experts['nn'] = None
 
         return experts
 
@@ -686,6 +724,47 @@ class BinanceTradingBot:
                         predictions['nn'] = float(p_nn)
                 except Exception as e:
                     logger.debug(f"{symbol}: NeuralNet prediction failed: {e}")
+
+            # ========== DIVERSITY MONITORING ==========
+            # Добавляем предсказания в Diversity Monitor
+            if predictions:
+                self.diversity_monitor.add_predictions(
+                    p_xgb=predictions.get('xgb'),
+                    p_rf=predictions.get('rf'),
+                    p_arf=predictions.get('arf'),
+                    p_nn=predictions.get('nn')
+                )
+
+                # Проверяем diversity метрики каждые 20 предсказаний
+                if self.diversity_monitor.n_samples % 20 == 0:
+                    metrics = self.diversity_monitor.get_metrics()
+                    if metrics:
+                        # Логируем метрики
+                        logger.info(f"[Diversity] {metrics.alert.value}: {metrics.alert_message}")
+                        logger.debug(f"  Disagreement={metrics.disagreement:.4f}, "
+                                   f"StdDev={metrics.std_dev:.4f}, "
+                                   f"MaxCorr={metrics.max_correlation:.4f}")
+
+                        # ========== РЕАКЦИЯ НА АЛЕРТЫ ==========
+                        # LOW_DIVERSITY: Эксперты слишком похожи → риск overfitting
+                        if metrics.alert == AlertType.LOW_DIVERSITY:
+                            logger.warning(f"⚠️ [Diversity] LOW_DIVERSITY detected! "
+                                         f"Disagreement={metrics.disagreement:.4f} < 0.05")
+                            # Откатываем META в SHADOW режим для защиты
+                            if self.meta and self.meta.mode == "ACTIVE":
+                                self.meta.mode = "SHADOW"
+                                logger.info("→ META: ACTIVE → SHADOW (low diversity protection)")
+
+                        # HIGH_DISAGREEMENT: Высокая uncertainty
+                        elif metrics.alert == AlertType.HIGH_DISAGREEMENT:
+                            logger.warning(f"⚠️ [Diversity] HIGH_DISAGREEMENT detected! "
+                                         f"Disagreement={metrics.disagreement:.4f} > 0.20")
+                            # Можно снизить position size, но это делается в стратегии
+
+                        # HIGH_CORRELATION: Избыточность экспертов
+                        elif metrics.alert == AlertType.HIGH_CORRELATION:
+                            logger.warning(f"⚠️ [Diversity] HIGH_CORRELATION detected! "
+                                         f"MaxCorr={metrics.max_correlation:.4f} > 0.95")
 
         except Exception as e:
             logger.error(f"Error collecting ML predictions for {symbol}: {e}")
