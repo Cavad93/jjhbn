@@ -314,7 +314,8 @@ class CoinSelector:
         get_predictions_func: callable = None,
         collect_ml_predictions_func: callable = None,
         top_n: int = 10,
-        exchange=None
+        exchange=None,
+        meta_model=None  # ✅ Добавили поддержку META
     ) -> List[dict]:
         """
         Отбирает топ-N торговых возможностей
@@ -470,6 +471,33 @@ class CoinSelector:
                 if collect_ml_predictions_func:
                     ml_predictions = collect_ml_predictions_func(features, phase, symbol)
 
+                # ✅ АКТИВНЫЙ РЕЖИМ META: Используем предсказание META для торговли
+                p_meta_prediction = None  # Предсказание от META (если в ACTIVE режиме)
+                if meta_model is not None and hasattr(meta_model, 'mode') and meta_model.mode == 'ACTIVE':
+                    try:
+                        # Вычисляем контекстные фичи для META
+                        context_features_temp = build_context_features(df_4h, symbol=symbol, exchange=exchange)
+
+                        # Вызываем META.predict()
+                        p_meta_prediction = meta_model.predict(
+                            p_xgb=ml_predictions.get('xgb'),
+                            p_rf=ml_predictions.get('rf'),
+                            p_arf=ml_predictions.get('arf'),
+                            p_nn=ml_predictions.get('nn'),
+                            p_base=p_up,
+                            reg_ctx=context_features_temp
+                        )
+
+                        # Если META дала предсказание, используем его вместо BASE
+                        if p_meta_prediction is not None:
+                            p_up = p_meta_prediction
+                            if self.verbose:
+                                print(f"  [META ACTIVE] {symbol}: p_meta={p_meta_prediction:.3f}")
+                    except Exception as e:
+                        logger.warning(f"META prediction failed for {symbol}: {e}")
+                        # Если META упала, используем BASE предсказание
+                        p_meta_prediction = None
+
                 # Рассчитываем EV для обоих направлений
                 ev_long, ev_short = self.calculate_ev_bidirectional(p_up)
 
@@ -518,7 +546,8 @@ class CoinSelector:
                     'ml_predictions': ml_predictions,  # ML предсказания для META
                     'features': features,  # 68D фичи для snapshot
                     'context': context_features,  # ✅ 7D контекстные фичи для META
-                    'base_signals': base_signals  # ✅ BASE сигналы [M, S, B, R] для калибровки весов
+                    'base_signals': base_signals,  # ✅ BASE сигналы [M, S, B, R] для калибровки весов
+                    'p_meta_prediction': p_meta_prediction  # ✅ Предсказание META (если ACTIVE режим)
                 }
 
                 opportunities.append(opportunity)

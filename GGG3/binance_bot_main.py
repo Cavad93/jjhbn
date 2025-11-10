@@ -463,8 +463,23 @@ class BinanceTradingBot:
                 else:
                     self.expert_stats['base']['losses'] += 1
 
-            # ⚠️ META: В SHADOW режиме META не принимает торговых решений, только учится
-            # Пока что НЕ обновляем статистику META при восстановлении
+            # ✅ META: Восстанавливаем статистику только для позиций в ACTIVE режиме
+            if snapshot:
+                meta_mode = snapshot.get('meta_mode')
+                p_meta_pred = snapshot.get('p_meta_prediction')
+
+                if meta_mode == 'ACTIVE' and p_meta_pred is not None:
+                    if 'meta' in self.expert_stats:
+                        if pos.direction == 'LONG':
+                            meta_was_right = (p_meta_pred > 0.5 and price_went_up) or (p_meta_pred <= 0.5 and not price_went_up)
+                        else:  # SHORT
+                            meta_was_right = (p_meta_pred < 0.5 and price_went_up) or (p_meta_pred >= 0.5 and not price_went_up)
+
+                        self.expert_stats['meta']['total'] += 1
+                        if meta_was_right:
+                            self.expert_stats['meta']['wins'] += 1
+                        else:
+                            self.expert_stats['meta']['losses'] += 1
 
         # Логируем восстановленную статистику
         for expert_name, stats in self.expert_stats.items():
@@ -825,7 +840,8 @@ class BinanceTradingBot:
             get_predictions_func=self._get_predictions,  # Базовая логика для торговли
             collect_ml_predictions_func=self._collect_ml_predictions_for_meta,  # ML для META
             top_n=20,  # Получаем топ-20 за один проход
-            exchange=self.exchange  # Для получения funding rate
+            exchange=self.exchange,  # Для получения funding rate
+            meta_model=self.meta  # ✅ Передаем META для ACTIVE режима
         )
 
         print(f"\n  Top-20 opportunities (for closure decisions):", flush=True)
@@ -1085,7 +1101,9 @@ class BinanceTradingBot:
                 'phase': opportunity.get('phase', 0),  # Фаза рынка
                 'timestamp': time.time(),
                 'context': opportunity.get('context', {}),  # ✅ Дублируем для совместимости
-                'base_signals': opportunity.get('base_signals', {})  # ✅ BASE сигналы [M, S, B, R] для калибровки
+                'base_signals': opportunity.get('base_signals', {}),  # ✅ BASE сигналы [M, S, B, R] для калибровки
+                'p_meta_prediction': opportunity.get('p_meta_prediction'),  # ✅ Предсказание META (если ACTIVE)
+                'meta_mode': self.meta.mode if self.meta is not None else None  # ✅ Режим META на момент входа
             }
 
             # Открываем позицию на бирже (фьючерсная логика)
@@ -1380,9 +1398,24 @@ class BinanceTradingBot:
                     else:
                         self.expert_stats['base']['losses'] += 1
 
-                # ⚠️ META: В SHADOW режиме META не принимает торговых решений, только учится
-                # TODO: Когда META перейдет в ACTIVE режим, нужно сохранять её предсказания и оценивать отдельно
-                # Пока что НЕ обновляем статистику META, т.к. она не участвует в торговле
+                # ✅ META: Оцениваем только если была в ACTIVE режиме при открытии позиции
+                meta_mode = snapshot.get('meta_mode')
+                p_meta_pred = snapshot.get('p_meta_prediction')
+
+                if meta_mode == 'ACTIVE' and p_meta_pred is not None:
+                    # META принимала решение - оцениваем её предсказание
+                    if 'meta' in self.expert_stats:
+                        if position.direction == 'LONG':
+                            meta_was_right = (p_meta_pred > 0.5 and price_went_up) or (p_meta_pred <= 0.5 and not price_went_up)
+                        else:  # SHORT
+                            meta_was_right = (p_meta_pred < 0.5 and price_went_up) or (p_meta_pred >= 0.5 and not price_went_up)
+
+                        self.expert_stats['meta']['total'] += 1
+                        if meta_was_right:
+                            self.expert_stats['meta']['wins'] += 1
+                        else:
+                            self.expert_stats['meta']['losses'] += 1
+                # В SHADOW режиме не обновляем статистику META
 
                 # Для META обучения используем старую логику (y_up основан на PnL)
                 y_up = 1 if price_went_up else 0
