@@ -68,7 +68,7 @@ from features.target_calculator import calculate_atr, detect_market_phase
 
 # Models
 from models.experts import XGBoostExpert, RandomForestExpert, AdaptiveRFExpert, NeuralNetworkExpert
-from meta_neural_cem import MetaNeuralCEM
+from simplified_ensemble_meta import SimplifiedEnsembleMETA
 
 # Risk management
 from risk.trailing_stop import TrailingStopManager
@@ -396,8 +396,8 @@ class BinanceTradingBot:
     def _load_meta(self):
         """Загружает META модель"""
         try:
-            # Создаем экземпляр MetaNeuralCEM
-            meta = MetaNeuralCEM(cfg=config)
+            # Создаем экземпляр SimplifiedEnsembleMETA
+            meta = SimplifiedEnsembleMETA(cfg=config)
             print(f"    ✓ META ({meta.mode} mode, {sum(meta.seen_ph.values())} samples)")
             return meta
         except Exception as e:
