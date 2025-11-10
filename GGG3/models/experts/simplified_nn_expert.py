@@ -178,8 +178,7 @@ class SimplifiedNeuralNetworkExpert:
             self.optimizer,
             mode='min',
             factor=0.5,
-            patience=3,
-            verbose=False
+            patience=3
         )
 
         self.criterion = nn.BCELoss()
