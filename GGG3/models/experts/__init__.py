@@ -5,13 +5,14 @@ ML Experts Package
 - XGBoostExpert: Gradient boosting
 - RandomForestExpert: Ensemble of decision trees
 - AdaptiveRFExpert: Online learning with River
-- NeuralNetworkExpert: Deep learning with PyTorch
+- NeuralNetworkExpert: Simplified deep learning with PyTorch (2.7K params)
 """
 
 from .xgb_expert import XGBoostExpert
 from .rf_expert import RandomForestExpert
 from .arf_expert import AdaptiveRFExpert
-from .nn_expert import NeuralNetworkExpert
+# ✅ ИЗМЕНЕНО: Используем упрощенную версию NeuralNet (11K → 2.7K params)
+from .simplified_nn_expert import SimplifiedNeuralNetworkExpert as NeuralNetworkExpert
 
 __all__ = [
     'XGBoostExpert',
