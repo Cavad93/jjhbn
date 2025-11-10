@@ -449,6 +449,7 @@ class BinanceTradingBot:
                             self.expert_stats[expert_name]['losses'] += 1
 
             # Базовая логика (основано на финальном решении)
+            # ВАЖНО: p_meta в snapshot - это предсказание от BASE логики (ужасное название!)
             p_base = snapshot.get('p_meta', 0.5) if snapshot else 0.5
             if 'base' in self.expert_stats:
                 if pos.direction == 'LONG':
@@ -462,18 +463,8 @@ class BinanceTradingBot:
                 else:
                     self.expert_stats['base']['losses'] += 1
 
-            # META (использует то же предсказание что и BASE)
-            if 'meta' in self.expert_stats:
-                if pos.direction == 'LONG':
-                    meta_was_right = (p_base > 0.5 and price_went_up) or (p_base <= 0.5 and not price_went_up)
-                else:  # SHORT
-                    meta_was_right = (p_base < 0.5 and price_went_up) or (p_base >= 0.5 and not price_went_up)
-
-                self.expert_stats['meta']['total'] += 1
-                if meta_was_right:
-                    self.expert_stats['meta']['wins'] += 1
-                else:
-                    self.expert_stats['meta']['losses'] += 1
+            # ⚠️ META: В SHADOW режиме META не принимает торговых решений, только учится
+            # Пока что НЕ обновляем статистику META при восстановлении
 
         # Логируем восстановленную статистику
         for expert_name, stats in self.expert_stats.items():
@@ -1375,7 +1366,7 @@ class BinanceTradingBot:
                             self.expert_stats[expert_name]['losses'] += 1
 
                 # Обновляем статистику BASE логики (основано на финальном решении)
-                # BASE использует p_meta для принятия решения, поэтому проверяем правильность финального решения
+                # ВАЖНО: p_meta в snapshot - это предсказание от BASE логики (ужасное название!)
                 p_base = snapshot.get('p_meta', 0.5)  # Финальное предсказание базовой логики
                 if 'base' in self.expert_stats:
                     if position.direction == 'LONG':
@@ -1389,18 +1380,9 @@ class BinanceTradingBot:
                     else:
                         self.expert_stats['base']['losses'] += 1
 
-                # Обновляем статистику META (использует то же предсказание что и BASE)
-                if 'meta' in self.expert_stats:
-                    if position.direction == 'LONG':
-                        meta_was_right = (p_base > 0.5 and price_went_up) or (p_base <= 0.5 and not price_went_up)
-                    else:  # SHORT
-                        meta_was_right = (p_base < 0.5 and price_went_up) or (p_base >= 0.5 and not price_went_up)
-
-                    self.expert_stats['meta']['total'] += 1
-                    if meta_was_right:
-                        self.expert_stats['meta']['wins'] += 1
-                    else:
-                        self.expert_stats['meta']['losses'] += 1
+                # ⚠️ META: В SHADOW режиме META не принимает торговых решений, только учится
+                # TODO: Когда META перейдет в ACTIVE режим, нужно сохранять её предсказания и оценивать отдельно
+                # Пока что НЕ обновляем статистику META, т.к. она не участвует в торговле
 
                 # Для META обучения используем старую логику (y_up основан на PnL)
                 y_up = 1 if price_went_up else 0
