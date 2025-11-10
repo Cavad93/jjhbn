@@ -424,23 +424,27 @@ class BinanceTradingBot:
         logger.info("[ExpertStats] Restoring expert statistics from closed positions...")
 
         for pos in self.position_manager.closed_positions:
-            price_went_up = pos.pnl > 0
+            # ВАЖНО: Для LONG pnl>0 означает рост, для SHORT pnl>0 означает ПАДЕНИЕ
+            if pos.direction == 'LONG':
+                price_went_up = pos.pnl > 0
+            else:  # SHORT
+                price_went_up = pos.pnl < 0  # SHORT: убыток означает цена выросла
 
             # Получаем entry_snapshot если есть
             snapshot = getattr(pos, 'entry_snapshot', {}) if hasattr(pos, 'entry_snapshot') else {}
             ml_preds = snapshot.get('ml_predictions', {})
 
             # ✅ ИСПРАВЛЕНИЕ: Обновляем статистику ML экспертов с учетом их предсказаний
+            # ЛОГИКА ОДИНАКОВА для LONG и SHORT, т.к. price_went_up уже учитывает направление
             if ml_preds:
                 for expert_name in ['xgb', 'rf', 'arf', 'nn']:
                     if expert_name in ml_preds and expert_name in self.expert_stats:
                         p_up = ml_preds[expert_name]
 
-                        # Определяем был ли эксперт прав
-                        if pos.direction == 'LONG':
-                            expert_was_right = (p_up > 0.5 and price_went_up) or (p_up <= 0.5 and not price_went_up)
-                        else:  # SHORT
-                            expert_was_right = (p_up < 0.5 and price_went_up) or (p_up >= 0.5 and not price_went_up)
+                        # Эксперт прав если:
+                        # - предсказал рост (p_up > 0.5) и цена выросла (price_went_up = True)
+                        # - предсказал падение (p_up <= 0.5) и цена упала (price_went_up = False)
+                        expert_was_right = (p_up > 0.5 and price_went_up) or (p_up <= 0.5 and not price_went_up)
 
                         self.expert_stats[expert_name]['total'] += 1
                         if expert_was_right:
@@ -1359,23 +1363,23 @@ class BinanceTradingBot:
                 ml_preds = snapshot.get('ml_predictions', {})
 
                 # Определяем фактический результат (цена выросла или упала)
-                price_went_up = position.pnl > 0
+                # ВАЖНО: Для LONG pnl>0 означает рост, для SHORT pnl>0 означает ПАДЕНИЕ
+                if position.direction == 'LONG':
+                    price_went_up = position.pnl > 0
+                else:  # SHORT
+                    price_went_up = position.pnl < 0  # SHORT: убыток означает цена выросла
 
                 # ✅ ИСПРАВЛЕНИЕ: Обновляем статистику экспертов с учетом их ПРЕДСКАЗАНИЙ
                 # Каждый эксперт дает свое p_up, нужно проверять правильность его прогноза
+                # ЛОГИКА ОДИНАКОВА для LONG и SHORT, т.к. price_went_up уже учитывает направление
                 for expert_name in ['xgb', 'rf', 'arf', 'nn']:
                     if expert_name in ml_preds and expert_name in self.expert_stats:
                         p_up = ml_preds[expert_name]  # Предсказание эксперта (0-1)
 
-                        # Определяем был ли эксперт прав
-                        if position.direction == 'LONG':
-                            # LONG: эксперт прав если предсказал рост (p_up > 0.5) и цена выросла
-                            # или предсказал падение (p_up <= 0.5) и цена упала
-                            expert_was_right = (p_up > 0.5 and price_went_up) or (p_up <= 0.5 and not price_went_up)
-                        else:  # SHORT
-                            # SHORT: эксперт прав если предсказал падение (p_up < 0.5) и цена упала (позиция в плюсе)
-                            # или предсказал рост (p_up >= 0.5) и цена выросла (позиция в минусе)
-                            expert_was_right = (p_up < 0.5 and price_went_up) or (p_up >= 0.5 and not price_went_up)
+                        # Эксперт прав если:
+                        # - предсказал рост (p_up > 0.5) и цена выросла (price_went_up = True)
+                        # - предсказал падение (p_up <= 0.5) и цена упала (price_went_up = False)
+                        expert_was_right = (p_up > 0.5 and price_went_up) or (p_up <= 0.5 and not price_went_up)
 
                         self.expert_stats[expert_name]['total'] += 1
                         if expert_was_right:
