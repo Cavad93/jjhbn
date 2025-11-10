@@ -905,18 +905,14 @@ class BinanceTradingBot:
 
         print(f"\n  Checking if existing positions should be closed (using top-20)...", flush=True)
 
-        # Счетчик закрытых позиций
+        # ═══════════════════════════════════════════════════════════════════════
+        # СТРАТЕГИЯ: Позиции закрываются ТОЛЬКО по TP/SL
+        # Не закрываем позиции принудительно при выпадении из TOP-20
+        # Trailing stop и TP/SL ордера управляют выходами
+        # ═══════════════════════════════════════════════════════════════════════
         positions_before_close = len(self.position_manager.get_all_open())
         closed_count = 0
-
-        # Получаем символы из топ-20 для проверки закрытия позиций
-        top_20_symbols = {opp['symbol'] for opp in top_20_opportunities}
-
-        for position in list(self.position_manager.get_all_open()):
-            if position.symbol not in top_20_symbols:
-                print(f"\n  Closing {position.symbol}: not in top-20 anymore")
-                self.close_position_manual(position)
-                closed_count += 1
+        print(f"  Strategy: Positions close on TP/SL only - no manual closure during rebalance", flush=True)
 
         # ═══════════════════════════════════════════════════════════════════════
         # КРИТИЧНО: Вычисляем торговый капитал ОДИН РАЗ для всех позиций
