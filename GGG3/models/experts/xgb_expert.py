@@ -15,6 +15,7 @@ import pickle
 import os
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
+import sys
 
 try:
     import xgboost as xgb
@@ -22,6 +23,23 @@ try:
 except ImportError:
     HAVE_XGB = False
     print("WARNING: xgboost not installed. Install with: pip install xgboost")
+
+# Import calibrator
+try:
+    # Try relative import first
+    from ..probability_calibrator import ProbabilityCalibrator
+    HAVE_CALIBRATOR = True
+except (ImportError, ValueError):
+    # Fallback: add parent directory to path
+    try:
+        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
+        from probability_calibrator import ProbabilityCalibrator
+        HAVE_CALIBRATOR = True
+    except ImportError:
+        HAVE_CALIBRATOR = False
+        print("WARNING: ProbabilityCalibrator not available")
 
 
 class XGBoostExpert:
@@ -70,13 +88,17 @@ class XGBoostExpert:
         self.is_trained = False
         self.n_features = None
 
+        # Калибратор вероятностей
+        self.calibrator = ProbabilityCalibrator(method='auto') if HAVE_CALIBRATOR else None
+        self.calibration_enabled = True  # Можно отключить
+
         # Статистика
         self.train_samples = 0
         self.retrain_count = 0
 
     def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None):
         """
-        Обучение модели с нуля
+        Обучение модели с нуля + калибровка вероятностей
 
         Args:
             X: Фичи (n_samples, n_features)
@@ -88,10 +110,33 @@ class XGBoostExpert:
 
         self.n_features = X.shape[1]
 
-        # Создаем DMatrix
-        dtrain = xgb.DMatrix(X, label=y, weight=sample_weight)
+        # ===== TRAIN/VAL SPLIT ДЛЯ КАЛИБРОВКИ =====
+        # Используем последние 20% для калибровки
+        n_total = len(X)
+        n_calibration = max(int(n_total * 0.2), min(50, n_total // 2))  # Минимум 50 или половина
 
-        # Параметры
+        if n_total > n_calibration + 10:
+            # Достаточно данных для split
+            X_train = X[:-n_calibration]
+            y_train = y[:-n_calibration]
+            X_calib = X[-n_calibration:]
+            y_calib = y[-n_calibration:]
+
+            if sample_weight is not None:
+                weight_train = sample_weight[:-n_calibration]
+            else:
+                weight_train = None
+        else:
+            # Мало данных - используем все для обучения, калибровка на тех же данных
+            X_train = X
+            y_train = y
+            X_calib = X
+            y_calib = y
+            weight_train = sample_weight
+
+        # ===== ОБУЧЕНИЕ МОДЕЛИ =====
+        dtrain = xgb.DMatrix(X_train, label=y_train, weight=weight_train)
+
         params = {
             'objective': 'binary:logistic',
             'eval_metric': 'logloss',
@@ -106,13 +151,25 @@ class XGBoostExpert:
             'verbosity': 0
         }
 
-        # Обучаем
         self.model = xgb.train(
             params=params,
             dtrain=dtrain,
             num_boost_round=self.n_estimators,
             verbose_eval=False
         )
+
+        # ===== КАЛИБРОВКА ВЕРОЯТНОСТЕЙ =====
+        if self.calibrator is not None and len(X_calib) >= 10:
+            # Получаем uncalibrated predictions на calibration set
+            dcalib = xgb.DMatrix(X_calib)
+            proba_uncalib = self.model.predict(dcalib)
+
+            try:
+                # Обучаем калибратор
+                self.calibrator.fit(proba_uncalib, y_calib)
+                # print(f"[XGB] ✅ Calibration fitted: method={self.calibrator.actual_method}")
+            except Exception as e:
+                print(f"[XGB] ⚠️ Calibration failed: {e}")
 
         self.is_trained = True
         self.train_samples = len(X)
@@ -174,13 +231,13 @@ class XGBoostExpert:
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """
-        Предсказание вероятностей
+        Предсказание вероятностей с калибровкой
 
         Args:
             X: Фичи (n_samples, n_features)
 
         Returns:
-            np.ndarray: Вероятности класса 1 (n_samples,)
+            np.ndarray: Калиброванные вероятности класса 1 (n_samples,)
         """
         if not self.is_trained:
             # Если модель не обучена, возвращаем 0.5
@@ -189,8 +246,20 @@ class XGBoostExpert:
         if X.shape[1] != self.n_features:
             raise ValueError(f"Expected {self.n_features} features, got {X.shape[1]}")
 
+        # Получаем uncalibrated predictions
         dtest = xgb.DMatrix(X)
-        proba = self.model.predict(dtest)
+        proba_uncalib = self.model.predict(dtest)
+
+        # ===== КАЛИБРОВКА =====
+        if self.calibration_enabled and self.calibrator is not None and self.calibrator.is_fitted:
+            try:
+                proba = self.calibrator.transform(proba_uncalib)
+            except Exception as e:
+                # Fallback на uncalibrated
+                print(f"[XGB] ⚠️ Calibration transform failed: {e}")
+                proba = proba_uncalib
+        else:
+            proba = proba_uncalib
 
         return proba
 
@@ -225,13 +294,15 @@ class XGBoostExpert:
         return float(proba[0]), metadata
 
     def save(self, filepath: str):
-        """Сохранение модели"""
+        """Сохранение модели + калибратора"""
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
         if self.model is not None:
             # Сохраняем XGBoost модель в JSON (легче для версионирования)
             model_path = filepath.replace('.pkl', '_xgb.json')
             self.model.save_model(model_path)
+        else:
+            model_path = None
 
         # Сохраняем метаданные
         state = {
@@ -247,7 +318,9 @@ class XGBoostExpert:
             'n_features': self.n_features,
             'train_samples': self.train_samples,
             'retrain_count': self.retrain_count,
-            'model_path': model_path if self.model else None
+            'model_path': model_path,
+            'calibrator': self.calibrator,  # ✅ Сохраняем калибратор
+            'calibration_enabled': self.calibration_enabled
         }
 
         with open(filepath, 'wb') as f:
@@ -255,7 +328,7 @@ class XGBoostExpert:
 
     @classmethod
     def load(cls, filepath: str) -> 'XGBoostExpert':
-        """Загрузка модели"""
+        """Загрузка модели + калибратора"""
         with open(filepath, 'rb') as f:
             state = pickle.load(f)
 
@@ -276,6 +349,10 @@ class XGBoostExpert:
         expert.n_features = state['n_features']
         expert.train_samples = state['train_samples']
         expert.retrain_count = state['retrain_count']
+
+        # ✅ Загружаем калибратор
+        expert.calibrator = state.get('calibrator', None)
+        expert.calibration_enabled = state.get('calibration_enabled', True)
 
         # Загружаем модель
         if state['model_path'] and os.path.exists(state['model_path']):

@@ -13,9 +13,25 @@ Ensemble метод на основе деревьев решений для п�
 import numpy as np
 import pickle
 import os
+import sys
 from typing import Dict, List, Optional, Tuple
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.calibration import CalibratedClassifierCV
+
+# Import calibrator
+try:
+    from ..probability_calibrator import ProbabilityCalibrator
+    HAVE_CALIBRATOR = True
+except (ImportError, ValueError):
+    try:
+        parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
+        from probability_calibrator import ProbabilityCalibrator
+        HAVE_CALIBRATOR = True
+    except ImportError:
+        HAVE_CALIBRATOR = False
+        print("WARNING: ProbabilityCalibrator not available")
 
 
 class RandomForestExpert:
@@ -33,7 +49,8 @@ class RandomForestExpert:
         min_samples_leaf: int = 5,
         max_features: str = 'sqrt',
         bootstrap: bool = True,
-        random_state: int = 42
+        random_state: int = 42,
+        max_total_trees: int = 500  # ✅ НОВОЕ: Ограничение на total trees
     ):
         """
         Args:
@@ -44,6 +61,7 @@ class RandomForestExpert:
             max_features: Количество фич для каждого дерева
             bootstrap: Использовать bootstrap sampling
             random_state: Random seed
+            max_total_trees: Максимальное количество деревьев в лесу (защита от memory leak)
         """
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -52,11 +70,16 @@ class RandomForestExpert:
         self.max_features = max_features
         self.bootstrap = bootstrap
         self.random_state = random_state
+        self.max_total_trees = max_total_trees  # ✅ НОВОЕ
 
         # Модель
         self.model = None
         self.is_trained = False
         self.n_features = None
+
+        # Калибратор вероятностей
+        self.calibrator = ProbabilityCalibrator(method='auto') if HAVE_CALIBRATOR else None
+        self.calibration_enabled = True
 
         # Статистика
         self.train_samples = 0
@@ -64,7 +87,7 @@ class RandomForestExpert:
 
     def fit(self, X: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None):
         """
-        Обучение модели с нуля
+        Обучение модели с нуля + калибровка
 
         Args:
             X: Фичи (n_samples, n_features)
@@ -76,7 +99,24 @@ class RandomForestExpert:
 
         self.n_features = X.shape[1]
 
-        # Создаем Random Forest
+        # ===== TRAIN/VAL SPLIT ДЛЯ КАЛИБРОВКИ =====
+        n_total = len(X)
+        n_calibration = max(int(n_total * 0.2), min(50, n_total // 2))
+
+        if n_total > n_calibration + 10:
+            X_train = X[:-n_calibration]
+            y_train = y[:-n_calibration]
+            X_calib = X[-n_calibration:]
+            y_calib = y[-n_calibration:]
+            weight_train = sample_weight[:-n_calibration] if sample_weight is not None else None
+        else:
+            X_train = X
+            y_train = y
+            X_calib = X
+            y_calib = y
+            weight_train = sample_weight
+
+        # ===== ОБУЧЕНИЕ МОДЕЛИ =====
         self.model = RandomForestClassifier(
             n_estimators=self.n_estimators,
             max_depth=self.max_depth,
@@ -85,12 +125,19 @@ class RandomForestExpert:
             max_features=self.max_features,
             bootstrap=self.bootstrap,
             random_state=self.random_state,
-            n_jobs=-1,  # Используем все CPU
+            n_jobs=-1,
             verbose=0
         )
 
-        # Обучаем
-        self.model.fit(X, y, sample_weight=sample_weight)
+        self.model.fit(X_train, y_train, sample_weight=weight_train)
+
+        # ===== КАЛИБРОВКА =====
+        if self.calibrator is not None and len(X_calib) >= 10:
+            proba_uncalib = self.model.predict_proba(X_calib)[:, 1]
+            try:
+                self.calibrator.fit(proba_uncalib, y_calib)
+            except Exception as e:
+                print(f"[RF] ⚠️ Calibration failed: {e}")
 
         self.is_trained = True
         self.train_samples = len(X)
@@ -104,7 +151,7 @@ class RandomForestExpert:
         sample_weight: Optional[np.ndarray] = None
     ):
         """
-        Онлайн обучение - добавляет новые деревья к существующему лесу
+        Онлайн обучение - добавляет новые деревья + защита от memory leak
 
         Args:
             X: Новые фичи
@@ -119,6 +166,17 @@ class RandomForestExpert:
 
         if X.shape[1] != self.n_features:
             raise ValueError(f"Expected {self.n_features} features, got {X.shape[1]}")
+
+        # ===== FIX MEMORY LEAK: Проверка лимита деревьев =====
+        current_trees = len(self.model.estimators_)
+
+        if current_trees + n_new_trees > self.max_total_trees:
+            # Удаляем старые деревья (FIFO)
+            n_to_remove = (current_trees + n_new_trees) - self.max_total_trees
+            if n_to_remove > 0:
+                self.model.estimators_ = self.model.estimators_[n_to_remove:]
+                self.model.n_estimators = len(self.model.estimators_)
+                # print(f"[RF] 🗑️ Removed {n_to_remove} oldest trees (limit: {self.max_total_trees})")
 
         # Создаем новый лес с новыми деревьями
         new_forest = RandomForestClassifier(
@@ -143,24 +201,42 @@ class RandomForestExpert:
         self.train_samples += len(X)
         self.retrain_count += 1
 
+        # ===== RECALIBRATE при большом количестве добавлений =====
+        # Каждые 5 обновлений пересчитываем калибровку
+        if self.calibrator is not None and self.retrain_count % 5 == 0 and len(X) >= 20:
+            try:
+                proba_uncalib = self.model.predict_proba(X)[:, 1]
+                self.calibrator.fit(proba_uncalib, y)
+            except Exception:
+                pass  # Тихо игнорируем если не получилось
+
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """
-        Предсказание вероятностей
+        Предсказание вероятностей с калибровкой
 
         Args:
             X: Фичи (n_samples, n_features)
 
         Returns:
-            np.ndarray: Вероятности класса 1 (n_samples,)
+            np.ndarray: Калиброванные вероятности класса 1 (n_samples,)
         """
         if not self.is_trained:
-            # Если модель не обучена, возвращаем 0.5
             return np.full(len(X), 0.5)
 
         if X.shape[1] != self.n_features:
             raise ValueError(f"Expected {self.n_features} features, got {X.shape[1]}")
 
-        proba = self.model.predict_proba(X)[:, 1]
+        proba_uncalib = self.model.predict_proba(X)[:, 1]
+
+        # Калибровка
+        if self.calibration_enabled and self.calibrator is not None and self.calibrator.is_fitted:
+            try:
+                proba = self.calibrator.transform(proba_uncalib)
+            except Exception as e:
+                print(f"[RF] ⚠️ Calibration transform failed: {e}")
+                proba = proba_uncalib
+        else:
+            proba = proba_uncalib
 
         return proba
 
@@ -195,7 +271,7 @@ class RandomForestExpert:
         return float(proba[0]), metadata
 
     def save(self, filepath: str):
-        """Сохранение модели"""
+        """Сохранение модели + калибратора"""
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
         state = {
@@ -207,10 +283,13 @@ class RandomForestExpert:
             'max_features': self.max_features,
             'bootstrap': self.bootstrap,
             'random_state': self.random_state,
+            'max_total_trees': self.max_total_trees,  # ✅ НОВОЕ
             'is_trained': self.is_trained,
             'n_features': self.n_features,
             'train_samples': self.train_samples,
-            'retrain_count': self.retrain_count
+            'retrain_count': self.retrain_count,
+            'calibrator': self.calibrator,  # ✅ НОВОЕ
+            'calibration_enabled': self.calibration_enabled  # ✅ НОВОЕ
         }
 
         with open(filepath, 'wb') as f:
@@ -218,7 +297,7 @@ class RandomForestExpert:
 
     @classmethod
     def load(cls, filepath: str) -> 'RandomForestExpert':
-        """Загрузка модели"""
+        """Загрузка модели + калибратора"""
         with open(filepath, 'rb') as f:
             state = pickle.load(f)
 
@@ -230,7 +309,8 @@ class RandomForestExpert:
             min_samples_leaf=state['min_samples_leaf'],
             max_features=state['max_features'],
             bootstrap=state['bootstrap'],
-            random_state=state['random_state']
+            random_state=state['random_state'],
+            max_total_trees=state.get('max_total_trees', 500)  # ✅ НОВОЕ
         )
 
         # Загружаем состояние
@@ -239,6 +319,10 @@ class RandomForestExpert:
         expert.n_features = state['n_features']
         expert.train_samples = state['train_samples']
         expert.retrain_count = state['retrain_count']
+
+        # ✅ Загружаем калибратор
+        expert.calibrator = state.get('calibrator', None)
+        expert.calibration_enabled = state.get('calibration_enabled', True)
 
         return expert
 

@@ -24,6 +24,13 @@ except ImportError:
     HAVE_RIVER = False
     print("WARNING: river not installed. Install with: pip install river")
 
+try:
+    import dill
+    HAVE_DILL = True
+except ImportError:
+    HAVE_DILL = False
+    print("WARNING: dill not installed. Install with: pip install dill")
+
 
 class AdaptiveRFExpert:
     """
@@ -211,13 +218,14 @@ class AdaptiveRFExpert:
 
     def save(self, filepath: str):
         """
-        Сохранение модели
+        Сохранение модели с использованием dill для River ARF
 
-        ВАЖНО: River модели сложно сериализовать полностью.
-        Сохраняем только статистику, модель пересоздается.
+        Использует dill для полной сериализации River модели.
+        Fallback на pickle если dill недоступен (legacy behavior).
         """
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
+        # Базовая информация
         state = {
             'n_models': self.n_models,
             'max_depth': self.max_depth,
@@ -228,19 +236,50 @@ class AdaptiveRFExpert:
             'n_features': self.n_features,
             'train_samples': self.train_samples,
             'drift_detections': self.drift_detections,
-            # River модели сложно сериализовать, поэтому сохраняем только параметры
-            'note': 'ARF model will be recreated on load - requires retraining'
+            'version': '2.0'  # Новая версия с dill
         }
 
-        with open(filepath, 'wb') as f:
-            pickle.dump(state, f)
+        if HAVE_DILL and self.model is not None:
+            # ✅ НОВОЕ: Используем dill для сериализации River модели
+            try:
+                # Сохраняем модель отдельно в .dill файл
+                model_path = filepath.replace('.pkl', '_model.dill')
+                with open(model_path, 'wb') as f:
+                    dill.dump(self.model, f)
+
+                state['model_path'] = model_path
+                state['serialization'] = 'dill'
+
+                # Сохраняем метаданные в .pkl
+                with open(filepath, 'wb') as f:
+                    pickle.dump(state, f)
+
+                print(f"[ARF] ✅ Model saved with dill serialization: {model_path}")
+
+            except Exception as e:
+                print(f"[ARF] ⚠️ Dill serialization failed: {e}, falling back to legacy mode")
+                # Fallback: без модели
+                state['model_path'] = None
+                state['serialization'] = 'none'
+                with open(filepath, 'wb') as f:
+                    pickle.dump(state, f)
+        else:
+            # Legacy mode: без модели
+            if not HAVE_DILL:
+                print("[ARF] ⚠️ dill not available, model will not be saved (install: pip install dill)")
+            state['model_path'] = None
+            state['serialization'] = 'none'
+            with open(filepath, 'wb') as f:
+                pickle.dump(state, f)
 
     @classmethod
     def load(cls, filepath: str) -> 'AdaptiveRFExpert':
         """
-        Загрузка модели
+        Загрузка модели с поддержкой dill десериализации
 
-        ВАЖНО: Модель пересоздается, требует повторного обучения!
+        Поддерживает:
+        - v2.0: dill сериализация (полное восстановление модели)
+        - legacy: старый формат без модели (требует retraining)
         """
         with open(filepath, 'rb') as f:
             state = pickle.load(f)
@@ -254,11 +293,48 @@ class AdaptiveRFExpert:
             random_state=state['random_state']
         )
 
-        # Загружаем статистику
-        expert.is_trained = False  # Требуется retraining!
+        # Восстанавливаем статистику
         expert.n_features = state['n_features']
-        expert.train_samples = 0
-        expert.drift_detections = 0
+        expert.train_samples = state.get('train_samples', 0)
+        expert.drift_detections = state.get('drift_detections', 0)
+
+        # ✅ ИСПРАВЛЕНИЕ: Загружаем модель если есть dill сериализация
+        serialization = state.get('serialization', 'none')
+        model_path = state.get('model_path')
+
+        if serialization == 'dill' and model_path and os.path.exists(model_path):
+            if HAVE_DILL:
+                try:
+                    # Загружаем River модель из dill файла
+                    with open(model_path, 'rb') as f:
+                        expert.model = dill.load(f)
+
+                    expert.is_trained = state.get('is_trained', True)
+
+                    print(f"[ARF] ✅ Model loaded from dill: {model_path}")
+                    print(f"     Trained: {expert.is_trained}, Samples: {expert.train_samples}")
+
+                except Exception as e:
+                    print(f"[ARF] ❌ Failed to load dill model: {e}")
+                    print(f"[ARF] ⚠️ Creating new model - will need retraining")
+                    expert._init_model()
+                    expert.is_trained = False
+                    expert.train_samples = 0
+            else:
+                print("[ARF] ⚠️ dill not available, cannot load model (install: pip install dill)")
+                expert._init_model()
+                expert.is_trained = False
+                expert.train_samples = 0
+        else:
+            # Legacy format или модель не сохранена
+            if serialization == 'none':
+                print("[ARF] ⚠️ Loaded legacy format without model - needs retraining")
+            else:
+                print(f"[ARF] ⚠️ Model file not found: {model_path}")
+
+            expert._init_model()
+            expert.is_trained = False
+            expert.train_samples = 0
 
         return expert
 
