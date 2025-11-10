@@ -424,30 +424,53 @@ class BinanceTradingBot:
         logger.info("[ExpertStats] Restoring expert statistics from closed positions...")
 
         for pos in self.position_manager.closed_positions:
-            is_win = pos.pnl > 0
+            price_went_up = pos.pnl > 0
 
-            # Если в позиции сохранены predictions от экспертов
-            if hasattr(pos, 'ml_predictions') and pos.ml_predictions:
-                # Обновляем статистику каждого эксперта
-                for expert_name, pred in pos.ml_predictions.items():
-                    if expert_name in self.expert_stats:
+            # Получаем entry_snapshot если есть
+            snapshot = getattr(pos, 'entry_snapshot', {}) if hasattr(pos, 'entry_snapshot') else {}
+            ml_preds = snapshot.get('ml_predictions', {})
+
+            # ✅ ИСПРАВЛЕНИЕ: Обновляем статистику ML экспертов с учетом их предсказаний
+            if ml_preds:
+                for expert_name in ['xgb', 'rf', 'arf', 'nn']:
+                    if expert_name in ml_preds and expert_name in self.expert_stats:
+                        p_up = ml_preds[expert_name]
+
+                        # Определяем был ли эксперт прав
+                        if pos.direction == 'LONG':
+                            expert_was_right = (p_up > 0.5 and price_went_up) or (p_up <= 0.5 and not price_went_up)
+                        else:  # SHORT
+                            expert_was_right = (p_up < 0.5 and price_went_up) or (p_up >= 0.5 and not price_went_up)
+
                         self.expert_stats[expert_name]['total'] += 1
-                        if is_win:
+                        if expert_was_right:
                             self.expert_stats[expert_name]['wins'] += 1
                         else:
                             self.expert_stats[expert_name]['losses'] += 1
 
-            # Базовая логика (всегда есть)
-            self.expert_stats['base']['total'] += 1
-            if is_win:
-                self.expert_stats['base']['wins'] += 1
-            else:
-                self.expert_stats['base']['losses'] += 1
+            # Базовая логика (основано на финальном решении)
+            p_base = snapshot.get('p_meta', 0.5) if snapshot else 0.5
+            if 'base' in self.expert_stats:
+                if pos.direction == 'LONG':
+                    base_was_right = (p_base > 0.5 and price_went_up) or (p_base <= 0.5 and not price_went_up)
+                else:  # SHORT
+                    base_was_right = (p_base < 0.5 and price_went_up) or (p_base >= 0.5 and not price_went_up)
 
-            # META (если была активна)
-            if hasattr(pos, 'meta_prediction') and pos.meta_prediction is not None:
+                self.expert_stats['base']['total'] += 1
+                if base_was_right:
+                    self.expert_stats['base']['wins'] += 1
+                else:
+                    self.expert_stats['base']['losses'] += 1
+
+            # META (использует то же предсказание что и BASE)
+            if 'meta' in self.expert_stats:
+                if pos.direction == 'LONG':
+                    meta_was_right = (p_base > 0.5 and price_went_up) or (p_base <= 0.5 and not price_went_up)
+                else:  # SHORT
+                    meta_was_right = (p_base < 0.5 and price_went_up) or (p_base >= 0.5 and not price_went_up)
+
                 self.expert_stats['meta']['total'] += 1
-                if is_win:
+                if meta_was_right:
                     self.expert_stats['meta']['wins'] += 1
                 else:
                     self.expert_stats['meta']['losses'] += 1
@@ -1326,35 +1349,61 @@ class BinanceTradingBot:
                 snapshot = position.entry_snapshot
                 ml_preds = snapshot.get('ml_predictions', {})
 
-                # Определяем фактический результат
-                y_up = 1 if position.pnl > 0 else 0
-                is_win = y_up == 1
+                # Определяем фактический результат (цена выросла или упала)
+                price_went_up = position.pnl > 0
 
-                # ✅ Обновляем статистику экспертов
-                # Обновляем для каждого эксперта, который делал предсказание
+                # ✅ ИСПРАВЛЕНИЕ: Обновляем статистику экспертов с учетом их ПРЕДСКАЗАНИЙ
+                # Каждый эксперт дает свое p_up, нужно проверять правильность его прогноза
                 for expert_name in ['xgb', 'rf', 'arf', 'nn']:
                     if expert_name in ml_preds and expert_name in self.expert_stats:
+                        p_up = ml_preds[expert_name]  # Предсказание эксперта (0-1)
+
+                        # Определяем был ли эксперт прав
+                        if position.direction == 'LONG':
+                            # LONG: эксперт прав если предсказал рост (p_up > 0.5) и цена выросла
+                            # или предсказал падение (p_up <= 0.5) и цена упала
+                            expert_was_right = (p_up > 0.5 and price_went_up) or (p_up <= 0.5 and not price_went_up)
+                        else:  # SHORT
+                            # SHORT: эксперт прав если предсказал падение (p_up < 0.5) и цена упала (позиция в плюсе)
+                            # или предсказал рост (p_up >= 0.5) и цена выросла (позиция в минусе)
+                            expert_was_right = (p_up < 0.5 and price_went_up) or (p_up >= 0.5 and not price_went_up)
+
                         self.expert_stats[expert_name]['total'] += 1
-                        if is_win:
+                        if expert_was_right:
                             self.expert_stats[expert_name]['wins'] += 1
                         else:
                             self.expert_stats[expert_name]['losses'] += 1
 
-                # Обновляем статистику BASE логики
+                # Обновляем статистику BASE логики (основано на финальном решении)
+                # BASE использует p_meta для принятия решения, поэтому проверяем правильность финального решения
+                p_base = snapshot.get('p_meta', 0.5)  # Финальное предсказание базовой логики
                 if 'base' in self.expert_stats:
+                    if position.direction == 'LONG':
+                        base_was_right = (p_base > 0.5 and price_went_up) or (p_base <= 0.5 and not price_went_up)
+                    else:  # SHORT
+                        base_was_right = (p_base < 0.5 and price_went_up) or (p_base >= 0.5 and not price_went_up)
+
                     self.expert_stats['base']['total'] += 1
-                    if is_win:
+                    if base_was_right:
                         self.expert_stats['base']['wins'] += 1
                     else:
                         self.expert_stats['base']['losses'] += 1
 
-                # Обновляем статистику META
+                # Обновляем статистику META (использует то же предсказание что и BASE)
                 if 'meta' in self.expert_stats:
+                    if position.direction == 'LONG':
+                        meta_was_right = (p_base > 0.5 and price_went_up) or (p_base <= 0.5 and not price_went_up)
+                    else:  # SHORT
+                        meta_was_right = (p_base < 0.5 and price_went_up) or (p_base >= 0.5 and not price_went_up)
+
                     self.expert_stats['meta']['total'] += 1
-                    if is_win:
+                    if meta_was_right:
                         self.expert_stats['meta']['wins'] += 1
                     else:
                         self.expert_stats['meta']['losses'] += 1
+
+                # Для META обучения используем старую логику (y_up основан на PnL)
+                y_up = 1 if price_went_up else 0
 
                 # ✅ Формируем полный контекст из snapshot (реальные значения из t0)
                 context = snapshot.get('context', {})
