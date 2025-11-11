@@ -58,7 +58,8 @@ class XGBoostExpert:
         colsample_bytree: float = 0.8,
         reg_alpha: float = 0.1,
         reg_lambda: float = 1.0,
-        random_state: int = 42
+        random_state: int = 42,
+        keep_history: int = 500
     ):
         """
         Args:
@@ -70,6 +71,7 @@ class XGBoostExpert:
             reg_alpha: L1 регуляризация
             reg_lambda: L2 регуляризация
             random_state: Random seed
+            keep_history: Количество последних примеров для переобучения при достижении лимита деревьев
         """
         if not HAVE_XGB:
             raise ImportError("xgboost not installed")
@@ -78,6 +80,7 @@ class XGBoostExpert:
         self.max_depth = max_depth
         self.learning_rate = learning_rate
         self.subsample = subsample
+        self.keep_history = keep_history
         self.colsample_bytree = colsample_bytree
         self.reg_alpha = reg_alpha
         self.reg_lambda = reg_lambda
@@ -87,6 +90,10 @@ class XGBoostExpert:
         self.model = None
         self.is_trained = False
         self.n_features = None
+
+        # История для переобучения (rolling window)
+        self.X_history = []
+        self.y_history = []
 
         # Калибратор вероятностей
         self.calibrator = ProbabilityCalibrator(method='auto') if HAVE_CALIBRATOR else None
@@ -180,7 +187,8 @@ class XGBoostExpert:
         X: np.ndarray,
         y: np.ndarray,
         n_new_trees: int = 10,
-        sample_weight: Optional[np.ndarray] = None
+        sample_weight: Optional[np.ndarray] = None,
+        max_total_trees: int = 200
     ):
         """
         Онлайн обучение - добавляет новые деревья к существующей модели
@@ -190,6 +198,7 @@ class XGBoostExpert:
             y: Новый таргет
             n_new_trees: Количество новых деревьев для добавления
             sample_weight: Веса примеров
+            max_total_trees: Максимальное общее количество деревьев (для предотвращения переобучения)
         """
         if not self.is_trained:
             # Первое обучение
@@ -198,6 +207,27 @@ class XGBoostExpert:
 
         if X.shape[1] != self.n_features:
             raise ValueError(f"Expected {self.n_features} features, got {X.shape[1]}")
+
+        # Добавляем в историю
+        for i in range(len(X)):
+            self.X_history.append(X[i])
+            self.y_history.append(y[i])
+
+        # Ограничиваем размер истории
+        if len(self.X_history) > self.keep_history:
+            self.X_history = self.X_history[-self.keep_history:]
+            self.y_history = self.y_history[-self.keep_history:]
+
+        # Проверяем текущее количество деревьев
+        current_trees = self.model.num_boosted_rounds()
+
+        # Если достигли лимита - переобучаем на накопленной истории
+        if current_trees >= max_total_trees:
+            print(f"[XGBoost] Reached max_total_trees={max_total_trees}, retraining on {len(self.X_history)} recent samples...")
+            X_retrain = np.array(self.X_history)
+            y_retrain = np.array(self.y_history)
+            self.fit(X_retrain, y_retrain, sample_weight=None)
+            return
 
         # Создаем DMatrix
         dtrain = xgb.DMatrix(X, label=y, weight=sample_weight)
@@ -217,11 +247,14 @@ class XGBoostExpert:
             'verbosity': 0
         }
 
+        # Ограничиваем количество новых деревьев чтобы не превысить лимит
+        trees_to_add = min(n_new_trees, max_total_trees - current_trees)
+
         # Добавляем новые деревья к существующей модели
         self.model = xgb.train(
             params=params,
             dtrain=dtrain,
-            num_boost_round=n_new_trees,
+            num_boost_round=trees_to_add,
             xgb_model=self.model,  # Продолжаем с существующей модели
             verbose_eval=False
         )
@@ -320,7 +353,10 @@ class XGBoostExpert:
             'retrain_count': self.retrain_count,
             'model_path': model_path,
             'calibrator': self.calibrator,  # ✅ Сохраняем калибратор
-            'calibration_enabled': self.calibration_enabled
+            'calibration_enabled': self.calibration_enabled,
+            'keep_history': self.keep_history,  # ✅ Сохраняем размер истории
+            'X_history': self.X_history,  # ✅ Сохраняем историю X
+            'y_history': self.y_history   # ✅ Сохраняем историю y
         }
 
         with open(filepath, 'wb') as f:
@@ -341,7 +377,8 @@ class XGBoostExpert:
             colsample_bytree=state['colsample_bytree'],
             reg_alpha=state['reg_alpha'],
             reg_lambda=state['reg_lambda'],
-            random_state=state['random_state']
+            random_state=state['random_state'],
+            keep_history=state.get('keep_history', 500)  # ✅ Загружаем размер истории
         )
 
         # Загружаем состояние
@@ -353,6 +390,10 @@ class XGBoostExpert:
         # ✅ Загружаем калибратор
         expert.calibrator = state.get('calibrator', None)
         expert.calibration_enabled = state.get('calibration_enabled', True)
+
+        # ✅ Загружаем историю для онлайн обучения
+        expert.X_history = state.get('X_history', [])
+        expert.y_history = state.get('y_history', [])
 
         # Загружаем модель
         if state['model_path'] and os.path.exists(state['model_path']):

@@ -1506,10 +1506,10 @@ class BinanceTradingBot:
                     features_2d = features.reshape(1, -1) if features.ndim == 1 else features
                     y_outcome = np.array([y_up])
 
-                    # XGBoost online learning
+                    # XGBoost online learning (с ограничением деревьев)
                     if 'xgb' in self.experts and self.experts['xgb'] is not None:
                         try:
-                            self.experts['xgb'].partial_fit(features_2d, y_outcome, n_new_trees=2)
+                            self.experts['xgb'].partial_fit(features_2d, y_outcome, n_new_trees=2, max_total_trees=200)
                             logger.debug(f"XGBoost trained on {position.symbol}: y_up={y_up}, trees={self.experts['xgb'].model.num_boosted_rounds()}")
                         except Exception as e:
                             logger.error(f"Error training XGBoost: {e}")
