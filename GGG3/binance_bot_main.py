@@ -468,10 +468,8 @@ class BinanceTradingBot:
             # ВАЖНО: p_meta в snapshot - это предсказание от BASE логики (ужасное название!)
             p_base = snapshot.get('p_meta', 0.5) if snapshot else 0.5
             if 'base' in self.expert_stats:
-                if pos.direction == 'LONG':
-                    base_was_right = (p_base > 0.5 and price_went_up) or (p_base <= 0.5 and not price_went_up)
-                else:  # SHORT
-                    base_was_right = (p_base < 0.5 and price_went_up) or (p_base >= 0.5 and not price_went_up)
+                # ✅ ИСПРАВЛЕНИЕ: Логика одинакова для LONG и SHORT, т.к. price_went_up уже учитывает направление
+                base_was_right = (p_base > 0.5 and price_went_up) or (p_base <= 0.5 and not price_went_up)
 
                 self.expert_stats['base']['total'] += 1
                 if base_was_right:
@@ -486,10 +484,8 @@ class BinanceTradingBot:
 
                 if meta_mode == 'ACTIVE' and p_meta_pred is not None:
                     if 'meta' in self.expert_stats:
-                        if pos.direction == 'LONG':
-                            meta_was_right = (p_meta_pred > 0.5 and price_went_up) or (p_meta_pred <= 0.5 and not price_went_up)
-                        else:  # SHORT
-                            meta_was_right = (p_meta_pred < 0.5 and price_went_up) or (p_meta_pred >= 0.5 and not price_went_up)
+                        # ✅ ИСПРАВЛЕНИЕ: Логика одинакова для LONG и SHORT, т.к. price_went_up уже учитывает направление
+                        meta_was_right = (p_meta_pred > 0.5 and price_went_up) or (p_meta_pred <= 0.5 and not price_went_up)
 
                         self.expert_stats['meta']['total'] += 1
                         if meta_was_right:
@@ -1440,10 +1436,8 @@ class BinanceTradingBot:
                 # ВАЖНО: p_meta в snapshot - это предсказание от BASE логики (ужасное название!)
                 p_base = snapshot.get('p_meta', 0.5)  # Финальное предсказание базовой логики
                 if 'base' in self.expert_stats:
-                    if position.direction == 'LONG':
-                        base_was_right = (p_base > 0.5 and price_went_up) or (p_base <= 0.5 and not price_went_up)
-                    else:  # SHORT
-                        base_was_right = (p_base < 0.5 and price_went_up) or (p_base >= 0.5 and not price_went_up)
+                    # ✅ ИСПРАВЛЕНИЕ: Логика одинакова для LONG и SHORT, т.к. price_went_up уже учитывает направление
+                    base_was_right = (p_base > 0.5 and price_went_up) or (p_base <= 0.5 and not price_went_up)
 
                     self.expert_stats['base']['total'] += 1
                     if base_was_right:
@@ -1458,10 +1452,8 @@ class BinanceTradingBot:
                 if meta_mode == 'ACTIVE' and p_meta_pred is not None:
                     # META принимала решение - оцениваем её предсказание
                     if 'meta' in self.expert_stats:
-                        if position.direction == 'LONG':
-                            meta_was_right = (p_meta_pred > 0.5 and price_went_up) or (p_meta_pred <= 0.5 and not price_went_up)
-                        else:  # SHORT
-                            meta_was_right = (p_meta_pred < 0.5 and price_went_up) or (p_meta_pred >= 0.5 and not price_went_up)
+                        # ✅ ИСПРАВЛЕНИЕ: Логика одинакова для LONG и SHORT, т.к. price_went_up уже учитывает направление
+                        meta_was_right = (p_meta_pred > 0.5 and price_went_up) or (p_meta_pred <= 0.5 and not price_went_up)
 
                         self.expert_stats['meta']['total'] += 1
                         if meta_was_right:
