@@ -1,27 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-simplified_ensemble_meta.py — Упрощенная META на основе взвешенного ансамбля
+simplified_ensemble_meta.py — Упрощенная META с контекстными фичами
 
 === АРХИТЕКТУРА ===
-- Простое взвешенное усреднение экспертов: p_final = Σ(w_i × p_i)
-- Phase-specific веса: 6 фаз × 4 эксперта = 24 параметра (вместо 31200)
-- Оптимизация весов через scipy.optimize (быстро, <1 секунда)
+- Ridge регрессия для комбинирования экспертов с учетом контекста
+- Phase-specific модели: 6 фаз × Ridge модель
+- Входные фичи (11): 4 эксперта + 7 контекстных
+  • Эксперты: p_xgb, p_rf, p_arf, p_nn
+  • Контекст: vol_ratio, trend_macd, jump_detected, funding_sign, book_imb, ofi_15s, basis_pct
 - SHADOW/ACTIVE режимы с валидацией
 - ADWIN drift detection
 
 === ПРЕИМУЩЕСТВА ===
-✅ 1300× меньше параметров (24 vs 31200)
-✅ 1800× быстрее обучение (<1s vs 10-30 минут)
-✅ Нет overfitting (24 params / 150 samples = 1:6 ratio)
-✅ Прозрачность (видны веса каждого эксперта)
-✅ Стабильность (простая оптимизация без локальных минимумов)
+✅ META "видит" рынок через контекстные фичи
+✅ Ridge регрессия: быстрая, интерпретируемая, устойчивая к overfitting
+✅ Фичи фиксируются в момент ОТКРЫТИЯ позиции (t0)
+✅ Результат фиксируется в момент ЗАКРЫТИЯ позиции
+✅ Прозрачность (можно анализировать коэффициенты модели)
+✅ Стабильность (L2 регуляризация предотвращает overfitting)
 
 === РЕЖИМЫ ===
 - SHADOW: Обучается на данных, но не влияет на решения
 - ACTIVE: Используется для предсказаний (переключается при WR >= 58%)
 
 Автор: Claude (Anthropic)
-Дата: 2025-11-10
+Дата: 2025-11-11 (Enhanced with context features)
 """
 from __future__ import annotations
 
@@ -34,8 +37,15 @@ from dataclasses import dataclass
 from collections import deque
 
 import numpy as np
-from scipy.optimize import minimize
-from scipy.special import expit as sigmoid
+
+# Scikit-learn для Ridge регрессии
+try:
+    from sklearn.linear_model import Ridge
+    from sklearn.preprocessing import StandardScaler
+    HAVE_SKLEARN = True
+except ImportError:
+    HAVE_SKLEARN = False
+    print("WARNING: sklearn not installed. Install with: pip install scikit-learn")
 
 # ========== ВНЕШНИЕ ЗАВИСИМОСТИ ==========
 
@@ -76,10 +86,28 @@ def _safe_float(v, default=0.5) -> float:
         return default
 
 
-def log_loss(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-15) -> float:
-    """Binary cross-entropy loss"""
-    y_pred = np.clip(y_pred, eps, 1 - eps)
-    return -np.mean(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred))
+def extract_context_features(reg_ctx: Optional[dict]) -> np.ndarray:
+    """
+    Извлекает контекстные фичи из reg_ctx
+
+    Args:
+        reg_ctx: Словарь с контекстными фичами
+
+    Returns:
+        np.ndarray: [vol_ratio, trend_macd, jump_detected, funding_sign, book_imb, ofi_15s, basis_pct]
+    """
+    if reg_ctx is None:
+        reg_ctx = {}
+
+    return np.array([
+        _safe_float(reg_ctx.get('vol_ratio', 1.0), 1.0),
+        _safe_float(reg_ctx.get('trend_macd', 0.0), 0.0),
+        float(reg_ctx.get('jump_detected', False)),  # bool -> 0.0 или 1.0
+        _safe_float(reg_ctx.get('funding_sign', 0.0), 0.0),
+        _safe_float(reg_ctx.get('book_imb', 0.0), 0.0),
+        _safe_float(reg_ctx.get('ofi_15s', 0.0), 0.0),
+        _safe_float(reg_ctx.get('basis_pct', 0.0), 0.0)
+    ])
 
 
 # ========== PHASE-SPECIFIC ENSEMBLE ==========
@@ -87,55 +115,86 @@ def log_loss(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-15) -> floa
 @dataclass
 class PhaseEnsemble:
     """
-    Ансамбль для одной фазы рынка
+    Ансамбль для одной фазы рынка с контекстными фичами
 
-    Веса: [w_xgb, w_rf, w_arf, w_nn]
-    Предсказание: p_final = Σ(w_i × p_i) / Σ(w_i)
+    Модель: Ridge регрессия
+    Входные фичи (11): [p_xgb, p_rf, p_arf, p_nn, vol_ratio, trend_macd, jump_detected,
+                        funding_sign, book_imb, ofi_15s, basis_pct]
+    Выход: p_final (вероятность роста)
     """
     phase: int
-    weights: np.ndarray = None  # [4] веса экспертов
+    model: Optional[Ridge] = None  # Ridge регрессия
+    scaler: Optional[StandardScaler] = None  # Нормализация фич
 
     # Данные для обучения
-    X: List[List[float]] = None  # История предсказаний экспертов
+    X: List[List[float]] = None  # История: [4 эксперта + 7 контекстных фич]
     y: List[int] = None  # История таргетов
 
     # Статистика
     n_samples: int = 0
     n_trained: int = 0
-    last_loss: float = float('inf')
+    last_score: float = 0.0  # R² score
 
     def __post_init__(self):
-        if self.weights is None:
-            # Инициализация: равные веса
-            self.weights = np.array([0.25, 0.25, 0.25, 0.25])
+        if not HAVE_SKLEARN:
+            raise ImportError("sklearn required for context-aware META")
+
+        if self.model is None:
+            # Ridge с L2 регуляризацией
+            self.model = Ridge(alpha=1.0, fit_intercept=True)
+
+        if self.scaler is None:
+            self.scaler = StandardScaler()
 
         if self.X is None:
             self.X = []
         if self.y is None:
             self.y = []
 
-    def predict(self, p_xgb: float, p_rf: float, p_arf: float, p_nn: float) -> float:
+    def predict(
+        self,
+        p_xgb: float,
+        p_rf: float,
+        p_arf: float,
+        p_nn: float,
+        reg_ctx: Optional[dict] = None
+    ) -> float:
         """
-        Взвешенное предсказание
+        Предсказание с учетом контекста
 
         Args:
             p_xgb, p_rf, p_arf, p_nn: Вероятности от экспертов
+            reg_ctx: Контекстные фичи
 
         Returns:
-            p_final: Взвешенная вероятность
+            p_final: Финальная вероятность
         """
-        preds = np.array([
+        # Формируем вектор фич
+        expert_preds = np.array([
             _safe_float(p_xgb, 0.5),
             _safe_float(p_rf, 0.5),
             _safe_float(p_arf, 0.5),
             _safe_float(p_nn, 0.5)
         ])
 
-        # Взвешенное среднее с нормализацией
-        weighted = self.weights * preds
-        p_final = np.sum(weighted) / np.sum(self.weights)
+        context_feats = extract_context_features(reg_ctx)
+        full_features = np.concatenate([expert_preds, context_feats])
 
-        return float(np.clip(p_final, 0.0, 1.0))
+        # Если модель не обучена, возвращаем среднее экспертов
+        if self.n_trained == 0:
+            return float(np.clip(np.mean(expert_preds), 0.0, 1.0))
+
+        try:
+            # Нормализуем и предсказываем
+            X_scaled = self.scaler.transform(full_features.reshape(1, -1))
+            p_final = self.model.predict(X_scaled)[0]
+
+            # Clip в [0, 1]
+            return float(np.clip(p_final, 0.0, 1.0))
+
+        except Exception as e:
+            # Fallback: среднее экспертов
+            return float(np.clip(np.mean(expert_preds), 0.0, 1.0))
 
     def add_sample(
         self,
@@ -143,17 +202,21 @@ class PhaseEnsemble:
         p_rf: float,
         p_arf: float,
         p_nn: float,
+        reg_ctx: Optional[dict],
         y_true: int
     ):
         """Добавить пример для обучения"""
-        preds = [
+        expert_preds = [
             _safe_float(p_xgb, 0.5),
             _safe_float(p_rf, 0.5),
             _safe_float(p_arf, 0.5),
             _safe_float(p_nn, 0.5)
         ]
 
-        self.X.append(preds)
+        context_feats = extract_context_features(reg_ctx).tolist()
+        full_features = expert_preds + context_feats
+
+        self.X.append(full_features)
         self.y.append(int(y_true))
         self.n_samples += 1
 
@@ -163,12 +226,12 @@ class PhaseEnsemble:
             self.X = self.X[-max_history:]
             self.y = self.y[-max_history:]
 
-    def optimize_weights(self, min_samples: int = 50) -> bool:
+    def train_model(self, min_samples: int = 50) -> bool:
         """
-        Оптимизирует веса на основе накопленных данных
+        Обучает Ridge регрессию на накопленных данных
 
         Returns:
-            bool: True если оптимизация прошла успешно
+            bool: True если обучение прошло успешно
         """
         if len(self.X) < min_samples:
             return False
@@ -176,54 +239,42 @@ class PhaseEnsemble:
         X_array = np.array(self.X)
         y_array = np.array(self.y)
 
-        # Objective: minimize log loss
-        def objective(w):
-            # Нормализуем веса
-            w = np.abs(w)
-            w = w / np.sum(w)
-
-            # Взвешенные предсказания
-            y_pred = np.sum(X_array * w, axis=1)
-            y_pred = np.clip(y_pred, 1e-15, 1 - 1e-15)
-
-            # Log loss
-            loss = log_loss(y_array, y_pred)
-
-            return loss
-
         try:
-            # Оптимизация
-            result = minimize(
-                objective,
-                x0=self.weights,
-                method='SLSQP',
-                bounds=[(0.0, 1.0)] * 4,
-                options={'maxiter': 100}
-            )
+            # Нормализуем фичи
+            X_scaled = self.scaler.fit_transform(X_array)
 
-            if result.success:
-                # Обновляем веса
-                new_weights = np.abs(result.x)
-                self.weights = new_weights / np.sum(new_weights)
-                self.last_loss = result.fun
-                self.n_trained += 1
+            # Обучаем Ridge
+            self.model.fit(X_scaled, y_array)
 
-                return True
-            else:
-                return False
+            # Оцениваем качество
+            self.last_score = self.model.score(X_scaled, y_array)
+            self.n_trained += 1
+
+            return True
 
         except Exception as e:
-            print(f"[PhaseEnsemble] Optimization failed for phase {self.phase}: {e}")
+            print(f"[PhaseEnsemble] Training failed for phase {self.phase}: {e}")
             return False
 
-    def get_weight_dict(self) -> Dict[str, float]:
-        """Возвращает веса как dict для читаемости"""
-        return {
-            'xgb': float(self.weights[0]),
-            'rf': float(self.weights[1]),
-            'arf': float(self.weights[2]),
-            'nn': float(self.weights[3])
-        }
+    def get_feature_importance(self) -> Dict[str, float]:
+        """
+        Возвращает важность фич (коэффициенты Ridge)
+
+        Returns:
+            Dict с важностью каждой фичи
+        """
+        if self.n_trained == 0:
+            return {}
+
+        feature_names = [
+            'xgb', 'rf', 'arf', 'nn',
+            'vol_ratio', 'trend_macd', 'jump_detected',
+            'funding_sign', 'book_imb', 'ofi_15s', 'basis_pct'
+        ]
+
+        coefs = self.model.coef_
+
+        return {name: float(coef) for name, coef in zip(feature_names, coefs)}
 
 
 # ========== SIMPLIFIED ENSEMBLE META ==========
@@ -289,12 +340,12 @@ class SimplifiedEnsembleMETA:
         reg_ctx: Optional[dict] = None
     ) -> Optional[float]:
         """
-        Предсказание финальной вероятности
+        Предсказание финальной вероятности с учетом контекста
 
         Args:
             p_xgb, p_rf, p_arf, p_nn: Вероятности от экспертов
             p_base: Вероятность от BASE логики (не используется)
-            reg_ctx: Контекст с фазой рынка
+            reg_ctx: Контекст с фазой рынка и контекстными фичами
 
         Returns:
             p_final: Финальная вероятность или None
@@ -317,9 +368,9 @@ class SimplifiedEnsembleMETA:
                 return None
             return float(np.clip(np.mean(preds), 0.0, 1.0))
 
-        # Взвешенное предсказание
+        # Предсказание с учетом контекста
         try:
-            p_final = ensemble.predict(p_xgb, p_rf, p_arf, p_nn)
+            p_final = ensemble.predict(p_xgb, p_rf, p_arf, p_nn, reg_ctx)
             return p_final
         except Exception as e:
             print(f"[SimplifiedMETA] Prediction error: {e}")
@@ -343,12 +394,12 @@ class SimplifiedEnsembleMETA:
         Записывает результат и триггерит обучение
 
         Args:
-            p_xgb, p_rf, p_arf, p_nn: Вероятности от экспертов
+            p_xgb, p_rf, p_arf, p_nn: Вероятности от экспертов (из t0)
             p_base: BASE логика (не используется)
-            y_up: Фактический результат (0 или 1)
+            y_up: Фактический результат (0 или 1) (из момента закрытия)
             used_in_live: Использовался ли в живой торговле
             p_final_used: Финальная вероятность (для метрик)
-            reg_ctx: Контекст
+            reg_ctx: Контекст с фазой и контекстными фичами (из t0)
         """
         try:
             ph = phase_from_ctx(reg_ctx)
@@ -357,8 +408,8 @@ class SimplifiedEnsembleMETA:
             if ensemble is None:
                 return
 
-            # Добавляем пример
-            ensemble.add_sample(p_xgb, p_rf, p_arf, p_nn, y_up)
+            # Добавляем пример с контекстными фичами
+            ensemble.add_sample(p_xgb, p_rf, p_arf, p_nn, reg_ctx, y_up)
             self.seen_ph[ph] += 1
             self.new_since_train_ph[ph] += 1
 
@@ -366,10 +417,10 @@ class SimplifiedEnsembleMETA:
             if p_final_used is not None:
                 p_for_gate = p_final_used
             else:
-                # Предсказываем на основе текущих весов
+                # Предсказываем на основе текущей модели
                 min_ready = int(getattr(self.cfg, "meta_min_ready", 80))
                 if self.seen_ph[ph] >= min_ready:
-                    p_for_gate = ensemble.predict(p_xgb, p_rf, p_arf, p_nn)
+                    p_for_gate = ensemble.predict(p_xgb, p_rf, p_arf, p_nn, reg_ctx)
                 else:
                     preds = [p for p in [p_xgb, p_rf, p_arf, p_nn] if p is not None]
                     p_for_gate = float(np.mean(preds)) if preds else 0.5
@@ -420,9 +471,9 @@ class SimplifiedEnsembleMETA:
 
     def _train_phase(self, ph: int):
         """
-        Обучение ансамбля для одной фазы
+        Обучение Ridge модели для одной фазы
 
-        Очень быстро: scipy.optimize за <1 секунду
+        Быстро: Ridge регрессия за <1 секунду
         """
         ensemble = self.ensembles.get(ph)
         if ensemble is None:
@@ -435,19 +486,24 @@ class SimplifiedEnsembleMETA:
         print(f"[SimplifiedMETA] 🎯 Training phase {ph} ({ensemble.n_samples} samples)")
 
         try:
-            # Оптимизация весов
-            success = ensemble.optimize_weights(min_samples=min_samples)
+            # Обучение Ridge модели
+            success = ensemble.train_model(min_samples=min_samples)
 
             if success:
-                weights = ensemble.get_weight_dict()
-                print(f"[SimplifiedMETA] ✅ Phase {ph} trained: "
-                      f"XGB={weights['xgb']:.3f}, RF={weights['rf']:.3f}, "
-                      f"ARF={weights['arf']:.3f}, NN={weights['nn']:.3f}, "
-                      f"Loss={ensemble.last_loss:.4f}")
+                # Выводим feature importance
+                importance = ensemble.get_feature_importance()
+                print(f"[SimplifiedMETA] ✅ Phase {ph} trained (R²={ensemble.last_score:.3f}):")
+                print(f"    Experts: XGB={importance.get('xgb', 0):.3f}, "
+                      f"RF={importance.get('rf', 0):.3f}, "
+                      f"ARF={importance.get('arf', 0):.3f}, "
+                      f"NN={importance.get('nn', 0):.3f}")
+                print(f"    Context: vol_ratio={importance.get('vol_ratio', 0):.3f}, "
+                      f"book_imb={importance.get('book_imb', 0):.3f}, "
+                      f"funding={importance.get('funding_sign', 0):.3f}")
 
                 self.new_since_train_ph[ph] = 0
             else:
-                print(f"[SimplifiedMETA] ⚠️ Phase {ph} optimization failed")
+                print(f"[SimplifiedMETA] ⚠️ Phase {ph} training failed")
 
         except Exception as e:
             print(f"[SimplifiedMETA] ❌ Training failed for phase {ph}: {e}")
@@ -506,34 +562,57 @@ class SimplifiedEnsembleMETA:
         }
 
     def get_phase_weights(self, ph: int) -> Optional[Dict[str, float]]:
-        """Возвращает веса для конкретной фазы"""
+        """
+        Возвращает feature importance для конкретной фазы
+
+        УСТАРЕЛО: Используйте get_phase_importance() для новой версии
+        """
+        return self.get_phase_importance(ph)
+
+    def get_phase_importance(self, ph: int) -> Optional[Dict[str, float]]:
+        """Возвращает важность фич для конкретной фазы"""
         ensemble = self.ensembles.get(ph)
         if ensemble is None:
             return None
-        return ensemble.get_weight_dict()
+        return ensemble.get_feature_importance()
 
     # ========== СОХРАНЕНИЕ/ЗАГРУЗКА ==========
 
     def _save(self):
-        """Сохранение состояния"""
+        """Сохранение состояния (модели + метаданные)"""
         try:
-            # Собираем веса всех ансамблей
+            import pickle
+
+            # Сохраняем каждую модель отдельно (бинарные данные)
+            models_dir = os.path.dirname(self.state_path)
+            os.makedirs(models_dir, exist_ok=True)
+
             ensembles_state = {}
             for ph, ens in self.ensembles.items():
+                # Сохраняем Ridge модель и scaler
+                model_path = os.path.join(models_dir, f"meta_phase_{ph}.pkl")
+                with open(model_path, 'wb') as f:
+                    pickle.dump({
+                        'model': ens.model,
+                        'scaler': ens.scaler
+                    }, f)
+
                 ensembles_state[str(ph)] = {
-                    'weights': ens.weights.tolist(),
+                    'model_path': model_path,
                     'n_samples': ens.n_samples,
                     'n_trained': ens.n_trained,
-                    'last_loss': ens.last_loss
+                    'last_score': ens.last_score
                 }
 
+            # Метаданные в JSON
             state = {
+                'version': '2.0',  # Новая версия с Ridge
                 'mode': self.mode,
                 'enabled': self.enabled,
                 'ensembles': ensembles_state,
                 'seen_ph': self.seen_ph,
                 'new_since_train_ph': self.new_since_train_ph,
-                'active_hits': self.active_hits[-500:],  # Сохраняем последние 500
+                'active_hits': self.active_hits[-500:],
                 'shadow_hits': self.shadow_hits[-500:]
             }
 
@@ -541,13 +620,17 @@ class SimplifiedEnsembleMETA:
 
         except Exception as e:
             print(f"[SimplifiedMETA] Save error: {e}")
+            traceback.print_exc()
 
     def _load(self):
-        """Загрузка состояния"""
+        """Загрузка состояния (модели + метаданные)"""
         try:
+            import pickle
+
             with open(self.state_path, "r", encoding="utf-8") as f:
                 state = json.load(f)
 
+            version = state.get("version", "1.0")
             self.mode = state.get("mode", "SHADOW")
             self.enabled = state.get("enabled", True)
 
@@ -556,21 +639,41 @@ class SimplifiedEnsembleMETA:
             for p_str, ens_data in ensembles_state.items():
                 ph = int(p_str)
                 if ph in self.ensembles:
-                    self.ensembles[ph].weights = np.array(ens_data.get('weights', [0.25]*4))
+                    # Загружаем модель
+                    if version == "2.0" and 'model_path' in ens_data:
+                        model_path = ens_data['model_path']
+                        if os.path.exists(model_path):
+                            with open(model_path, 'rb') as f:
+                                model_data = pickle.load(f)
+                                self.ensembles[ph].model = model_data['model']
+                                self.ensembles[ph].scaler = model_data['scaler']
+                        else:
+                            print(f"[SimplifiedMETA] ⚠️ Model file not found for phase {ph}: {model_path}")
+                    elif 'weights' in ens_data:
+                        # Старая версия (v1.0) - игнорируем веса, т.к. теперь используем Ridge
+                        print(f"[SimplifiedMETA] ⚠️ Phase {ph}: old format detected, will retrain")
+
+                    # Метаданные
                     self.ensembles[ph].n_samples = ens_data.get('n_samples', 0)
                     self.ensembles[ph].n_trained = ens_data.get('n_trained', 0)
-                    self.ensembles[ph].last_loss = ens_data.get('last_loss', float('inf'))
+                    self.ensembles[ph].last_score = ens_data.get('last_score', 0.0)
 
             self.seen_ph = state.get("seen_ph", {ph: 0 for ph in range(6)})
+            # Преобразуем ключи в int
+            self.seen_ph = {int(k): v for k, v in self.seen_ph.items()}
+
             self.new_since_train_ph = state.get("new_since_train_ph", {ph: 0 for ph in range(6)})
+            self.new_since_train_ph = {int(k): v for k, v in self.new_since_train_ph.items()}
+
             self.active_hits = state.get("active_hits", [])
             self.shadow_hits = state.get("shadow_hits", [])
 
-            print(f"[SimplifiedMETA] ✅ Loaded state: mode={self.mode}, "
+            print(f"[SimplifiedMETA] ✅ Loaded state: version={version}, mode={self.mode}, "
                   f"samples={sum(self.seen_ph.values())}")
 
         except Exception as e:
             print(f"[SimplifiedMETA] Load error: {e}")
+            traceback.print_exc()
 
 
 # ========== ТЕСТИРОВАНИЕ ==========
@@ -608,13 +711,28 @@ if __name__ == "__main__":
         p_arf = p_xgb + np.random.normal(0, 0.15)
         p_nn = p_xgb + np.random.normal(0, 0.12)
 
-        # Таргет коррелирован с экспертами
-        p_true = (p_xgb + p_rf + p_arf + p_nn) / 4.0
-        y_up = int(p_true > 0.5)
-
-        # Фаза
+        # Генерируем контекстные фичи
         ph = i % 6
-        reg_ctx = {"phase": ph}
+        reg_ctx = {
+            "phase": ph,
+            "vol_ratio": np.random.uniform(0.8, 1.2),
+            "trend_macd": np.random.uniform(-0.1, 0.1),
+            "jump_detected": np.random.choice([True, False], p=[0.1, 0.9]),
+            "funding_sign": np.random.uniform(-0.01, 0.01),
+            "book_imb": np.random.uniform(-0.05, 0.05),
+            "ofi_15s": np.random.uniform(-100, 100),
+            "basis_pct": np.random.uniform(-0.001, 0.001)
+        }
+
+        # Таргет коррелирован с экспертами + контекстом
+        p_true = (p_xgb + p_rf + p_arf + p_nn) / 4.0
+        # Добавляем влияние контекста
+        if reg_ctx['vol_ratio'] > 1.1:
+            p_true += 0.05  # Высокая волатильность -> выше шанс роста
+        if reg_ctx['book_imb'] > 0:
+            p_true += reg_ctx['book_imb']  # Order book imbalance влияет
+
+        y_up = int(p_true > 0.5)
 
         # Предсказание
         p_final = meta.predict(p_xgb, p_rf, p_arf, p_nn, 0.5, reg_ctx)
@@ -630,13 +748,18 @@ if __name__ == "__main__":
     for key, value in status.items():
         print(f"   {key}: {value}")
 
-    # Веса по фазам
-    print("\n4. Веса ансамблей по фазам...")
+    # Feature importance по фазам
+    print("\n4. Feature importance по фазам...")
     for ph in range(6):
-        weights = meta.get_phase_weights(ph)
-        if weights:
-            print(f"   Phase {ph}: XGB={weights['xgb']:.3f}, RF={weights['rf']:.3f}, "
-                  f"ARF={weights['arf']:.3f}, NN={weights['nn']:.3f}")
+        importance = meta.get_phase_importance(ph)
+        if importance:
+            print(f"   Phase {ph}:")
+            print(f"      Experts: XGB={importance.get('xgb', 0):.3f}, "
+                  f"RF={importance.get('rf', 0):.3f}, "
+                  f"ARF={importance.get('arf', 0):.3f}, "
+                  f"NN={importance.get('nn', 0):.3f}")
+            print(f"      Context: vol_ratio={importance.get('vol_ratio', 0):.3f}, "
+                  f"book_imb={importance.get('book_imb', 0):.3f}")
 
     # Сохранение
     print("\n5. Сохранение...")
