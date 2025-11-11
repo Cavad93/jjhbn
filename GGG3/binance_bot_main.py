@@ -756,6 +756,10 @@ class BinanceTradingBot:
         last_4h_check = 0
         last_5m_check = 0
 
+        # ✅ ЗАЩИТА ОТ INFINITE LOOP
+        MAX_CONSECUTIVE_ERRORS = 10
+        consecutive_errors = 0
+
         while True:
             try:
                 current_time = time.time()
@@ -788,15 +792,46 @@ class BinanceTradingBot:
                 # Пауза
                 time.sleep(60)
 
+                # ✅ Сброс счётчика ошибок при успехе
+                consecutive_errors = 0
+
             except KeyboardInterrupt:
                 print("\n\n⚠️  Stopping bot...")
                 self.shutdown()
                 break
 
             except Exception as e:
-                logger.error(f"ERROR in main loop: {e}", exc_info=True)
-                print(f"\n❌ ERROR: {e}")
-                time.sleep(300)
+                consecutive_errors += 1
+                logger.error(f"ERROR in main loop ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}", exc_info=True)
+                print(f"\n❌ ERROR ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}")
+
+                # ✅ КРИТИЧЕСКАЯ ЗАЩИТА: Останавливаем бота при слишком многих ошибках
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    logger.critical(f"⚠️  TOO MANY CONSECUTIVE ERRORS ({consecutive_errors}) - STOPPING BOT FOR SAFETY")
+                    print(f"\n{'='*80}")
+                    print(f"🛑 CRITICAL: {consecutive_errors} consecutive errors detected!")
+                    print(f"🛑 Bot stopped to prevent infinite error loop")
+                    print(f"🛑 Please check logs and fix the issue before restarting")
+                    print(f"{'='*80}\n")
+
+                    # Отправляем Telegram уведомление если доступно
+                    if hasattr(self, 'telegram') and self.telegram:
+                        try:
+                            self.telegram.send_message(
+                                f"🛑 BOT STOPPED: {consecutive_errors} consecutive errors\n"
+                                f"Last error: {str(e)[:200]}\n"
+                                f"Check logs immediately!"
+                            )
+                        except:
+                            pass
+
+                    self.shutdown()
+                    break
+
+                # Exponential backoff для ретраев
+                sleep_time = min(300, 30 * (2 ** (consecutive_errors - 1)))
+                print(f"⏳ Waiting {sleep_time}s before retry...")
+                time.sleep(sleep_time)
 
     # ========================================================================
     # PORTFOLIO REBALANCING
@@ -878,6 +913,42 @@ class BinanceTradingBot:
         # ═══════════════════════════════════════════════════════════════════════
         # ОПТИМИЗАЦИЯ: Один проход для топ-20, экономия ~30-60 минут!
         # ═══════════════════════════════════════════════════════════════════════
+        # ✅ ОПТИМИЗАЦИЯ: Предзагрузка OHLCV данных параллельно (ускорение 8-10x)
+        # ═══════════════════════════════════════════════════════════════════════
+        print(f"\n📥 Fetching OHLCV data in parallel for {len(all_pairs)} pairs...", flush=True)
+        ohlcv_cache = {}
+
+        # Подготовка batch запросов
+        batch_requests = []
+        for symbol in all_pairs:
+            batch_requests.append((symbol, '5m', 200))
+            batch_requests.append((symbol, '15m', 200))
+            batch_requests.append((symbol, '30m', 200))
+            batch_requests.append((symbol, '4h', 100))
+
+        # Параллельное получение данных (8-10x ускорение)
+        import time as time_module
+        start_time = time_module.time()
+
+        if hasattr(self.exchange, 'get_ohlcv_batch'):
+            # Используем batch метод если доступен
+            ohlcv_cache = self.exchange.get_ohlcv_batch(batch_requests, max_workers=10)
+            elapsed = time_module.time() - start_time
+            print(f"✅ OHLCV data fetched in {elapsed:.1f}s (parallel mode)", flush=True)
+        else:
+            # Fallback на синхронный режим
+            print(f"⚠️  Batch mode unavailable, using sequential fetch", flush=True)
+
+        # Создаём обёрнутую функцию get_ohlcv с кешем
+        def get_ohlcv_cached(symbol, timeframe, limit):
+            """Обёртка которая использует предзагруженные данные"""
+            if symbol in ohlcv_cache and timeframe in ohlcv_cache[symbol]:
+                return ohlcv_cache[symbol][timeframe]
+            else:
+                # Fallback на прямой вызов если нет в кеше
+                return self.exchange.get_ohlcv(symbol, timeframe, limit)
+
+        # ═══════════════════════════════════════════════════════════════════════
         # Сканируем рынок ОДИН РАЗ для получения топ-20 возможностей
         # Затем используем:
         #   - Все 20 для решений о закрытии существующих позиций
@@ -886,7 +957,7 @@ class BinanceTradingBot:
         top_20_opportunities = self.coin_selector.select_top_coins(
             all_pairs=all_pairs,
             get_ticker_func=lambda s: self.exchange.get_ticker(s),
-            get_ohlcv_func=lambda s, tf, lim: self.exchange.get_ohlcv(s, tf, lim),
+            get_ohlcv_func=get_ohlcv_cached,  # ✅ Используем кешированную версию
             feature_builder=self.feature_builder,
             calculate_atr_func=calculate_atr,
             calculate_phase_func=detect_market_phase,
