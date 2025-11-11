@@ -383,10 +383,10 @@ class BinanceTradingBot:
                 print(f"    ✓ NeuralNet (online, {experts['nn'].train_epochs} epochs)")
             except Exception as e:
                 print(f"    ⚠ NeuralNet load failed: {e}, creating new")
-                experts['nn'] = NeuralNetworkExpert(input_dim=68, hidden_dims=[64, 32], dropout=0.2, learning_rate=0.001)
+                experts['nn'] = NeuralNetworkExpert(input_dim=68, dropout=0.2, learning_rate=0.001)
                 print(f"    ✓ NeuralNet (new, online learning)")
         else:
-            experts['nn'] = NeuralNetworkExpert(input_dim=68, hidden_dims=[64, 32], dropout=0.2, learning_rate=0.001)
+            experts['nn'] = NeuralNetworkExpert(input_dim=68, dropout=0.2, learning_rate=0.001)
             print(f"    ✓ NeuralNet (new, online learning)")
 
         # Adaptive RF - третий эксперт с другими параметрами
