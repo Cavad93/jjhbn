@@ -1108,6 +1108,47 @@ def analyze_and_rank_top20(
                 f"final={opp['final_score']:.3f} (tech={confidence:.3f} below threshold)"
             )
 
+        # ════════════════════════════════════════════════════════════════
+        # ✅ ВАРИАНТ 1: SENTIMENT КАК БУСТЕР/ШТРАФ
+        # ════════════════════════════════════════════════════════════════
+        # Применяем модификатор на основе sentiment:
+        # - Сильный позитивный sentiment (+0.5 до +1.0) → бонус +5% до +10%
+        # - Нейтральный sentiment (около 0.0) → без изменений
+        # - Сильный негативный sentiment (-1.0 до -0.5) → штраф -10% до -5%
+        # ════════════════════════════════════════════════════════════════
+        sentiment = opp.get('haiku_sentiment', 0.0)
+        base_score = opp['final_score']
+
+        # Модификатор: 1.0 + (sentiment * 0.1)
+        # При sentiment = +1.0 → modifier = 1.1 (бонус +10%)
+        # При sentiment = +0.5 → modifier = 1.05 (бонус +5%)
+        # При sentiment = 0.0 → modifier = 1.0 (без изменений)
+        # При sentiment = -0.5 → modifier = 0.95 (штраф -5%)
+        # При sentiment = -1.0 → modifier = 0.9 (штраф -10%)
+        sentiment_modifier = 1.0 + (sentiment * 0.1)
+
+        # Применяем модификатор
+        opp['final_score'] = base_score * sentiment_modifier
+
+        # Определяем sentiment label для логирования
+        if sentiment < -0.3:
+            sentiment_label = 'BEARISH📉'
+            impact = 'penalty'
+        elif sentiment > 0.3:
+            sentiment_label = 'BULLISH📈'
+            impact = 'boost'
+        else:
+            sentiment_label = 'NEUTRAL➡️'
+            impact = 'none'
+
+        # Логируем влияние sentiment
+        if abs(sentiment) > 0.05:  # Логируем только если есть значимый sentiment
+            logger.debug(
+                f"[SentimentBoost] {opp['symbol']}: sent={sentiment:+.2f} ({sentiment_label}) "
+                f"base={base_score:.4f} → final={opp['final_score']:.4f} "
+                f"(modifier={sentiment_modifier:.3f}x, {impact})"
+            )
+
         filtered.append(opp)
 
     # 3. Сортировка по EV (как в оригинале)
