@@ -87,6 +87,7 @@ class HaikuConfig:
 
     # Стоимость
     ESTIMATED_COST_PER_BATCH = 0.0135  # $0.0135 за batch из 5 монет
+    MONTHLY_BUDGET_USD = 30.0  # ✅ Месячный бюджет не более $30
 
     # Скоринг
     SCORE_THRESHOLD_REJECT = 0.4  # Ниже этого - отклонение
@@ -414,9 +415,9 @@ class HaikuAnalyzer:
     """
 
     # Системный промпт (будет закэширован Anthropic API)
-    SYSTEM_PROMPT = """You are a crypto fundamental analyst. Analyze coins for critical signals.
+    SYSTEM_PROMPT = """You are a crypto fundamental analyst. Analyze coins for critical signals AND market sentiment.
 
-Task: Check each coin for RED FLAGS and POSITIVE CATALYSTS.
+Task: Check each coin for RED FLAGS, POSITIVE CATALYSTS, and SENTIMENT.
 
 RED FLAGS (score < 0.4):
 - SEC lawsuits/investigations
@@ -431,6 +432,14 @@ POSITIVE CATALYSTS (score > 0.6):
 - Institutional adoption news
 
 NEUTRAL (0.4-0.6): No significant news
+
+SENTIMENT ANALYSIS (-1.0 to +1.0):
+- Analyze overall market sentiment from news
+- -1.0: Very bearish (panic, fear, massive FUD)
+- -0.5: Bearish (negative news, concerns)
+-  0.0: Neutral (mixed or no clear sentiment)
+- +0.5: Bullish (positive news, optimism)
+- +1.0: Very bullish (euphoria, major hype)
 
 Output: JSON only, no explanations."""
 
@@ -642,6 +651,7 @@ Output: JSON only, no explanations."""
                 # Используем только технический скор
                 opp['haiku_score'] = opp['p_up']
                 opp['haiku_critical'] = False
+                opp['haiku_sentiment'] = 0.0  # ✅ Нейтральный sentiment для пропущенных
                 opp['haiku_reason'] = "skipped: weak signal"
                 results.append(opp)
                 self.stats['fallback_used'] += 1
@@ -697,6 +707,7 @@ Output: JSON only, no explanations."""
                 for opp in batch:
                     opp['haiku_score'] = opp['p_up']
                     opp['haiku_critical'] = False
+                    opp['haiku_sentiment'] = 0.0  # ✅ Нейтральный sentiment при ошибке
                     opp['haiku_reason'] = f"api_error: {str(e)[:50]}"
                     results.append(opp)
                     self.stats['fallback_used'] += 1
@@ -716,6 +727,27 @@ Output: JSON only, no explanations."""
         Returns:
             Список результатов анализа
         """
+        # ════════════════════════════════════════════════════════════════
+        # BUDGET CHECK: Проверяем не превышен ли месячный бюджет
+        # ════════════════════════════════════════════════════════════════
+        current_cost = self.stats['total_cost_usd']
+        estimated_cost = HaikuConfig.ESTIMATED_COST_PER_BATCH
+
+        if current_cost + estimated_cost > HaikuConfig.MONTHLY_BUDGET_USD:
+            logger.error(
+                f"[HaikuAnalyzer] ⚠️  BUDGET EXCEEDED: ${current_cost:.2f} + ${estimated_cost:.4f} "
+                f"> ${HaikuConfig.MONTHLY_BUDGET_USD:.2f} monthly limit"
+            )
+            raise RuntimeError(
+                f"Monthly budget of ${HaikuConfig.MONTHLY_BUDGET_USD:.2f} exceeded. "
+                f"Current: ${current_cost:.2f}, estimated next: ${estimated_cost:.4f}"
+            )
+
+        logger.debug(
+            f"[HaikuAnalyzer] Budget OK: ${current_cost:.2f} + ${estimated_cost:.4f} "
+            f"= ${current_cost + estimated_cost:.2f} / ${HaikuConfig.MONTHLY_BUDGET_USD:.2f}"
+        )
+
         # ════════════════════════════════════════════════════════════════
         # RATE LIMITING: Проверяем и ждём если превышен лимит
         # ════════════════════════════════════════════════════════════════
@@ -818,7 +850,7 @@ Output: JSON only, no explanations."""
 
         lines.append("")
         lines.append("JSON format:")
-        lines.append('[{"symbol":"BTCUSDT","score":0.75,"critical":false,"reason":"positive partnership"},...]')
+        lines.append('[{"symbol":"BTCUSDT","score":0.75,"critical":false,"sentiment":0.6,"reason":"positive partnership"},...]')
 
         prompt = "\n".join(lines)
         prompt_length = len(prompt)
@@ -874,7 +906,11 @@ Output: JSON only, no explanations."""
             for i, item in enumerate(parsed):
                 score = float(item.get('score', 0.5))
                 critical = bool(item.get('critical', False))
+                sentiment = float(item.get('sentiment', 0.0))  # ✅ Извлекаем sentiment
                 reason = item.get('reason', '')[:50]  # Максимум 50 символов
+
+                # Нормализуем sentiment в диапазон [-1, 1]
+                sentiment = max(-1.0, min(1.0, sentiment))
 
                 # Обновляем статистику решений
                 if score < HaikuConfig.SCORE_THRESHOLD_REJECT:
@@ -887,14 +923,24 @@ Output: JSON only, no explanations."""
                     self.stats['decisions']['neutral'] += 1
                     decision = 'NEUTRAL'
 
+                # Определяем sentiment label для логов
+                if sentiment < -0.3:
+                    sentiment_label = 'BEARISH'
+                elif sentiment > 0.3:
+                    sentiment_label = 'BULLISH'
+                else:
+                    sentiment_label = 'NEUTRAL'
+
                 logger.debug(
                     f"  [{i+1}/{len(parsed)}] {item.get('symbol', 'UNKNOWN')}: "
-                    f"score={score:.2f} ({decision}), critical={critical}, reason='{reason}'"
+                    f"score={score:.2f} ({decision}), sentiment={sentiment:+.2f} ({sentiment_label}), "
+                    f"critical={critical}, reason='{reason}'"
                 )
 
                 results.append({
                     'haiku_score': score,
                     'haiku_critical': critical,
+                    'haiku_sentiment': sentiment,  # ✅ Добавляем sentiment
                     'haiku_reason': reason
                 })
 
@@ -910,6 +956,7 @@ Output: JSON only, no explanations."""
                 {
                     'haiku_score': 0.5,
                     'haiku_critical': False,
+                    'haiku_sentiment': 0.0,  # ✅ Нейтральный sentiment
                     'haiku_reason': f'parse_error: {str(e)[:30]}'
                 }
                 for _ in batch
@@ -1073,9 +1120,18 @@ def analyze_and_rank_top20(
 
     # Логируем результаты
     for i, opp in enumerate(top_10, 1):
+        sentiment = opp.get('haiku_sentiment', 0.0)
+        if sentiment < -0.3:
+            sentiment_emoji = '📉'
+        elif sentiment > 0.3:
+            sentiment_emoji = '📈'
+        else:
+            sentiment_emoji = '➡️'
+
         logger.info(
             f"  {i:2d}. {opp['symbol']:<12} {opp['direction']:<6} "
             f"tech={opp['p_up']:.3f} fund={opp.get('haiku_score', 0):.3f} "
+            f"sent={sentiment:+.2f}{sentiment_emoji} "
             f"EV={opp['ev']:.4f} ({opp.get('haiku_reason', 'n/a')})"
         )
 
