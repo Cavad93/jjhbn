@@ -682,7 +682,10 @@ Telegram уведомления работают корректно!
                     if command in self.command_handlers:
                         try:
                             response_text = self.command_handlers[command]()
-                            self._send_message(response_text)
+                            # Отправляем сообщение только если есть текст
+                            # (обработчик может сам отправить сообщение и вернуть пустую строку)
+                            if response_text:
+                                self._send_message(response_text)
                         except Exception as e:
                             logger.error(f"Error handling command /{command}: {e}", exc_info=True)
                             self._send_message(f"❌ Ошибка при выполнении команды /{command}: {str(e)}")
