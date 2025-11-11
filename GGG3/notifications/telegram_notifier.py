@@ -685,6 +685,28 @@ Telegram уведомления работают корректно!
     # DETAILED STATUS REPORT (для команды /status)
     # ========================================================================
 
+    def _safe_format_number(self, value: float, format_str: str = ".2f", default: str = "N/A") -> str:
+        """
+        Безопасное форматирование числа, обрабатывает inf/nan
+
+        Args:
+            value: число для форматирования
+            format_str: строка формата (например, ".2f", "+.2f")
+            default: значение по умолчанию для inf/nan
+
+        Returns:
+            Отформатированная строка
+        """
+        import math
+
+        if value is None or math.isnan(value) or math.isinf(value):
+            return default
+
+        try:
+            return f"{value:{format_str}}"
+        except (ValueError, TypeError):
+            return default
+
     def notify_status_report(self, status_data: Dict) -> bool:
         """
         Отправка подробного отчета о статусе бота
@@ -742,15 +764,26 @@ Telegram уведомления работают корректно!
                 dir_emoji = "🟢" if direction == "LONG" else "🔴"
                 pnl_emoji = "✅" if pnl_usdt >= 0 else "❌"
 
+                # Безопасное форматирование чисел
+                entry_str = self._safe_format_number(entry_price, ".4f")
+                current_str = self._safe_format_number(current_price, ".4f")
+                pnl_usdt_str = self._safe_format_number(pnl_usdt, "+.2f")
+                pnl_pct_str = self._safe_format_number(pnl_pct, "+.2f")
+                pos_value_str = self._safe_format_number(position_value, ".2f")
+                tp_str = self._safe_format_number(tp_price, ".4f")
+                sl_str = self._safe_format_number(sl_price, ".4f")
+
                 text += f"\n{i}. {dir_emoji} <b>{symbol}</b> {direction}\n"
-                text += f"   Вход: ${entry_price:.4f} | Сейчас: ${current_price:.4f}\n"
-                text += f"   {pnl_emoji} PnL: ${pnl_usdt:+.2f} ({pnl_pct:+.2f}%)\n"
-                text += f"   Размер: ${position_value:.2f} | TP: ${tp_price:.4f} | SL: ${sl_price:.4f}\n"
+                text += f"   Вход: ${entry_str} | Сейчас: ${current_str}\n"
+                text += f"   {pnl_emoji} PnL: ${pnl_usdt_str} ({pnl_pct_str}%)\n"
+                text += f"   Размер: ${pos_value_str} | TP: ${tp_str} | SL: ${sl_str}\n"
                 text += f"   Время: {duration}\n"
 
             # Итого по открытым позициям
             total_emoji = "✅" if total_unrealized_pnl >= 0 else "❌"
-            text += f"\n{total_emoji} <b>Итого нереализованный PnL: ${total_unrealized_pnl:+.2f} ({total_unrealized_pnl_pct:+.2f}%)</b>\n"
+            total_pnl_str = self._safe_format_number(total_unrealized_pnl, "+.2f")
+            total_pnl_pct_str = self._safe_format_number(total_unrealized_pnl_pct, "+.2f")
+            text += f"\n{total_emoji} <b>Итого нереализованный PnL: ${total_pnl_str} ({total_pnl_pct_str}%)</b>\n"
         else:
             text += "<b>🔓 ОТКРЫТЫЕ ПОЗИЦИИ</b>\nНет открытых позиций\n"
 
@@ -776,9 +809,16 @@ Telegram уведомления работают корректно!
             text += f"\n<b>📊 ИЗМЕНЕНИЯ КАПИТАЛА</b>\n"
             for period_name, data in period_changes.items():
                 if data.get('available'):
-                    sign = "+" if data['absolute'] >= 0 else ""
-                    emoji = "📈" if data['absolute'] >= 0 else "📉"
-                    text += f"  {emoji} {period_name}: {sign}${data['absolute']:.2f} ({sign}{data['percent']:.2f}%)\n"
+                    absolute_val = data['absolute']
+                    percent_val = data['percent']
+                    sign = "+" if absolute_val >= 0 else ""
+                    emoji = "📈" if absolute_val >= 0 else "📉"
+
+                    # Безопасное форматирование
+                    abs_str = self._safe_format_number(absolute_val, ".2f")
+                    pct_str = self._safe_format_number(percent_val, ".2f")
+
+                    text += f"  {emoji} {period_name}: {sign}${abs_str} ({sign}{pct_str}%)\n"
 
         # ═══════════════════════════════════════════════════════════════
         # РАЗДЕЛ 3: ТОРГОВАЯ СТАТИСТИКА
@@ -789,12 +829,18 @@ Telegram уведомления работают корректно!
         daily_pnl = status_data.get('daily_pnl', 0.0)
         closed_today = status_data.get('closed_trades_today', 0)
 
+        # Безопасное форматирование win rate
+        win_rate_pct = win_rate * 100 if win_rate is not None else 0
+        win_rate_str = self._safe_format_number(win_rate_pct, ".1f", "0.0")
+        realized_pnl_str = self._safe_format_number(total_realized_pnl, "+.2f")
+        daily_pnl_str = self._safe_format_number(daily_pnl, "+.2f")
+
         text += f"\n<b>📈 ТОРГОВАЯ СТАТИСТИКА</b>\n"
         text += f"  • Всего сделок: {total_trades}\n"
-        text += f"  • Win Rate: {win_rate:.1%}\n"
-        text += f"  • Реализованный PnL: ${total_realized_pnl:+,.2f}\n"
+        text += f"  • Win Rate: {win_rate_str}%\n"
+        text += f"  • Реализованный PnL: ${realized_pnl_str}\n"
         text += f"  • Сегодня закрыто: {closed_today} сделок\n"
-        text += f"  • Дневной PnL: ${daily_pnl:+.2f}\n"
+        text += f"  • Дневной PnL: ${daily_pnl_str}\n"
 
         # Дополнительная статистика
         avg_win = status_data.get('avg_win', 0.0)
@@ -803,13 +849,24 @@ Telegram уведомления работают корректно!
         worst_trade = status_data.get('worst_trade', 0.0)
 
         if total_trades > 0:
+            # Безопасное форматирование статистики
+            avg_win_str = self._safe_format_number(avg_win, "+.2f")
+            avg_loss_str = self._safe_format_number(avg_loss, "+.2f")
+            best_trade_str = self._safe_format_number(best_trade, "+.2f")
+            worst_trade_str = self._safe_format_number(worst_trade, "+.2f")
+
             text += f"\n<b>📊 ДЕТАЛИ</b>\n"
-            text += f"  • Средний выигрыш: ${avg_win:+.2f}\n"
-            text += f"  • Средний убыток: ${avg_loss:+.2f}\n"
-            text += f"  • Лучшая сделка: ${best_trade:+.2f}\n"
-            text += f"  • Худшая сделка: ${worst_trade:+.2f}\n"
+            text += f"  • Средний выигрыш: ${avg_win_str}\n"
+            text += f"  • Средний убыток: ${avg_loss_str}\n"
+            text += f"  • Лучшая сделка: ${best_trade_str}\n"
+            text += f"  • Худшая сделка: ${worst_trade_str}\n"
 
         # Время
         text += f"\n⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+
+        # Проверка длины сообщения (Telegram лимит 4096 символов)
+        if len(text) > 4096:
+            logger.warning(f"Status message too long ({len(text)} chars), truncating...")
+            text = text[:4090] + "\n...(обрезано)"
 
         return self._send_message(text)

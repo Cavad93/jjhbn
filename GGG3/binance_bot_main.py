@@ -1800,10 +1800,10 @@ class BinanceTradingBot:
             period_changes = {}
             if hasattr(self, 'capital_tracker') and self.capital_tracker:
                 try:
-                    changes_1h = self.capital_tracker.get_change_over_period(hours=1)
-                    changes_24h = self.capital_tracker.get_change_over_period(hours=24)
-                    changes_7d = self.capital_tracker.get_change_over_period(days=7)
-                    changes_30d = self.capital_tracker.get_change_over_period(days=30)
+                    changes_1h = self.capital_tracker.get_change_over_period(total_equity, hours_ago=1)
+                    changes_24h = self.capital_tracker.get_change_over_period(total_equity, hours_ago=24)
+                    changes_7d = self.capital_tracker.get_change_over_period(total_equity, hours_ago=7*24)
+                    changes_30d = self.capital_tracker.get_change_over_period(total_equity, hours_ago=30*24)
 
                     period_changes = {
                         '1ч': changes_1h,
