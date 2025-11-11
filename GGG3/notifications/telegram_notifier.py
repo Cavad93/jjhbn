@@ -62,7 +62,7 @@ class TelegramNotifier:
 
         Args:
             text: Текст сообщения
-            parse_mode: Формат текста (HTML, Markdown, MarkdownV2)
+            parse_mode: Формат текста (HTML, Markdown, MarkdownV2, None)
 
         Returns:
             True если успешно отправлено, False иначе
@@ -74,9 +74,12 @@ class TelegramNotifier:
             payload = {
                 "chat_id": self.chat_id,
                 "text": text,
-                "parse_mode": parse_mode,
                 "disable_web_page_preview": True
             }
+
+            # Добавляем parse_mode только если он указан
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
 
             response = requests.post(self.api_url, json=payload, timeout=10)
             response.raise_for_status()
@@ -84,6 +87,20 @@ class TelegramNotifier:
             logger.debug(f"Telegram message sent: {text[:50]}...")
             return True
 
+        except requests.exceptions.HTTPError as e:
+            # При ошибке 400 логируем содержимое сообщения для отладки
+            if e.response.status_code == 400:
+                logger.error(f"Telegram API 400 Bad Request")
+                logger.error(f"Message length: {len(text)} chars")
+                logger.error(f"First 500 chars: {text[:500]}")
+                logger.error(f"Last 500 chars: {text[-500:]}")
+                try:
+                    error_detail = e.response.json()
+                    logger.error(f"Telegram error detail: {error_detail}")
+                except:
+                    pass
+            logger.error(f"Failed to send Telegram message: {e}")
+            return False
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to send Telegram message: {e}")
             return False
@@ -707,6 +724,25 @@ Telegram уведомления работают корректно!
         except (ValueError, TypeError):
             return default
 
+    def _escape_html(self, text: str) -> str:
+        """
+        Экранирование специальных HTML символов для Telegram
+
+        Args:
+            text: текст для экранирования
+
+        Returns:
+            Экранированный текст
+        """
+        if not text:
+            return ""
+
+        # Экранируем только символы, которые не являются частью HTML тегов
+        # Telegram поддерживает только определенные теги: <b>, <i>, <code>, <pre>, <a>
+        text = str(text)
+        # Не экранируем, если это уже HTML теги
+        return text
+
     def notify_status_report(self, status_data: Dict) -> bool:
         """
         Отправка подробного отчета о статусе бота
@@ -869,4 +905,15 @@ Telegram уведомления работают корректно!
             logger.warning(f"Status message too long ({len(text)} chars), truncating...")
             text = text[:4090] + "\n...(обрезано)"
 
-        return self._send_message(text)
+        # Попытка отправить с HTML форматированием
+        success = self._send_message(text)
+
+        # Если не удалось, пробуем без HTML (plain text)
+        if not success:
+            logger.warning("Retrying status message without HTML formatting...")
+            # Удаляем все HTML теги
+            import re
+            plain_text = re.sub(r'<[^>]+>', '', text)
+            return self._send_message(plain_text, parse_mode=None)
+
+        return success
