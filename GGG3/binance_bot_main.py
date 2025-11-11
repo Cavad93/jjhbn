@@ -343,91 +343,65 @@ class BinanceTradingBot:
         """Загружает ML экспертов (с поддержкой Transfer Learning)"""
         experts = {}
 
-        # ========== TRANSFER LEARNING: Попытка загрузить pretrained модели ==========
-        pretrained_dir = config.MODELS_DIR / 'pretrained'
-        use_pretrained = False
+        # ========== PURE ONLINE LEARNING: Создаем все эксперты с нуля ==========
+        print("    🎯 PURE ONLINE LEARNING MODE")
+        print("    ⚠️  All experts start from scratch and learn during live trading!")
 
-        if pretrained_dir.exists():
+        # XGBoost - online learning с partial_fit
+        xgb_path = config.MODELS_DIR / 'saved' / 'xgb_expert_online.pkl'
+        if xgb_path.exists():
             try:
-                print("    🎓 Attempting to load pretrained models (Transfer Learning)...")
-                tl_config = PretrainingConfig(
-                    historical_data_path="",  # Не нужен для загрузки
-                    experts_to_pretrain=['xgb', 'rf', 'nn'],
-                    pretrained_save_dir=str(pretrained_dir),
-                    verbose=False
-                )
-                tl_manager = TransferLearningManager(tl_config)
-                pretrained_experts = tl_manager.load_pretrained_experts()
-
-                # Используем pretrained если успешно загрузили
-                if pretrained_experts:
-                    experts.update(pretrained_experts)
-                    use_pretrained = True
-                    print(f"    ✅ Loaded {len(pretrained_experts)} pretrained experts")
+                experts['xgb'] = XGBoostExpert.load(str(xgb_path))
+                print(f"    ✓ XGBoost (online, {experts['xgb'].train_samples} samples)")
             except Exception as e:
-                print(f"    ⚠️  Pretrained loading failed: {e}")
-                print(f"    → Falling back to regular model loading")
+                print(f"    ⚠ XGBoost load failed: {e}, creating new")
+                experts['xgb'] = XGBoostExpert(n_estimators=10, max_depth=5, learning_rate=0.1, random_state=42)
+                print(f"    ✓ XGBoost (new, online learning)")
+        else:
+            experts['xgb'] = XGBoostExpert(n_estimators=10, max_depth=5, learning_rate=0.1, random_state=42)
+            print(f"    ✓ XGBoost (new, online learning)")
 
-        # ========== FALLBACK: Обычная загрузка моделей ==========
-        if not use_pretrained:
-            # XGBoost
-            xgb_path = config.MODELS_DIR / 'saved' / 'xgb_expert.pkl'
-            if xgb_path.exists():
-                try:
-                    experts['xgb'] = XGBoostExpert.load(str(xgb_path))
-                    print(f"    ✓ XGBoost")
-                except Exception as e:
-                    print(f"    ⚠ XGBoost failed: {e}")
-                    experts['xgb'] = None
-            else:
-                experts['xgb'] = None
+        # Random Forest - заменяем на второй ARF (sklearn RF не поддерживает online)
+        rf_path = config.MODELS_DIR / 'saved' / 'rf_expert_online.pkl'
+        if rf_path.exists():
+            try:
+                experts['rf'] = AdaptiveRFExpert.load(str(rf_path))
+                print(f"    ✓ RandomForest/ARF (online, {experts['rf'].train_samples} samples)")
+            except Exception as e:
+                print(f"    ⚠ RandomForest/ARF load failed: {e}, creating new")
+                experts['rf'] = AdaptiveRFExpert(n_models=15, random_state=123)
+                print(f"    ✓ RandomForest/ARF (new, online learning)")
+        else:
+            experts['rf'] = AdaptiveRFExpert(n_models=15, random_state=123)
+            print(f"    ✓ RandomForest/ARF (new, online learning)")
 
-            # Random Forest
-            rf_path = config.MODELS_DIR / 'saved' / 'rf_expert.pkl'
-            if rf_path.exists():
-                try:
-                    experts['rf'] = RandomForestExpert.load(str(rf_path))
-                    print(f"    ✓ RandomForest")
-                except Exception as e:
-                    print(f"    ⚠ RandomForest failed: {e}")
-                    experts['rf'] = None
-            else:
-                experts['rf'] = None
+        # Neural Network - online learning с partial_fit
+        nn_path = config.MODELS_DIR / 'saved' / 'nn_expert_online.pkl'
+        if nn_path.exists():
+            try:
+                experts['nn'] = NeuralNetworkExpert.load(str(nn_path))
+                print(f"    ✓ NeuralNet (online, {experts['nn'].train_epochs} epochs)")
+            except Exception as e:
+                print(f"    ⚠ NeuralNet load failed: {e}, creating new")
+                experts['nn'] = NeuralNetworkExpert(input_dim=68, hidden_dims=[64, 32], dropout=0.2, learning_rate=0.001)
+                print(f"    ✓ NeuralNet (new, online learning)")
+        else:
+            experts['nn'] = NeuralNetworkExpert(input_dim=68, hidden_dims=[64, 32], dropout=0.2, learning_rate=0.001)
+            print(f"    ✓ NeuralNet (new, online learning)")
 
-            # Neural Network
-            nn_path = config.MODELS_DIR / 'saved' / 'nn_expert.pkl'
-            if nn_path.exists():
-                try:
-                    experts['nn'] = NeuralNetworkExpert.load(str(nn_path))
-                    print(f"    ✓ NeuralNet")
-                except Exception as e:
-                    print(f"    ⚠ NeuralNet failed: {e}")
-                    experts['nn'] = None
-            else:
-                experts['nn'] = None
-
-        # ========== ADAPTIVE RF: Всегда загружается отдельно (online learning) ==========
-        arf_path = config.MODELS_DIR / 'saved' / 'arf_expert.pkl'
+        # Adaptive RF - третий эксперт с другими параметрами
+        arf_path = config.MODELS_DIR / 'saved' / 'arf_expert_online.pkl'
         if arf_path.exists():
             try:
                 experts['arf'] = AdaptiveRFExpert.load(str(arf_path))
-                print(f"    ✓ AdaptiveRF (loaded)")
+                print(f"    ✓ AdaptiveRF (online, {experts['arf'].train_samples} samples)")
             except Exception as e:
                 print(f"    ⚠ AdaptiveRF load failed: {e}, creating new")
-                try:
-                    experts['arf'] = AdaptiveRFExpert(n_models=10, random_state=42)
-                    print(f"    ✓ AdaptiveRF (new, will learn online)")
-                except Exception as e2:
-                    print(f"    ✗ AdaptiveRF init failed: {e2}")
-                    experts['arf'] = None
-        else:
-            # Создаем новый ARF для онлайн обучения
-            try:
                 experts['arf'] = AdaptiveRFExpert(n_models=10, random_state=42)
-                print(f"    ✓ AdaptiveRF (new, will learn online)")
-            except Exception as e:
-                print(f"    ✗ AdaptiveRF init failed: {e}")
-                experts['arf'] = None
+                print(f"    ✓ AdaptiveRF (new, online learning)")
+        else:
+            experts['arf'] = AdaptiveRFExpert(n_models=10, random_state=42)
+            print(f"    ✓ AdaptiveRF (new, online learning)")
 
         return experts
 
@@ -1526,28 +1500,79 @@ class BinanceTradingBot:
                 )
                 logger.debug(f"META.record_result() called for {position.symbol}: y_up={y_up}, context={reg_ctx}")
 
-                # ✅ ARF ONLINE LEARNING: Train ARF expert with real outcome
-                if 'arf' in self.experts and self.experts['arf'] is not None:
-                    try:
-                        # Извлекаем фичи из snapshot (t0)
-                        features = snapshot.get('features')
-                        if features is not None and hasattr(features, 'reshape'):
-                            features_2d = features.reshape(1, -1) if features.ndim == 1 else features
-                            y_outcome = np.array([y_up])
+                # ✅ ONLINE LEARNING: Train all experts with real outcome
+                features = snapshot.get('features')
+                if features is not None and hasattr(features, 'reshape'):
+                    features_2d = features.reshape(1, -1) if features.ndim == 1 else features
+                    y_outcome = np.array([y_up])
 
-                            # Онлайн обучение ARF
+                    # XGBoost online learning
+                    if 'xgb' in self.experts and self.experts['xgb'] is not None:
+                        try:
+                            self.experts['xgb'].partial_fit(features_2d, y_outcome, n_new_trees=2)
+                            logger.debug(f"XGBoost trained on {position.symbol}: y_up={y_up}, trees={self.experts['xgb'].model.num_boosted_rounds()}")
+                        except Exception as e:
+                            logger.error(f"Error training XGBoost: {e}")
+
+                    # RandomForest/ARF online learning
+                    if 'rf' in self.experts and self.experts['rf'] is not None:
+                        try:
+                            self.experts['rf'].partial_fit(features_2d, y_outcome)
+                            logger.debug(f"RandomForest/ARF trained on {position.symbol}: y_up={y_up}, total_samples={self.experts['rf'].train_samples}")
+                        except Exception as e:
+                            logger.error(f"Error training RandomForest/ARF: {e}")
+
+                    # AdaptiveRF online learning
+                    if 'arf' in self.experts and self.experts['arf'] is not None:
+                        try:
                             self.experts['arf'].partial_fit(features_2d, y_outcome)
-                            logger.debug(f"ARF trained on {position.symbol}: y_up={y_up}, total_samples={self.experts['arf'].train_samples}")
+                            logger.debug(f"AdaptiveRF trained on {position.symbol}: y_up={y_up}, total_samples={self.experts['arf'].train_samples}")
+                        except Exception as e:
+                            logger.error(f"Error training AdaptiveRF: {e}")
 
-                            # Сохраняем ARF каждые 5 закрытых позиций
-                            if self.total_closed_trades % 5 == 0:
-                                arf_path = config.MODELS_DIR / 'saved' / 'arf_expert.pkl'
+                    # NeuralNetwork online learning
+                    if 'nn' in self.experts and self.experts['nn'] is not None:
+                        try:
+                            self.experts['nn'].partial_fit(features_2d, y_outcome, n_epochs=1)
+                            logger.debug(f"NeuralNetwork trained on {position.symbol}: y_up={y_up}, epochs={self.experts['nn'].train_epochs}")
+                        except Exception as e:
+                            logger.error(f"Error training NeuralNetwork: {e}")
+
+                    # Периодическое сохранение всех моделей (каждые 5 сделок)
+                    if self.total_closed_trades % 5 == 0:
+                        try:
+                            if self.experts.get('xgb'):
+                                xgb_path = config.MODELS_DIR / 'saved' / 'xgb_expert_online.pkl'
+                                self.experts['xgb'].save(str(xgb_path))
+                                logger.info(f"[XGBoost] Saved model")
+                        except Exception as e:
+                            logger.error(f"Error saving XGBoost: {e}")
+
+                        try:
+                            if self.experts.get('rf'):
+                                rf_path = config.MODELS_DIR / 'saved' / 'rf_expert_online.pkl'
+                                self.experts['rf'].save(str(rf_path))
+                                logger.info(f"[RandomForest/ARF] Saved model")
+                        except Exception as e:
+                            logger.error(f"Error saving RandomForest/ARF: {e}")
+
+                        try:
+                            if self.experts.get('arf'):
+                                arf_path = config.MODELS_DIR / 'saved' / 'arf_expert_online.pkl'
                                 self.experts['arf'].save(str(arf_path))
-                                logger.info(f"[ARF] Saved model: {self.experts['arf'].train_samples} samples")
-                        else:
-                            logger.warning(f"ARF training skipped: features not found in snapshot for {position.symbol}")
-                    except Exception as e:
-                        logger.error(f"Error training ARF: {e}")
+                                logger.info(f"[AdaptiveRF] Saved model")
+                        except Exception as e:
+                            logger.error(f"Error saving AdaptiveRF: {e}")
+
+                        try:
+                            if self.experts.get('nn'):
+                                nn_path = config.MODELS_DIR / 'saved' / 'nn_expert_online.pkl'
+                                self.experts['nn'].save(str(nn_path))
+                                logger.info(f"[NeuralNetwork] Saved model")
+                        except Exception as e:
+                            logger.error(f"Error saving NeuralNetwork: {e}")
+                else:
+                    logger.warning(f"Expert training skipped: features not found in snapshot for {position.symbol}")
 
         except Exception as e:
             logger.error(f"Error recording result to META: {e}")
@@ -1742,14 +1767,40 @@ class BinanceTradingBot:
         self.position_manager.save_to_file()
         print("✅ Positions saved")
 
-        # Сохранение ARF модели
+        # Сохранение всех экспертов (online learning models)
+        print("\n💾 Saving expert models...")
+
+        if 'xgb' in self.experts and self.experts['xgb'] is not None:
+            try:
+                xgb_path = config.MODELS_DIR / 'saved' / 'xgb_expert_online.pkl'
+                self.experts['xgb'].save(str(xgb_path))
+                print(f"✅ XGBoost saved (trees: {self.experts['xgb'].model.num_boosted_rounds()})")
+            except Exception as e:
+                print(f"⚠️  Failed to save XGBoost: {e}")
+
+        if 'rf' in self.experts and self.experts['rf'] is not None:
+            try:
+                rf_path = config.MODELS_DIR / 'saved' / 'rf_expert_online.pkl'
+                self.experts['rf'].save(str(rf_path))
+                print(f"✅ RandomForest/ARF saved ({self.experts['rf'].train_samples} samples)")
+            except Exception as e:
+                print(f"⚠️  Failed to save RandomForest/ARF: {e}")
+
         if 'arf' in self.experts and self.experts['arf'] is not None:
             try:
-                arf_path = config.MODELS_DIR / 'saved' / 'arf_expert.pkl'
+                arf_path = config.MODELS_DIR / 'saved' / 'arf_expert_online.pkl'
                 self.experts['arf'].save(str(arf_path))
-                print(f"✅ ARF expert saved ({self.experts['arf'].train_samples} samples)")
+                print(f"✅ AdaptiveRF saved ({self.experts['arf'].train_samples} samples)")
             except Exception as e:
-                print(f"⚠️  Failed to save ARF expert: {e}")
+                print(f"⚠️  Failed to save AdaptiveRF: {e}")
+
+        if 'nn' in self.experts and self.experts['nn'] is not None:
+            try:
+                nn_path = config.MODELS_DIR / 'saved' / 'nn_expert_online.pkl'
+                self.experts['nn'].save(str(nn_path))
+                print(f"✅ NeuralNetwork saved ({self.experts['nn'].train_epochs} epochs)")
+            except Exception as e:
+                print(f"⚠️  Failed to save NeuralNetwork: {e}")
 
         # Сохранение баланса Paper Exchange
         if self.paper_mode:
