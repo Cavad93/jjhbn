@@ -289,6 +289,11 @@ class BinanceTradingBot:
                 max_positions=config.MAX_POSITIONS
             )
 
+        # ✅ Регистрация обработчиков команд Telegram
+        self.telegram.register_command_handler('status', self._handle_status_command)
+        self.telegram.start_command_listener()
+        logger.info("Telegram command listener started")
+
     def _update_activity(self):
         """Обновляет timestamp последней активности для watchdog"""
         with self._activity_lock:
@@ -1709,6 +1714,163 @@ class BinanceTradingBot:
             logger.error(f"Error closing position manually {position.symbol}: {e}", exc_info=True)
 
     # ========================================================================
+    # TELEGRAM COMMAND HANDLERS
+    # ========================================================================
+
+    def _handle_status_command(self) -> str:
+        """
+        Обработчик команды /status
+
+        Собирает и возвращает детальную статистику по работе бота:
+        - Открытые позиции с нереализованным PnL
+        - Баланс и капитал
+        - Торговую статистику
+
+        Returns:
+            str: Сообщение для отправки в Telegram (уже не нужно, метод вызывает notify_status_report)
+        """
+        try:
+            # Собираем данные об открытых позициях с нереализованным PnL
+            open_positions = self.position_manager.get_all_open()
+            open_positions_data = []
+            total_unrealized_pnl = 0.0
+            total_position_value = 0.0
+
+            for pos in open_positions:
+                try:
+                    # Получаем текущую цену
+                    ticker = self.exchange.get_ticker(pos.symbol)
+                    current_price = ticker['last']
+
+                    # Вычисляем нереализованный PnL
+                    pnl_usdt, pnl_pct = pos.calculate_pnl(current_price)
+
+                    # Форматируем время удержания
+                    duration_sec = pos.get_duration()
+                    hours = int(duration_sec / 3600)
+                    minutes = int((duration_sec % 3600) / 60)
+                    duration_str = f"{hours}h {minutes}m"
+
+                    open_positions_data.append({
+                        'symbol': pos.symbol,
+                        'direction': pos.direction,
+                        'entry_price': pos.entry_price,
+                        'current_price': current_price,
+                        'pnl_usdt': pnl_usdt,
+                        'pnl_pct': pnl_pct,
+                        'position_value': pos.position_value,
+                        'tp_price': pos.tp_price,
+                        'sl_price': pos.sl_price,
+                        'duration': duration_str
+                    })
+
+                    total_unrealized_pnl += pnl_usdt
+                    total_position_value += pos.position_value
+
+                except Exception as e:
+                    logger.error(f"Error calculating PnL for {pos.symbol}: {e}")
+                    continue
+
+            # Процент нереализованного PnL
+            total_unrealized_pnl_pct = (total_unrealized_pnl / total_position_value * 100) if total_position_value > 0 else 0.0
+
+            # Получаем баланс и капитал
+            try:
+                current_free_balance = self.exchange.get_balance()
+                current_equity = self.exchange.get_equity()
+                locked_in_positions = self.exchange.get_used_margin(leverage=config.LEVERAGE)
+
+                # Резервный фонд (если есть)
+                if hasattr(self, 'reserve_fund') and self.reserve_fund:
+                    current_reserve = self.reserve_fund.get_current_reserve()
+                else:
+                    current_reserve = 0.0
+
+                total_equity = current_equity + current_reserve
+
+            except Exception as e:
+                logger.error(f"Error getting balance: {e}")
+                current_free_balance = 0.0
+                current_equity = 0.0
+                locked_in_positions = 0.0
+                current_reserve = 0.0
+                total_equity = 0.0
+
+            # Изменения за периоды (если есть capital_tracker)
+            period_changes = {}
+            if hasattr(self, 'capital_tracker') and self.capital_tracker:
+                try:
+                    changes_1h = self.capital_tracker.get_change_over_period(hours=1)
+                    changes_24h = self.capital_tracker.get_change_over_period(hours=24)
+                    changes_7d = self.capital_tracker.get_change_over_period(days=7)
+                    changes_30d = self.capital_tracker.get_change_over_period(days=30)
+
+                    period_changes = {
+                        '1ч': changes_1h,
+                        '24ч': changes_24h,
+                        '7д': changes_7d,
+                        '30д': changes_30d
+                    }
+                except Exception as e:
+                    logger.error(f"Error getting period changes: {e}")
+
+            # Торговая статистика
+            pnl_summary = self.position_manager.get_pnl_summary()
+
+            total_trades = pnl_summary.get('total_trades', 0)
+            win_rate = pnl_summary.get('win_rate', 0.0)
+            total_realized_pnl = pnl_summary.get('total_pnl', 0.0)
+            avg_win = pnl_summary.get('avg_win', 0.0)
+            avg_loss = pnl_summary.get('avg_loss', 0.0)
+            best_trade = pnl_summary.get('best_trade', 0.0)
+            worst_trade = pnl_summary.get('worst_trade', 0.0)
+
+            # Подсчет закрытых сделок сегодня
+            closed_today = 0
+            daily_pnl = 0.0
+            try:
+                from datetime import date
+                today = date.today()
+                recent_closed = self.position_manager.get_recent_closed(limit=100)
+                for pos in recent_closed:
+                    if pos.exit_time and pos.exit_time.date() == today:
+                        closed_today += 1
+                        daily_pnl += pos.pnl
+            except Exception as e:
+                logger.error(f"Error counting daily trades: {e}")
+
+            # Формируем данные для отправки
+            status_data = {
+                'open_positions': open_positions_data,
+                'total_unrealized_pnl': total_unrealized_pnl,
+                'total_unrealized_pnl_pct': total_unrealized_pnl_pct,
+                'free_balance': current_free_balance,
+                'locked_in_positions': locked_in_positions,
+                'total_equity': total_equity,
+                'reserve_fund': current_reserve,
+                'closed_trades_today': closed_today,
+                'daily_pnl': daily_pnl,
+                'total_trades': total_trades,
+                'win_rate': win_rate,
+                'total_realized_pnl': total_realized_pnl,
+                'best_trade': best_trade,
+                'worst_trade': worst_trade,
+                'avg_win': avg_win,
+                'avg_loss': avg_loss,
+                'period_changes': period_changes
+            }
+
+            # Отправляем через notify_status_report
+            self.telegram.notify_status_report(status_data)
+
+            # Возвращаем пустую строку (метод уже отправил сообщение)
+            return ""
+
+        except Exception as e:
+            logger.error(f"Error in status command handler: {e}", exc_info=True)
+            return f"❌ Ошибка при получении статуса: {str(e)}"
+
+    # ========================================================================
     # SHUTDOWN
     # ========================================================================
 
@@ -1724,6 +1886,11 @@ class BinanceTradingBot:
         print("\n\n" + "="*80)
         print("🛑 GRACEFUL SHUTDOWN - Closing all positions...")
         print("="*80 + "\n")
+
+        # ✅ Останавливаем Telegram command listener
+        if hasattr(self, 'telegram') and self.telegram:
+            self.telegram.stop_command_listener()
+            logger.info("Telegram command listener stopped")
 
         # ═══════════════════════════════════════════════════════════
         # ШАГ 1: Закрываем все открытые позиции

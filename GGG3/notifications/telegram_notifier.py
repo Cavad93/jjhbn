@@ -13,9 +13,11 @@ Telegram Notifier - отправка уведомлений о работе бо
 
 import logging
 import requests
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Callable
 from datetime import datetime
 import traceback
+import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,13 @@ class TelegramNotifier:
         self.chat_id = chat_id
         self.enabled = enabled
         self.api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        self.get_updates_url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
+
+        # Для обработки команд
+        self.last_update_id = 0
+        self.command_handlers: Dict[str, Callable] = {}
+        self.command_thread: Optional[threading.Thread] = None
+        self.command_thread_running = False
 
         if not enabled:
             logger.info("Telegram notifications disabled")
@@ -551,12 +560,256 @@ UTC 23:00 - 07:00
 
     def test_connection(self) -> bool:
         """Тестовая отправка сообщения"""
-        text = """
+        text = f"""
 🧪 <b>ТЕСТОВОЕ СООБЩЕНИЕ</b>
 
 Telegram уведомления работают корректно!
 
 ⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
         """.strip()
+
+        return self._send_message(text)
+
+    def send_message(self, text: str) -> bool:
+        """
+        Публичный метод для отправки сообщения
+
+        Args:
+            text: Текст сообщения
+
+        Returns:
+            True если успешно, False иначе
+        """
+        return self._send_message(text)
+
+    # ========================================================================
+    # COMMAND HANDLER (для обработки команд типа /status)
+    # ========================================================================
+
+    def register_command_handler(self, command: str, handler: Callable):
+        """
+        Регистрация обработчика команды
+
+        Args:
+            command: Команда (например, 'status' для /status)
+            handler: Функция-обработчик, принимает () и возвращает str
+        """
+        self.command_handlers[command] = handler
+        logger.info(f"Registered command handler: /{command}")
+
+    def start_command_listener(self):
+        """Запуск потока для прослушивания команд"""
+        if not self.enabled:
+            logger.warning("Cannot start command listener: notifications disabled")
+            return
+
+        if self.command_thread_running:
+            logger.warning("Command listener already running")
+            return
+
+        self.command_thread_running = True
+        self.command_thread = threading.Thread(target=self._command_listener_loop, daemon=True)
+        self.command_thread.start()
+        logger.info("Command listener started")
+
+    def stop_command_listener(self):
+        """Остановка потока прослушивания команд"""
+        if self.command_thread_running:
+            self.command_thread_running = False
+            logger.info("Command listener stopped")
+
+    def _command_listener_loop(self):
+        """Основной цикл прослушивания команд"""
+        logger.info("Command listener loop started")
+
+        while self.command_thread_running:
+            try:
+                # Получаем новые обновления
+                params = {
+                    "offset": self.last_update_id + 1,
+                    "timeout": 30,
+                    "allowed_updates": ["message"]
+                }
+
+                response = requests.get(self.get_updates_url, params=params, timeout=35)
+                response.raise_for_status()
+
+                data = response.json()
+
+                if not data.get("ok"):
+                    logger.error(f"Failed to get updates: {data}")
+                    time.sleep(5)
+                    continue
+
+                updates = data.get("result", [])
+
+                for update in updates:
+                    self.last_update_id = max(self.last_update_id, update["update_id"])
+
+                    # Проверяем что это сообщение от нашего чата
+                    message = update.get("message", {})
+                    chat_id = str(message.get("chat", {}).get("id", ""))
+
+                    if chat_id != self.chat_id:
+                        continue
+
+                    # Проверяем что это команда
+                    text = message.get("text", "")
+                    if not text.startswith("/"):
+                        continue
+
+                    # Парсим команду
+                    command = text.split()[0][1:]  # Убираем '/'
+
+                    # Вызываем обработчик
+                    if command in self.command_handlers:
+                        try:
+                            response_text = self.command_handlers[command]()
+                            self._send_message(response_text)
+                        except Exception as e:
+                            logger.error(f"Error handling command /{command}: {e}", exc_info=True)
+                            self._send_message(f"❌ Ошибка при выполнении команды /{command}: {str(e)}")
+                    else:
+                        logger.debug(f"Unknown command: /{command}")
+
+            except requests.exceptions.Timeout:
+                # Это нормально для long polling
+                continue
+            except Exception as e:
+                logger.error(f"Error in command listener loop: {e}", exc_info=True)
+                time.sleep(5)
+
+        logger.info("Command listener loop stopped")
+
+    # ========================================================================
+    # DETAILED STATUS REPORT (для команды /status)
+    # ========================================================================
+
+    def notify_status_report(self, status_data: Dict) -> bool:
+        """
+        Отправка подробного отчета о статусе бота
+
+        Args:
+            status_data: Словарь с данными статуса:
+                - open_positions: List[Dict] - список открытых позиций с текущими ценами и PnL
+                - total_unrealized_pnl: float - общий нереализованный PnL
+                - total_unrealized_pnl_pct: float - общий нереализованный PnL в %
+                - balance: float - текущий баланс
+                - locked_in_positions: float - заблокировано в позициях (маржа)
+                - free_balance: float - свободный баланс
+                - total_equity: float - общий капитал
+                - reserve_fund: float - резервный фонд
+                - closed_trades_today: int - закрытых сделок сегодня
+                - daily_pnl: float - дневной PnL
+                - total_trades: int - всего сделок
+                - win_rate: float - win rate
+                - total_realized_pnl: float - общий реализованный PnL
+                - best_trade: float - лучшая сделка
+                - worst_trade: float - худшая сделка
+                - avg_win: float - средний выигрыш
+                - avg_loss: float - средний убыток
+                - period_changes: Dict - изменения за периоды (1h, 24h, 7d, 30d)
+
+        Returns:
+            True если успешно отправлено
+        """
+        # Заголовок
+        text = "📊 <b>СТАТУС БОТА</b>\n\n"
+
+        # ═══════════════════════════════════════════════════════════════
+        # РАЗДЕЛ 1: ОТКРЫТЫЕ ПОЗИЦИИ
+        # ═══════════════════════════════════════════════════════════════
+        open_positions = status_data.get('open_positions', [])
+        total_unrealized_pnl = status_data.get('total_unrealized_pnl', 0.0)
+        total_unrealized_pnl_pct = status_data.get('total_unrealized_pnl_pct', 0.0)
+
+        if open_positions:
+            text += f"<b>🔓 ОТКРЫТЫЕ ПОЗИЦИИ ({len(open_positions)})</b>\n"
+
+            for i, pos in enumerate(open_positions, 1):
+                symbol = pos.get('symbol', 'UNKNOWN')
+                direction = pos.get('direction', 'UNKNOWN')
+                entry_price = pos.get('entry_price', 0.0)
+                current_price = pos.get('current_price', 0.0)
+                pnl_usdt = pos.get('pnl_usdt', 0.0)
+                pnl_pct = pos.get('pnl_pct', 0.0)
+                position_value = pos.get('position_value', 0.0)
+                tp_price = pos.get('tp_price', 0.0)
+                sl_price = pos.get('sl_price', 0.0)
+                duration = pos.get('duration', 'N/A')
+
+                # Эмодзи для направления и результата
+                dir_emoji = "🟢" if direction == "LONG" else "🔴"
+                pnl_emoji = "✅" if pnl_usdt >= 0 else "❌"
+
+                text += f"\n{i}. {dir_emoji} <b>{symbol}</b> {direction}\n"
+                text += f"   Вход: ${entry_price:.4f} | Сейчас: ${current_price:.4f}\n"
+                text += f"   {pnl_emoji} PnL: ${pnl_usdt:+.2f} ({pnl_pct:+.2f}%)\n"
+                text += f"   Размер: ${position_value:.2f} | TP: ${tp_price:.4f} | SL: ${sl_price:.4f}\n"
+                text += f"   Время: {duration}\n"
+
+            # Итого по открытым позициям
+            total_emoji = "✅" if total_unrealized_pnl >= 0 else "❌"
+            text += f"\n{total_emoji} <b>Итого нереализованный PnL: ${total_unrealized_pnl:+.2f} ({total_unrealized_pnl_pct:+.2f}%)</b>\n"
+        else:
+            text += "<b>🔓 ОТКРЫТЫЕ ПОЗИЦИИ</b>\nНет открытых позиций\n"
+
+        # ═══════════════════════════════════════════════════════════════
+        # РАЗДЕЛ 2: КАПИТАЛ
+        # ═══════════════════════════════════════════════════════════════
+        total_equity = status_data.get('total_equity', 0.0)
+        free_balance = status_data.get('free_balance', 0.0)
+        locked_in_positions = status_data.get('locked_in_positions', 0.0)
+        reserve_fund = status_data.get('reserve_fund', 0.0)
+
+        text += f"\n<b>💼 КАПИТАЛ</b>\n"
+        text += f"  • Свободный: ${free_balance:,.2f}\n"
+        text += f"  • В позициях (маржа): ${locked_in_positions:,.2f}\n"
+        if reserve_fund > 0:
+            reserve_pct = (reserve_fund / total_equity * 100) if total_equity > 0 else 0
+            text += f"  • Резервный: ${reserve_fund:,.2f} ({reserve_pct:.1f}%)\n"
+        text += f"  • <b>Общий капитал: ${total_equity:,.2f}</b>\n"
+
+        # Изменения за периоды
+        period_changes = status_data.get('period_changes', {})
+        if period_changes:
+            text += f"\n<b>📊 ИЗМЕНЕНИЯ КАПИТАЛА</b>\n"
+            for period_name, data in period_changes.items():
+                if data.get('available'):
+                    sign = "+" if data['absolute'] >= 0 else ""
+                    emoji = "📈" if data['absolute'] >= 0 else "📉"
+                    text += f"  {emoji} {period_name}: {sign}${data['absolute']:.2f} ({sign}{data['percent']:.2f}%)\n"
+
+        # ═══════════════════════════════════════════════════════════════
+        # РАЗДЕЛ 3: ТОРГОВАЯ СТАТИСТИКА
+        # ═══════════════════════════════════════════════════════════════
+        total_trades = status_data.get('total_trades', 0)
+        win_rate = status_data.get('win_rate', 0.0)
+        total_realized_pnl = status_data.get('total_realized_pnl', 0.0)
+        daily_pnl = status_data.get('daily_pnl', 0.0)
+        closed_today = status_data.get('closed_trades_today', 0)
+
+        text += f"\n<b>📈 ТОРГОВАЯ СТАТИСТИКА</b>\n"
+        text += f"  • Всего сделок: {total_trades}\n"
+        text += f"  • Win Rate: {win_rate:.1%}\n"
+        text += f"  • Реализованный PnL: ${total_realized_pnl:+,.2f}\n"
+        text += f"  • Сегодня закрыто: {closed_today} сделок\n"
+        text += f"  • Дневной PnL: ${daily_pnl:+.2f}\n"
+
+        # Дополнительная статистика
+        avg_win = status_data.get('avg_win', 0.0)
+        avg_loss = status_data.get('avg_loss', 0.0)
+        best_trade = status_data.get('best_trade', 0.0)
+        worst_trade = status_data.get('worst_trade', 0.0)
+
+        if total_trades > 0:
+            text += f"\n<b>📊 ДЕТАЛИ</b>\n"
+            text += f"  • Средний выигрыш: ${avg_win:+.2f}\n"
+            text += f"  • Средний убыток: ${avg_loss:+.2f}\n"
+            text += f"  • Лучшая сделка: ${best_trade:+.2f}\n"
+            text += f"  • Худшая сделка: ${worst_trade:+.2f}\n"
+
+        # Время
+        text += f"\n⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
 
         return self._send_message(text)
