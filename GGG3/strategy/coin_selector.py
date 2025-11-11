@@ -110,14 +110,23 @@ class CoinSelector:
             'passed_filters': 0
         }
 
-    def calculate_ev_bidirectional(self, p_up: float) -> Tuple[float, float]:
+    def calculate_ev_bidirectional(self, p_up: float, tp_mult: float = None, sl_mult: float = None) -> Tuple[float, float]:
         """
         Рассчитывает Expected Value для LONG и SHORT с учетом комиссий и проскальзывания
 
-        Текущие параметры:
+        ВАЖНО: Использует АДАПТИВНЫЕ множители TP/SL для точного расчёта EV!
+
+        Параметры по умолчанию (если не переданы):
         - TP = 2.5× ATR
         - SL = 1.5× ATR
         - R:R = 2.5/1.5 = 1.67:1
+
+        Адаптивные параметры (зависят от волатильности):
+        - Низкая волатильность (<2%): TP = 3.0×, SL = 1.5×, R:R = 2.0:1
+        - Средняя (2-5%): TP = 2.5×, SL = 1.5×, R:R = 1.67:1
+        - Высокая (>5%): TP = 2.0×, SL = 1.5×, R:R = 1.33:1
+
+        Комиссии и проскальзывание:
         - Комиссия = 0.1% (вход + выход)
         - Проскальзывание = 0.05% (вход + выход)
         - Общие издержки = 0.3% на круг
@@ -127,41 +136,42 @@ class CoinSelector:
         EV_long = P(TP) × Reward - P(SL) × Risk
 
         Нормализуем к SL = 1R:
-          Reward = TP/SL = 2.5/1.5 = 1.67R
+          Reward = TP/SL
           Risk = 1.0R
 
-        EV_long = p_up × 1.67 - (1 - p_up) × 1.0
-                = p_up × 1.67 - 1 + p_up
-                = p_up × (1.67 + 1.0) - 1.0
-                = p_up × 2.67 - 1.0
-
         С учетом издержек (0.3% = 0.003):
-          Real_TP = 2.5 - 0.006 = 2.494 ATR
-          Real_SL = 1.5 + 0.006 = 1.506 ATR
-          Real_RR = 2.494/1.506 = 1.656:1
+          Real_TP = tp_mult - 0.003
+          Real_SL = sl_mult + 0.003
 
-        EV_long_real = p_up × 2.494 - (1 - p_up) × 1.506
-                     = p_up × 4.0 - 1.506
+        EV_long_real = p_up × Real_TP - (1 - p_up) × Real_SL
 
         Break-even точки:
-        - Без издержек: p_up > 0.375 (37.5%)
-        - С издержками: p_up > 0.377 (37.7%)
+        - Без издержек: p_up > sl_mult / (tp_mult + sl_mult)
+        - С издержками: немного выше
 
         Args:
             p_up: Вероятность роста цены (0-1)
+            tp_mult: Адаптивный множитель для Take Profit (опционально)
+            sl_mult: Адаптивный множитель для Stop Loss (опционально)
 
         Returns:
             Tuple[ev_long, ev_short] - Expected Value для LONG и SHORT
 
         Examples:
             >>> selector = CoinSelector()
-            >>> ev_long, ev_short = selector.calculate_ev_bidirectional(0.67)
-            >>> print(f"LONG EV: {ev_long:.4f}")  # 0.1738 (+17.38%)
-            >>> print(f"SHORT EV: {ev_short:.4f}")  # -0.1738 (-17.38%)
+            >>> # Низкая волатильность
+            >>> ev_long, ev_short = selector.calculate_ev_bidirectional(0.60, tp_mult=3.0, sl_mult=1.5)
+            >>> print(f"LONG EV: {ev_long:.4f}")  # 0.1978 (+19.78%)
+            >>>
+            >>> # Высокая волатильность
+            >>> ev_long, ev_short = selector.calculate_ev_bidirectional(0.60, tp_mult=2.0, sl_mult=1.5)
+            >>> print(f"LONG EV: {ev_long:.4f}")  # 0.0978 (+9.78%)
         """
-        # Получаем актуальные множители из конфига
-        tp_mult = binance_config.TP_ATR_MULTIPLIER  # 2.5
-        sl_mult = binance_config.SL_ATR_MULTIPLIER  # 1.5
+        # ✅ ИСПРАВЛЕНИЕ: Используем переданные адаптивные множители или дефолтные из конфига
+        if tp_mult is None:
+            tp_mult = binance_config.TP_ATR_MULTIPLIER  # 2.5 (дефолт)
+        if sl_mult is None:
+            sl_mult = binance_config.SL_ATR_MULTIPLIER  # 1.5 (дефолт)
 
         # Издержки: комиссия (0.1%) + проскальзывание (0.05%) × 2 (вход + выход)
         # Используем консервативную оценку 0.3% на круг
@@ -498,11 +508,11 @@ class CoinSelector:
                         # Если META упала, используем BASE предсказание
                         p_meta_prediction = None
 
-                # Рассчитываем EV для обоих направлений
-                ev_long, ev_short = self.calculate_ev_bidirectional(p_up)
-
-                # Получаем адаптивные множители TP/SL на основе волатильности
+                # ✅ ИСПРАВЛЕНИЕ: Сначала получаем адаптивные множители TP/SL на основе волатильности
                 tp_mult, sl_mult = binance_config.get_adaptive_tp_sl_multipliers(atr_pct)
+
+                # Рассчитываем EV для обоих направлений с адаптивными множителями
+                ev_long, ev_short = self.calculate_ev_bidirectional(p_up, tp_mult=tp_mult, sl_mult=sl_mult)
 
                 # Выбираем лучшее направление
                 if ev_long > self.min_ev_threshold and ev_long > ev_short:
