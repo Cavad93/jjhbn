@@ -1525,6 +1525,30 @@ class BinanceTradingBot:
                     reg_ctx=reg_ctx  # ✅ ПЕРЕДАЕМ РЕАЛЬНЫЙ КОНТЕКСТ из t0
                 )
                 logger.debug(f"META.record_result() called for {position.symbol}: y_up={y_up}, context={reg_ctx}")
+
+                # ✅ ARF ONLINE LEARNING: Train ARF expert with real outcome
+                if 'arf' in self.experts and self.experts['arf'] is not None:
+                    try:
+                        # Извлекаем фичи из snapshot (t0)
+                        features = snapshot.get('features')
+                        if features is not None and hasattr(features, 'reshape'):
+                            features_2d = features.reshape(1, -1) if features.ndim == 1 else features
+                            y_outcome = np.array([y_up])
+
+                            # Онлайн обучение ARF
+                            self.experts['arf'].partial_fit(features_2d, y_outcome)
+                            logger.debug(f"ARF trained on {position.symbol}: y_up={y_up}, total_samples={self.experts['arf'].train_samples}")
+
+                            # Сохраняем ARF каждые 5 закрытых позиций
+                            if self.total_closed_trades % 5 == 0:
+                                arf_path = config.MODELS_DIR / 'saved' / 'arf_expert.pkl'
+                                self.experts['arf'].save(str(arf_path))
+                                logger.info(f"[ARF] Saved model: {self.experts['arf'].train_samples} samples")
+                        else:
+                            logger.warning(f"ARF training skipped: features not found in snapshot for {position.symbol}")
+                    except Exception as e:
+                        logger.error(f"Error training ARF: {e}")
+
         except Exception as e:
             logger.error(f"Error recording result to META: {e}")
 
@@ -1717,6 +1741,15 @@ class BinanceTradingBot:
         print("\n💾 Saving state...")
         self.position_manager.save_to_file()
         print("✅ Positions saved")
+
+        # Сохранение ARF модели
+        if 'arf' in self.experts and self.experts['arf'] is not None:
+            try:
+                arf_path = config.MODELS_DIR / 'saved' / 'arf_expert.pkl'
+                self.experts['arf'].save(str(arf_path))
+                print(f"✅ ARF expert saved ({self.experts['arf'].train_samples} samples)")
+            except Exception as e:
+                print(f"⚠️  Failed to save ARF expert: {e}")
 
         # Сохранение баланса Paper Exchange
         if self.paper_mode:
