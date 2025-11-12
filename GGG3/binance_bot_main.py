@@ -1777,7 +1777,6 @@ class BinanceTradingBot:
             # Получаем баланс и капитал
             try:
                 current_free_balance = self.exchange.get_balance()
-                current_equity = self.exchange.get_equity()
                 locked_in_positions = self.exchange.get_used_margin(leverage=config.LEVERAGE)
 
                 # Резервный фонд (если есть)
@@ -1786,12 +1785,13 @@ class BinanceTradingBot:
                 else:
                     current_reserve = 0.0
 
-                total_equity = current_equity + current_reserve
+                # КРИТИЧНО: total_equity должен включать locked_in_positions!
+                # Иначе расчёт изменений будет неправильным (snapshot включает locked_in_positions)
+                total_equity = current_free_balance + locked_in_positions + current_reserve
 
             except Exception as e:
                 logger.error(f"Error getting balance: {e}")
                 current_free_balance = 0.0
-                current_equity = 0.0
                 locked_in_positions = 0.0
                 current_reserve = 0.0
                 total_equity = 0.0
