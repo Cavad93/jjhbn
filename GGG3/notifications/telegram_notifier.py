@@ -714,7 +714,7 @@ Telegram уведомления работают корректно!
                             logger.debug(f"Unknown command: /{command}")
                     else:
                         # Не команда - проверяем активна ли AI сессия
-                        self._handle_ai_message(text, message.get("from", {}).get("id", ""))
+                        self._handle_ai_message(text, str(message.get("from", {}).get("id", "")))
 
             except requests.exceptions.Timeout:
                 # Это нормально для long polling
