@@ -605,6 +605,10 @@ Communication style:
             self.sessions[user_id] = UserSession(user_id=user_id, chat_id=chat_id)
             self.stats["total_sessions"] += 1
             logger.info(f"[AITradingAssistant] Created new session for user {user_id}")
+        else:
+            # Обновляем chat_id если пользователь активирует сессию в другом чате
+            self.sessions[user_id].chat_id = chat_id
+            logger.info(f"[AITradingAssistant] Updated chat_id for user {user_id} to {chat_id}")
 
         session = self.sessions[user_id]
         session.active = True

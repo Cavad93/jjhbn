@@ -852,8 +852,10 @@ Telegram уведомления работают корректно!
         callback_id = callback_query.get("id")
         data = callback_query.get("data", "")
         user_id = str(callback_query.get("from", {}).get("id", ""))
+        # Получаем chat_id из сообщения, к которому относится callback
+        chat_id = str(callback_query.get("message", {}).get("chat", {}).get("id", ""))
 
-        logger.info(f"[TelegramNotifier] Callback query: {data} from user {user_id}")
+        logger.info(f"[TelegramNotifier] Callback query: {data} from user {user_id} in chat {chat_id}")
 
         # Проверяем, что callback от разрешенного пользователя
         if user_id != self.allowed_user_id:
@@ -864,7 +866,7 @@ Telegram уведомления работают корректно!
         try:
             # Обработка AI команд
             if data == "ai_activate":
-                self._handle_ai_activate(user_id)
+                self._handle_ai_activate(user_id, chat_id)
             elif data == "ai_deactivate":
                 self._handle_ai_deactivate(user_id)
             elif data == "ai_status":
@@ -895,18 +897,18 @@ Telegram уведомления работают корректно!
         except Exception as e:
             logger.warning(f"[TelegramNotifier] Failed to answer callback: {e}")
 
-    def _handle_ai_activate(self, user_id: str):
+    def _handle_ai_activate(self, user_id: str, chat_id: str):
         """Активация AI сессии"""
         if not self.ai_assistant:
-            self._send_message("❌ AI Assistant не настроен. Проверьте ANTHROPIC_API_KEY в .env")
+            self._send_message("❌ AI Assistant не настроен. Проверьте ANTHROPIC_API_KEY в .env", target_chat_id=chat_id)
             return
 
         try:
-            session = self.ai_assistant.activate_session(user_id, self.chat_id)
-            logger.info(f"[TelegramNotifier] AI session activated for user {user_id}")
+            session = self.ai_assistant.activate_session(user_id, chat_id)
+            logger.info(f"[TelegramNotifier] AI session activated for user {user_id} in chat {chat_id}")
 
-            # Обновляем панель управления
-            self.send_ai_control_panel()
+            # Обновляем панель управления (отправляем в тот же чат)
+            # self.send_ai_control_panel()  # Эта функция всегда отправляет в личный чат
 
             # Приветственное сообщение
             self._send_message(
@@ -916,12 +918,13 @@ Telegram уведомления работают корректно!
                 "• Сколько я заработал?\n"
                 "• Есть ли проблемы?\n"
                 "• Что с капиталом?\n\n"
-                "Просто пишите вопросы текстом."
+                "Просто пишите вопросы текстом.",
+                target_chat_id=chat_id
             )
 
         except Exception as e:
             logger.error(f"[TelegramNotifier] Failed to activate AI: {e}", exc_info=True)
-            self._send_message(f"❌ Ошибка активации AI: {str(e)[:100]}")
+            self._send_message(f"❌ Ошибка активации AI: {str(e)[:100]}", target_chat_id=chat_id)
 
     def _handle_ai_deactivate(self, user_id: str):
         """Деактивация AI сессии"""
