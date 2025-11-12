@@ -211,7 +211,9 @@ class BinanceTradingBot:
         self.telegram = TelegramNotifier(
             bot_token=config.TELEGRAM_BOT_TOKEN,
             chat_id=config.TELEGRAM_CHAT_ID,
-            enabled=config.TELEGRAM_ALERTS_ENABLED
+            enabled=config.TELEGRAM_ALERTS_ENABLED,
+            group_chat_id=config.TELEGRAM_GROUP_CHAT_ID,
+            allowed_user_id=config.TELEGRAM_ALLOWED_USER_ID
         )
 
         # AI Trading Assistant (Claude Sonnet 4.5)

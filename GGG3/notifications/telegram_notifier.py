@@ -27,18 +27,23 @@ class TelegramNotifier:
     Отправка уведомлений в Telegram через Bot API
     """
 
-    def __init__(self, bot_token: str, chat_id: str, enabled: bool = True, ai_assistant=None):
+    def __init__(self, bot_token: str, chat_id: str, enabled: bool = True, ai_assistant=None,
+                 group_chat_id: str = "", allowed_user_id: str = "939056216"):
         """
         Инициализация Telegram notifier
 
         Args:
             bot_token: Токен Telegram бота (получить у @BotFather)
-            chat_id: ID чата для отправки сообщений
+            chat_id: ID личного чата для отправки сообщений и команд
             enabled: Включить/выключить уведомления
             ai_assistant: AI Assistant instance (опционально)
+            group_chat_id: ID группового чата для отправки уведомлений (опционально)
+            allowed_user_id: ID пользователя, который может отправлять команды (по умолчанию: 939056216)
         """
         self.bot_token = bot_token
         self.chat_id = chat_id
+        self.group_chat_id = group_chat_id
+        self.allowed_user_id = allowed_user_id
         self.enabled = enabled
         self.api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         self.get_updates_url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
@@ -63,9 +68,13 @@ class TelegramNotifier:
             logger.warning("Telegram bot_token or chat_id not configured")
             self.enabled = False
         else:
-            logger.info(f"Telegram notifier initialized (chat_id: {chat_id})")
+            chats_info = f"chat_id: {chat_id}"
+            if group_chat_id:
+                chats_info += f", group_chat_id: {group_chat_id}"
+            logger.info(f"Telegram notifier initialized ({chats_info}, allowed_user_id: {allowed_user_id})")
 
-    def _send_message(self, text: str, parse_mode: str = "HTML", reply_markup: Optional[Dict] = None) -> bool:
+    def _send_message(self, text: str, parse_mode: str = "HTML", reply_markup: Optional[Dict] = None,
+                      target_chat_id: Optional[str] = None) -> bool:
         """
         Отправка сообщения в Telegram
 
@@ -73,54 +82,66 @@ class TelegramNotifier:
             text: Текст сообщения
             parse_mode: Формат текста (HTML, Markdown, MarkdownV2, None)
             reply_markup: Inline keyboard markup (опционально)
+            target_chat_id: ID чата для отправки (если None, отправляется во все настроенные чаты)
 
         Returns:
-            True если успешно отправлено, False иначе
+            True если успешно отправлено хотя бы в один чат, False иначе
         """
         if not self.enabled:
             return False
 
-        try:
-            payload = {
-                "chat_id": self.chat_id,
-                "text": text,
-                "disable_web_page_preview": True
-            }
+        # Определяем список чатов для отправки
+        if target_chat_id:
+            # Отправляем только в указанный чат
+            chat_ids = [target_chat_id]
+        else:
+            # Отправляем во все настроенные чаты
+            chat_ids = [self.chat_id]
+            if self.group_chat_id:
+                chat_ids.append(self.group_chat_id)
 
-            # Добавляем parse_mode только если он указан
-            if parse_mode:
-                payload["parse_mode"] = parse_mode
+        success = False
+        for chat_id in chat_ids:
+            try:
+                payload = {
+                    "chat_id": chat_id,
+                    "text": text,
+                    "disable_web_page_preview": True
+                }
 
-            # Добавляем кнопки если указаны
-            if reply_markup:
-                payload["reply_markup"] = reply_markup
+                # Добавляем parse_mode только если он указан
+                if parse_mode:
+                    payload["parse_mode"] = parse_mode
 
-            response = requests.post(self.api_url, json=payload, timeout=10)
-            response.raise_for_status()
+                # Добавляем кнопки если указаны
+                if reply_markup:
+                    payload["reply_markup"] = reply_markup
 
-            logger.debug(f"Telegram message sent: {text[:50]}...")
-            return True
+                response = requests.post(self.api_url, json=payload, timeout=10)
+                response.raise_for_status()
 
-        except requests.exceptions.HTTPError as e:
-            # При ошибке 400 логируем содержимое сообщения для отладки
-            if e.response.status_code == 400:
-                logger.error(f"Telegram API 400 Bad Request")
-                logger.error(f"Message length: {len(text)} chars")
-                logger.error(f"First 500 chars: {text[:500]}")
-                logger.error(f"Last 500 chars: {text[-500:]}")
-                try:
-                    error_detail = e.response.json()
-                    logger.error(f"Telegram error detail: {error_detail}")
-                except:
-                    pass
-            logger.error(f"Failed to send Telegram message: {e}")
-            return False
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to send Telegram message: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error sending Telegram message: {e}")
-            return False
+                logger.debug(f"Telegram message sent to {chat_id}: {text[:50]}...")
+                success = True
+
+            except requests.exceptions.HTTPError as e:
+                # При ошибке 400 логируем содержимое сообщения для отладки
+                if e.response.status_code == 400:
+                    logger.error(f"Telegram API 400 Bad Request for chat {chat_id}")
+                    logger.error(f"Message length: {len(text)} chars")
+                    logger.error(f"First 500 chars: {text[:500]}")
+                    logger.error(f"Last 500 chars: {text[-500:]}")
+                    try:
+                        error_detail = e.response.json()
+                        logger.error(f"Telegram error detail: {error_detail}")
+                    except:
+                        pass
+                logger.error(f"Failed to send Telegram message to {chat_id}: {e}")
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Failed to send Telegram message to {chat_id}: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error sending Telegram message to {chat_id}: {e}")
+
+        return success
 
     # ========================================================================
     # BOT STATUS NOTIFICATIONS
@@ -689,8 +710,11 @@ Telegram уведомления работают корректно!
                     # ═══════════════════════════════════════════════════════════════
                     message = update.get("message", {})
                     chat_id = str(message.get("chat", {}).get("id", ""))
+                    user_id = str(message.get("from", {}).get("id", ""))
 
-                    if chat_id != self.chat_id:
+                    # Проверяем, что сообщение от разрешенного пользователя
+                    if user_id != self.allowed_user_id:
+                        logger.debug(f"Ignoring message from unauthorized user {user_id}")
                         continue
 
                     text = message.get("text", "")
@@ -708,16 +732,18 @@ Telegram уведомления работают корректно!
                                 response_text = self.command_handlers[command]()
                                 # Отправляем сообщение только если есть текст
                                 # (обработчик может сам отправить сообщение и вернуть пустую строку)
+                                # Ответ отправляем в тот же чат, откуда пришла команда
                                 if response_text:
-                                    self._send_message(response_text)
+                                    self._send_message(response_text, target_chat_id=chat_id)
                             except Exception as e:
                                 logger.error(f"Error handling command /{command}: {e}", exc_info=True)
-                                self._send_message(f"❌ Ошибка при выполнении команды /{command}: {str(e)}")
+                                self._send_message(f"❌ Ошибка при выполнении команды /{command}: {str(e)}",
+                                                 target_chat_id=chat_id)
                         else:
                             logger.debug(f"Unknown command: /{command}")
                     else:
                         # Не команда - проверяем активна ли AI сессия
-                        self._handle_ai_message(text, str(message.get("from", {}).get("id", "")))
+                        self._handle_ai_message(text, user_id, chat_id)
 
             except requests.exceptions.Timeout:
                 # Это нормально для long polling
@@ -828,6 +854,12 @@ Telegram уведомления работают корректно!
         user_id = str(callback_query.get("from", {}).get("id", ""))
 
         logger.info(f"[TelegramNotifier] Callback query: {data} from user {user_id}")
+
+        # Проверяем, что callback от разрешенного пользователя
+        if user_id != self.allowed_user_id:
+            logger.warning(f"[TelegramNotifier] Ignoring callback from unauthorized user {user_id}")
+            self._answer_callback_query(callback_id, "❌ Доступ запрещен")
+            return
 
         try:
             # Обработка AI команд
@@ -983,13 +1015,14 @@ Telegram уведомления работают корректно!
         logger.info("[TelegramNotifier] User cancelled closeall")
         self._send_message("❌ <b>ОТМЕНЕНО</b>\n\nЗакрытие всех позиций отменено.")
 
-    def _handle_ai_message(self, message: str, user_id: str):
+    def _handle_ai_message(self, message: str, user_id: str, chat_id: str):
         """
         Обработка текстового сообщения для AI чата
 
         Args:
             message: Текст сообщения
             user_id: Telegram user ID
+            chat_id: Telegram chat ID (для отправки ответа в правильный чат)
         """
         if not self.ai_assistant:
             return
@@ -1008,7 +1041,7 @@ Telegram уведомления работают корректно!
             # Разбиваем длинный ответ на части (Telegram limit 4096 chars)
             MAX_LENGTH = 4000
             if len(response) <= MAX_LENGTH:
-                self._send_message(response)
+                self._send_message(response, target_chat_id=chat_id)
             else:
                 # Разбиваем на части
                 parts = []
@@ -1029,12 +1062,12 @@ Telegram уведомления работают корректно!
                 for i, part in enumerate(parts, 1):
                     if len(parts) > 1:
                         part = f"[{i}/{len(parts)}]\n\n{part}"
-                    self._send_message(part)
+                    self._send_message(part, target_chat_id=chat_id)
                     time.sleep(0.5)  # Небольшая пауза между сообщениями
 
         except Exception as e:
             logger.error(f"[TelegramNotifier] Error processing AI message: {e}", exc_info=True)
-            self._send_message(f"❌ Ошибка обработки сообщения: {str(e)[:100]}")
+            self._send_message(f"❌ Ошибка обработки сообщения: {str(e)[:100]}", target_chat_id=chat_id)
 
     # ========================================================================
     # DETAILED STATUS REPORT (для команды /status)

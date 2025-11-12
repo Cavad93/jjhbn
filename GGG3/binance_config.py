@@ -56,7 +56,9 @@ USE_TESTNET = os.getenv('USE_TESTNET', 'True').lower() in ('true', '1', 'yes')
 
 # Telegram бот (опционально)
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')  # Личный чат для команд и уведомлений
+TELEGRAM_GROUP_CHAT_ID = os.getenv('TELEGRAM_GROUP_CHAT_ID', '')  # Группа для уведомлений
+TELEGRAM_ALLOWED_USER_ID = os.getenv('TELEGRAM_ALLOWED_USER_ID', '939056216')  # ID пользователя, который может отправлять команды
 
 
 # ============================================================================
