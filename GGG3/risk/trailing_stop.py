@@ -92,6 +92,11 @@ class TrailingStopManager:
             # Рассчитываем новый SL (ниже максимальной цены на distance_pct)
             new_sl = self._peak_prices[symbol] * (1 - self.distance_pct / 100)
 
+            # КРИТИЧНО: SL не должен подниматься выше entry_price для LONG!
+            # Trailing stop защищает прибыль, но не должен создавать убыток
+            if new_sl > entry_price:
+                new_sl = entry_price
+
             # Обновляем SL только если он выше текущего
             if new_sl > current_sl:
                 return new_sl
@@ -103,6 +108,11 @@ class TrailingStopManager:
 
             # Рассчитываем новый SL (выше минимальной цены на distance_pct)
             new_sl = self._peak_prices[symbol] * (1 + self.distance_pct / 100)
+
+            # КРИТИЧНО: SL не должен опускаться ниже entry_price для SHORT!
+            # Trailing stop защищает прибыль, но не должен создавать убыток
+            if new_sl < entry_price:
+                new_sl = entry_price
 
             # Обновляем SL только если он ниже текущего
             if new_sl < current_sl:
