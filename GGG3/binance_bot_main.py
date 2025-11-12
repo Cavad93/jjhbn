@@ -335,10 +335,6 @@ class BinanceTradingBot:
                     # - Принудительный перезапуск операции
                     # - Завершение с ошибкой
 
-                elif idle_time > 300:  # 5 минут
-                    # Предупреждение о долгой операции
-                    logger.warning(f"[WATCHDOG] Long-running operation: {idle_time:.0f}s since last activity")
-
             except Exception as e:
                 logger.error(f"[WATCHDOG] Error in watchdog thread: {e}")
 
