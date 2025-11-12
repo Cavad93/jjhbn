@@ -868,9 +868,8 @@ Telegram уведомления работают корректно!
         daily_pnl = status_data.get('daily_pnl', 0.0)
         closed_today = status_data.get('closed_trades_today', 0)
 
-        # Безопасное форматирование win rate
-        win_rate_pct = win_rate * 100 if win_rate is not None else 0
-        win_rate_str = self._safe_format_number(win_rate_pct, ".1f", "0.0")
+        # Безопасное форматирование win rate (уже в процентах от position_manager)
+        win_rate_str = self._safe_format_number(win_rate, ".1f", "0.0")
         realized_pnl_str = self._safe_format_number(total_realized_pnl, "+.2f")
         daily_pnl_str = self._safe_format_number(daily_pnl, "+.2f")
 

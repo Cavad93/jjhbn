@@ -1740,7 +1740,7 @@ class BinanceTradingBot:
                 try:
                     # Получаем текущую цену
                     ticker = self.exchange.get_ticker(pos.symbol)
-                    current_price = ticker['last']
+                    current_price = ticker['lastPrice']  # Правильный ключ!
 
                     # Вычисляем нереализованный PnL
                     pnl_usdt, pnl_pct = pos.calculate_pnl(current_price)
@@ -1822,8 +1822,8 @@ class BinanceTradingBot:
             total_realized_pnl = pnl_summary.get('total_pnl', 0.0)
             avg_win = pnl_summary.get('avg_win', 0.0)
             avg_loss = pnl_summary.get('avg_loss', 0.0)
-            best_trade = pnl_summary.get('best_trade', 0.0)
-            worst_trade = pnl_summary.get('worst_trade', 0.0)
+            best_trade = pnl_summary.get('max_win', 0.0)  # Правильный ключ!
+            worst_trade = pnl_summary.get('max_loss', 0.0)  # Правильный ключ!
 
             # Подсчет закрытых сделок сегодня
             closed_today = 0
