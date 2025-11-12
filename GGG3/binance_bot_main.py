@@ -82,6 +82,7 @@ from paper_trading.paper_exchange import PaperExchange
 
 # Notifications
 from notifications.telegram_notifier import TelegramNotifier
+from notifications.ai_assistant import AITradingAssistant, BotContextCollector
 
 # Logging
 logging.basicConfig(
@@ -213,6 +214,39 @@ class BinanceTradingBot:
             enabled=config.TELEGRAM_ALERTS_ENABLED
         )
 
+        # AI Trading Assistant (Claude Sonnet 4.5)
+        if config.TELEGRAM_ALERTS_ENABLED and config.ANTHROPIC_API_KEY:
+            try:
+                # Context collector для сбора данных бота
+                self.bot_context_collector = BotContextCollector(
+                    position_manager=self.position_manager,
+                    capital_tracker=self.capital_tracker if paper_mode else None,
+                    config=config
+                )
+
+                # AI Assistant
+                self.ai_assistant = AITradingAssistant(
+                    api_key=config.ANTHROPIC_API_KEY,
+                    context_collector=self.bot_context_collector
+                )
+
+                # Связываем с Telegram
+                self.telegram.set_ai_assistant(self.ai_assistant)
+
+                print(f"  AI Assistant: Enabled (Claude Sonnet 4.5)")
+            except Exception as e:
+                logger.warning(f"Failed to initialize AI Assistant: {e}")
+                self.ai_assistant = None
+                self.bot_context_collector = None
+                print(f"  AI Assistant: Disabled (initialization failed)")
+        else:
+            self.ai_assistant = None
+            self.bot_context_collector = None
+            if not config.TELEGRAM_ALERTS_ENABLED:
+                print(f"  AI Assistant: Disabled (Telegram disabled)")
+            else:
+                print(f"  AI Assistant: Disabled (no API key)")
+
         # Haiku 4.5 Fundamental Analyzer
         if config.HAIKU_ANALYSIS_ENABLED and config.ANTHROPIC_API_KEY:
             try:
@@ -291,6 +325,7 @@ class BinanceTradingBot:
 
         # ✅ Регистрация обработчиков команд Telegram
         self.telegram.register_command_handler('status', self._handle_status_command)
+        self.telegram.register_command_handler('ai', self._handle_ai_command)
         self.telegram.start_command_listener()
         logger.info("Telegram command listener started")
 
@@ -1865,6 +1900,31 @@ class BinanceTradingBot:
         except Exception as e:
             logger.error(f"Error in status command handler: {e}", exc_info=True)
             return f"❌ Ошибка при получении статуса: {str(e)}"
+
+    def _handle_ai_command(self) -> str:
+        """
+        Обработчик команды /ai
+
+        Отправляет панель управления AI ассистентом с кнопками:
+        - Активировать/Деактивировать AI
+        - AI Status (анализ бота через Claude Sonnet 4.5)
+
+        Returns:
+            str: Пустая строка (метод уже отправляет сообщение)
+        """
+        try:
+            if not self.ai_assistant:
+                return "❌ AI Assistant не настроен. Проверьте ANTHROPIC_API_KEY в .env"
+
+            # Отправляем панель управления
+            self.telegram.send_ai_control_panel()
+
+            # Возвращаем пустую строку (метод уже отправил сообщение)
+            return ""
+
+        except Exception as e:
+            logger.error(f"Error in /ai command: {e}", exc_info=True)
+            return f"❌ Ошибка при вызове AI панели: {str(e)[:100]}"
 
     # ========================================================================
     # SHUTDOWN

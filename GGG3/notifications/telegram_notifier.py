@@ -27,7 +27,7 @@ class TelegramNotifier:
     Отправка уведомлений в Telegram через Bot API
     """
 
-    def __init__(self, bot_token: str, chat_id: str, enabled: bool = True):
+    def __init__(self, bot_token: str, chat_id: str, enabled: bool = True, ai_assistant=None):
         """
         Инициализация Telegram notifier
 
@@ -35,18 +35,24 @@ class TelegramNotifier:
             bot_token: Токен Telegram бота (получить у @BotFather)
             chat_id: ID чата для отправки сообщений
             enabled: Включить/выключить уведомления
+            ai_assistant: AI Assistant instance (опционально)
         """
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.enabled = enabled
         self.api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         self.get_updates_url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
+        self.answer_callback_url = f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery"
+        self.edit_message_url = f"https://api.telegram.org/bot{bot_token}/editMessageText"
 
         # Для обработки команд
         self.last_update_id = 0
         self.command_handlers: Dict[str, Callable] = {}
         self.command_thread: Optional[threading.Thread] = None
         self.command_thread_running = False
+
+        # AI Assistant
+        self.ai_assistant = ai_assistant
 
         if not enabled:
             logger.info("Telegram notifications disabled")
@@ -56,13 +62,14 @@ class TelegramNotifier:
         else:
             logger.info(f"Telegram notifier initialized (chat_id: {chat_id})")
 
-    def _send_message(self, text: str, parse_mode: str = "HTML") -> bool:
+    def _send_message(self, text: str, parse_mode: str = "HTML", reply_markup: Optional[Dict] = None) -> bool:
         """
         Отправка сообщения в Telegram
 
         Args:
             text: Текст сообщения
             parse_mode: Формат текста (HTML, Markdown, MarkdownV2, None)
+            reply_markup: Inline keyboard markup (опционально)
 
         Returns:
             True если успешно отправлено, False иначе
@@ -80,6 +87,10 @@ class TelegramNotifier:
             # Добавляем parse_mode только если он указан
             if parse_mode:
                 payload["parse_mode"] = parse_mode
+
+            # Добавляем кнопки если указаны
+            if reply_markup:
+                payload["reply_markup"] = reply_markup
 
             response = requests.post(self.api_url, json=payload, timeout=10)
             response.raise_for_status()
@@ -645,7 +656,7 @@ Telegram уведомления работают корректно!
                 params = {
                     "offset": self.last_update_id + 1,
                     "timeout": 30,
-                    "allowed_updates": ["message"]
+                    "allowed_updates": ["message", "callback_query"]  # Добавляем callback_query для кнопок
                 }
 
                 response = requests.get(self.get_updates_url, params=params, timeout=35)
@@ -663,34 +674,47 @@ Telegram уведомления работают корректно!
                 for update in updates:
                     self.last_update_id = max(self.last_update_id, update["update_id"])
 
-                    # Проверяем что это сообщение от нашего чата
+                    # ═══════════════════════════════════════════════════════════════
+                    # ОБРАБОТКА CALLBACK QUERIES (кнопки)
+                    # ═══════════════════════════════════════════════════════════════
+                    if "callback_query" in update:
+                        self._handle_callback_query(update["callback_query"])
+                        continue
+
+                    # ═══════════════════════════════════════════════════════════════
+                    # ОБРАБОТКА ТЕКСТОВЫХ СООБЩЕНИЙ
+                    # ═══════════════════════════════════════════════════════════════
                     message = update.get("message", {})
                     chat_id = str(message.get("chat", {}).get("id", ""))
 
                     if chat_id != self.chat_id:
                         continue
 
-                    # Проверяем что это команда
                     text = message.get("text", "")
-                    if not text.startswith("/"):
+                    if not text:
                         continue
 
-                    # Парсим команду
-                    command = text.split()[0][1:]  # Убираем '/'
+                    # Проверяем команды
+                    if text.startswith("/"):
+                        # Парсим команду
+                        command = text.split()[0][1:]  # Убираем '/'
 
-                    # Вызываем обработчик
-                    if command in self.command_handlers:
-                        try:
-                            response_text = self.command_handlers[command]()
-                            # Отправляем сообщение только если есть текст
-                            # (обработчик может сам отправить сообщение и вернуть пустую строку)
-                            if response_text:
-                                self._send_message(response_text)
-                        except Exception as e:
-                            logger.error(f"Error handling command /{command}: {e}", exc_info=True)
-                            self._send_message(f"❌ Ошибка при выполнении команды /{command}: {str(e)}")
+                        # Вызываем обработчик
+                        if command in self.command_handlers:
+                            try:
+                                response_text = self.command_handlers[command]()
+                                # Отправляем сообщение только если есть текст
+                                # (обработчик может сам отправить сообщение и вернуть пустую строку)
+                                if response_text:
+                                    self._send_message(response_text)
+                            except Exception as e:
+                                logger.error(f"Error handling command /{command}: {e}", exc_info=True)
+                                self._send_message(f"❌ Ошибка при выполнении команды /{command}: {str(e)}")
+                        else:
+                            logger.debug(f"Unknown command: /{command}")
                     else:
-                        logger.debug(f"Unknown command: /{command}")
+                        # Не команда - проверяем активна ли AI сессия
+                        self._handle_ai_message(text, message.get("from", {}).get("id", ""))
 
             except requests.exceptions.Timeout:
                 # Это нормально для long polling
@@ -700,6 +724,220 @@ Telegram уведомления работают корректно!
                 time.sleep(5)
 
         logger.info("Command listener loop stopped")
+
+    # ========================================================================
+    # AI ASSISTANT INTEGRATION
+    # ========================================================================
+
+    def set_ai_assistant(self, ai_assistant):
+        """
+        Установить AI Assistant instance
+
+        Args:
+            ai_assistant: AITradingAssistant instance
+        """
+        self.ai_assistant = ai_assistant
+        logger.info("[TelegramNotifier] AI Assistant connected")
+
+    def send_ai_control_panel(self):
+        """Отправка панели управления AI ассистентом"""
+        if not self.ai_assistant:
+            logger.warning("[TelegramNotifier] AI Assistant not configured")
+            return False
+
+        # Проверяем активность сессии
+        user_id = self.chat_id  # Используем chat_id как user_id
+        is_active = self.ai_assistant.is_session_active(user_id)
+
+        # Формируем текст
+        if is_active:
+            text = "🤖 <b>AI АССИСТЕНТ АКТИВЕН</b>\n\nМожете задавать вопросы о боте в чате."
+
+            # Показываем статистику сессии
+            stats = self.ai_assistant.get_session_stats(user_id)
+            if stats:
+                text += f"\n\n📊 Статистика:"
+                text += f"\n  • Сообщений: {stats['total_messages']}"
+                text += f"\n  • Стоимость: ${stats['total_cost_usd']:.4f}"
+                text += f"\n  • Cache эфф.: {stats['cache_efficiency_pct']:.1f}%"
+        else:
+            text = "🤖 <b>AI АССИСТЕНТ</b>\n\nАктивируйте AI для интерактивного чата с ботом."
+
+        # Формируем кнопки
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "💤 Деактивировать" if is_active else "⚡ Активировать",
+                     "callback_data": "ai_deactivate" if is_active else "ai_activate"}
+                ],
+                [
+                    {"text": "📊 AI Status", "callback_data": "ai_status"}
+                ]
+            ]
+        }
+
+        return self._send_message(text, reply_markup=keyboard)
+
+    def _handle_callback_query(self, callback_query: Dict):
+        """
+        Обработка нажатия на inline кнопку
+
+        Args:
+            callback_query: Callback query от Telegram
+        """
+        callback_id = callback_query.get("id")
+        data = callback_query.get("data", "")
+        user_id = str(callback_query.get("from", {}).get("id", ""))
+
+        logger.info(f"[TelegramNotifier] Callback query: {data} from user {user_id}")
+
+        try:
+            # Обработка AI команд
+            if data == "ai_activate":
+                self._handle_ai_activate(user_id)
+            elif data == "ai_deactivate":
+                self._handle_ai_deactivate(user_id)
+            elif data == "ai_status":
+                self._handle_ai_status(user_id)
+            else:
+                logger.warning(f"[TelegramNotifier] Unknown callback data: {data}")
+
+            # Подтверждаем обработку callback
+            self._answer_callback_query(callback_id)
+
+        except Exception as e:
+            logger.error(f"[TelegramNotifier] Error handling callback: {e}", exc_info=True)
+            self._answer_callback_query(callback_id, f"Ошибка: {str(e)[:50]}")
+
+    def _answer_callback_query(self, callback_id: str, text: Optional[str] = None):
+        """Ответ на callback query"""
+        try:
+            payload = {"callback_query_id": callback_id}
+            if text:
+                payload["text"] = text
+
+            requests.post(self.answer_callback_url, json=payload, timeout=5)
+        except Exception as e:
+            logger.warning(f"[TelegramNotifier] Failed to answer callback: {e}")
+
+    def _handle_ai_activate(self, user_id: str):
+        """Активация AI сессии"""
+        if not self.ai_assistant:
+            self._send_message("❌ AI Assistant не настроен. Проверьте ANTHROPIC_API_KEY в .env")
+            return
+
+        try:
+            session = self.ai_assistant.activate_session(user_id, self.chat_id)
+            logger.info(f"[TelegramNotifier] AI session activated for user {user_id}")
+
+            # Обновляем панель управления
+            self.send_ai_control_panel()
+
+            # Приветственное сообщение
+            self._send_message(
+                "✅ <b>AI Ассистент активирован!</b>\n\n"
+                "Теперь вы можете задавать вопросы о боте прямо в чате:\n\n"
+                "• Почему бот открыл позицию?\n"
+                "• Сколько я заработал?\n"
+                "• Есть ли проблемы?\n"
+                "• Что с капиталом?\n\n"
+                "Просто пишите вопросы текстом."
+            )
+
+        except Exception as e:
+            logger.error(f"[TelegramNotifier] Failed to activate AI: {e}", exc_info=True)
+            self._send_message(f"❌ Ошибка активации AI: {str(e)[:100]}")
+
+    def _handle_ai_deactivate(self, user_id: str):
+        """Деактивация AI сессии"""
+        if not self.ai_assistant:
+            return
+
+        try:
+            self.ai_assistant.deactivate_session(user_id)
+            logger.info(f"[TelegramNotifier] AI session deactivated for user {user_id}")
+
+            # Обновляем панель управления
+            self.send_ai_control_panel()
+
+            self._send_message("💤 <b>AI Ассистент деактивирован.</b>\n\nДля экономии токенов сессия остановлена.")
+
+        except Exception as e:
+            logger.error(f"[TelegramNotifier] Failed to deactivate AI: {e}", exc_info=True)
+            self._send_message(f"❌ Ошибка деактивации AI: {str(e)[:100]}")
+
+    def _handle_ai_status(self, user_id: str):
+        """Генерация AI Status отчета"""
+        if not self.ai_assistant:
+            self._send_message("❌ AI Assistant не настроен")
+            return
+
+        try:
+            # Отправляем уведомление о генерации
+            self._send_message("🤖 Генерирую AI-анализ состояния бота...\n\nЭто займет 3-5 секунд.")
+
+            # Получаем AI анализ
+            report = self.ai_assistant.get_ai_status_report(user_id)
+
+            # Отправляем отчет
+            self._send_message(f"📊 <b>AI STATUS REPORT</b>\n\n{report}")
+
+        except Exception as e:
+            logger.error(f"[TelegramNotifier] Failed to generate AI status: {e}", exc_info=True)
+            self._send_message(f"❌ Ошибка генерации AI Status: {str(e)[:100]}")
+
+    def _handle_ai_message(self, message: str, user_id: str):
+        """
+        Обработка текстового сообщения для AI чата
+
+        Args:
+            message: Текст сообщения
+            user_id: Telegram user ID
+        """
+        if not self.ai_assistant:
+            return
+
+        # Проверяем активна ли сессия
+        if not self.ai_assistant.is_session_active(user_id):
+            logger.debug(f"[TelegramNotifier] AI session not active for user {user_id}, ignoring message")
+            return
+
+        try:
+            logger.info(f"[TelegramNotifier] Processing AI message from user {user_id}: {message[:50]}...")
+
+            # Отправляем в AI
+            response = self.ai_assistant.chat(user_id, message)
+
+            # Разбиваем длинный ответ на части (Telegram limit 4096 chars)
+            MAX_LENGTH = 4000
+            if len(response) <= MAX_LENGTH:
+                self._send_message(response)
+            else:
+                # Разбиваем на части
+                parts = []
+                while response:
+                    if len(response) <= MAX_LENGTH:
+                        parts.append(response)
+                        break
+
+                    # Ищем последний перенос строки перед лимитом
+                    split_pos = response.rfind('\n', 0, MAX_LENGTH)
+                    if split_pos == -1:
+                        split_pos = MAX_LENGTH
+
+                    parts.append(response[:split_pos])
+                    response = response[split_pos:].lstrip()
+
+                # Отправляем по частям
+                for i, part in enumerate(parts, 1):
+                    if len(parts) > 1:
+                        part = f"[{i}/{len(parts)}]\n\n{part}"
+                    self._send_message(part)
+                    time.sleep(0.5)  # Небольшая пауза между сообщениями
+
+        except Exception as e:
+            logger.error(f"[TelegramNotifier] Error processing AI message: {e}", exc_info=True)
+            self._send_message(f"❌ Ошибка обработки сообщения: {str(e)[:100]}")
 
     # ========================================================================
     # DETAILED STATUS REPORT (для команды /status)
