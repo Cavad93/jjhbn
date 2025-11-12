@@ -45,7 +45,7 @@ def restore_balance_from_capital_tracker():
     print()
 
     # Файлы
-    snapshots_file = data_dir / "capital_tracker_snapshots.json"
+    snapshots_file = data_dir / "capital_history.json"
     paper_exchange_file = data_dir / "paper_exchange_state.json"
 
     # Проверяем наличие capital tracker snapshots
@@ -64,7 +64,9 @@ def restore_balance_from_capital_tracker():
     # Загружаем снимки
     try:
         with open(snapshots_file, 'r') as f:
-            snapshots = json.load(f)
+            data = json.load(f)
+            # CapitalTracker сохраняет в формате {"history": [...], "last_updated": ...}
+            snapshots = data.get('history', [])
     except Exception as e:
         print(f"❌ ERROR: Failed to load capital tracker snapshots: {e}")
         return False
