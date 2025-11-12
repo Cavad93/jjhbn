@@ -326,6 +326,11 @@ class BinanceTradingBot:
         # ✅ Регистрация обработчиков команд Telegram
         self.telegram.register_command_handler('status', self._handle_status_command)
         self.telegram.register_command_handler('ai', self._handle_ai_command)
+        self.telegram.register_command_handler('closeall', self._handle_closeall_command)
+
+        # Устанавливаем обработчик закрытия всех позиций
+        self.telegram.closeall_handler = self.close_all_positions
+
         self.telegram.start_command_listener()
         logger.info("Telegram command listener started")
 
@@ -1925,6 +1930,137 @@ class BinanceTradingBot:
         except Exception as e:
             logger.error(f"Error in /ai command: {e}", exc_info=True)
             return f"❌ Ошибка при вызове AI панели: {str(e)[:100]}"
+
+    def _handle_closeall_command(self) -> str:
+        """
+        Обработчик команды /closeall
+
+        Отправляет панель подтверждения для закрытия всех открытых позиций.
+
+        Returns:
+            str: Пустая строка (метод уже отправляет сообщение)
+        """
+        try:
+            # Получаем открытые позиции
+            open_positions = self.position_manager.get_all_open()
+
+            if not open_positions:
+                return "ℹ️ <b>НЕТ ОТКРЫТЫХ ПОЗИЦИЙ</b>\n\nВсе позиции уже закрыты."
+
+            # Считаем общую стоимость
+            total_value = sum(pos.position_value for pos in open_positions)
+
+            # Отправляем панель подтверждения
+            self.telegram.send_closeall_confirmation(
+                open_positions_count=len(open_positions),
+                total_value=total_value
+            )
+
+            # Возвращаем пустую строку (метод уже отправил сообщение)
+            return ""
+
+        except Exception as e:
+            logger.error(f"Error in /closeall command: {e}", exc_info=True)
+            return f"❌ Ошибка при вызове closeall: {str(e)[:100]}"
+
+    def close_all_positions(self) -> Dict:
+        """
+        Закрытие всех открытых позиций (emergency stop)
+
+        Returns:
+            Dict: Результат операции с полями:
+                - success: bool - успешно ли выполнено
+                - closed_count: int - количество закрытых позиций
+                - failed_count: int - количество неудачных попыток
+                - total_pnl: float - общий PnL
+                - details: List[Dict] - детали по каждой позиции
+                - error: str (если success=False)
+        """
+        logger.warning("="*80)
+        logger.warning("⚠️ EMERGENCY CLOSE ALL POSITIONS REQUESTED")
+        logger.warning("="*80)
+
+        result = {
+            "success": False,
+            "closed_count": 0,
+            "failed_count": 0,
+            "total_pnl": 0.0,
+            "details": [],
+            "error": None
+        }
+
+        try:
+            # Получаем все открытые позиции
+            open_positions = self.position_manager.get_all_open()
+
+            if not open_positions:
+                result["success"] = True
+                result["error"] = "Нет открытых позиций"
+                logger.info("No open positions to close")
+                return result
+
+            logger.info(f"Closing {len(open_positions)} open positions...")
+
+            # Закрываем каждую позицию
+            for pos in open_positions:
+                try:
+                    symbol = pos.symbol
+                    logger.info(f"Closing position: {symbol} {pos.direction}")
+
+                    # Получаем текущую цену
+                    ticker = self.exchange.get_ticker(symbol)
+                    current_price = ticker['lastPrice']
+
+                    # Вычисляем PnL
+                    pnl_usdt, pnl_pct = pos.calculate_pnl(current_price)
+
+                    # Закрываем позицию через PositionManager
+                    # (это обновит статистику и отправит уведомление)
+                    self.position_manager.close_position(
+                        symbol=symbol,
+                        exit_price=current_price,
+                        exit_reason="EMERGENCY_CLOSEALL"
+                    )
+
+                    result["closed_count"] += 1
+                    result["total_pnl"] += pnl_usdt
+
+                    # Добавляем детали
+                    result["details"].append({
+                        "symbol": symbol,
+                        "direction": pos.direction,
+                        "entry_price": pos.entry_price,
+                        "exit_price": current_price,
+                        "pnl": pnl_usdt,
+                        "pnl_pct": pnl_pct
+                    })
+
+                    logger.info(f"✅ Closed {symbol}: PnL ${pnl_usdt:+.2f} ({pnl_pct:+.2f}%)")
+
+                except Exception as e:
+                    logger.error(f"Failed to close position {pos.symbol}: {e}", exc_info=True)
+                    result["failed_count"] += 1
+                    result["details"].append({
+                        "symbol": pos.symbol,
+                        "error": str(e)[:100]
+                    })
+
+            # Если хотя бы одна позиция закрыта - успех
+            if result["closed_count"] > 0:
+                result["success"] = True
+
+            logger.warning("="*80)
+            logger.warning(f"✅ CLOSEALL COMPLETED: {result['closed_count']} closed, {result['failed_count']} failed")
+            logger.warning(f"   Total PnL: ${result['total_pnl']:+.2f}")
+            logger.warning("="*80)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Critical error in close_all_positions: {e}", exc_info=True)
+            result["success"] = False
+            result["error"] = f"Critical error: {str(e)[:200]}"
+            return result
 
     # ========================================================================
     # SHUTDOWN

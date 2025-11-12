@@ -54,6 +54,9 @@ class TelegramNotifier:
         # AI Assistant
         self.ai_assistant = ai_assistant
 
+        # Close all positions handler (будет установлен из main)
+        self.closeall_handler: Optional[Callable] = None
+
         if not enabled:
             logger.info("Telegram notifications disabled")
         elif not bot_token or not chat_id:
@@ -778,6 +781,41 @@ Telegram уведомления работают корректно!
 
         return self._send_message(text, reply_markup=keyboard)
 
+    def send_closeall_confirmation(self, open_positions_count: int, total_value: float):
+        """
+        Отправка панели подтверждения закрытия всех позиций
+
+        Args:
+            open_positions_count: Количество открытых позиций
+            total_value: Общая стоимость позиций
+        """
+        if open_positions_count == 0:
+            text = "ℹ️ <b>НЕТ ОТКРЫТЫХ ПОЗИЦИЙ</b>\n\nВсе позиции уже закрыты."
+            return self._send_message(text)
+
+        text = f"""
+⚠️ <b>ЗАКРЫТИЕ ВСЕХ ПОЗИЦИЙ</b>
+
+Вы уверены что хотите закрыть ВСЕ открытые позиции?
+
+📊 Будет закрыто: <b>{open_positions_count}</b> позиций
+💰 Общий объём: <b>${total_value:.2f}</b>
+
+⚠️ Это действие нельзя отменить!
+        """.strip()
+
+        # Формируем кнопки подтверждения
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Да, закрыть ВСЕ", "callback_data": "closeall_confirm"},
+                    {"text": "❌ Отмена", "callback_data": "closeall_cancel"}
+                ]
+            ]
+        }
+
+        return self._send_message(text, reply_markup=keyboard)
+
     def _handle_callback_query(self, callback_query: Dict):
         """
         Обработка нажатия на inline кнопку
@@ -799,6 +837,11 @@ Telegram уведомления работают корректно!
                 self._handle_ai_deactivate(user_id)
             elif data == "ai_status":
                 self._handle_ai_status(user_id)
+            # Обработка closeall команд
+            elif data == "closeall_confirm":
+                self._handle_closeall_confirm()
+            elif data == "closeall_cancel":
+                self._handle_closeall_cancel()
             else:
                 logger.warning(f"[TelegramNotifier] Unknown callback data: {data}")
 
@@ -885,6 +928,60 @@ Telegram уведомления работают корректно!
         except Exception as e:
             logger.error(f"[TelegramNotifier] Failed to generate AI status: {e}", exc_info=True)
             self._send_message(f"❌ Ошибка генерации AI Status: {str(e)[:100]}")
+
+    def _handle_closeall_confirm(self):
+        """Обработка подтверждения закрытия всех позиций"""
+        if not self.closeall_handler:
+            self._send_message("❌ Обработчик closeall не настроен")
+            return
+
+        try:
+            logger.info("[TelegramNotifier] User confirmed closeall - executing...")
+            self._send_message("⏳ <b>ЗАКРЫТИЕ ВСЕХ ПОЗИЦИЙ...</b>\n\nПожалуйста, подождите...")
+
+            # Вызываем обработчик закрытия позиций
+            result = self.closeall_handler()
+
+            # Отправляем результат
+            if result.get("success"):
+                closed_count = result.get("closed_count", 0)
+                failed_count = result.get("failed_count", 0)
+                total_pnl = result.get("total_pnl", 0.0)
+                details = result.get("details", [])
+
+                text = f"""
+✅ <b>ВСЕ ПОЗИЦИИ ЗАКРЫТЫ</b>
+
+📊 Закрыто: <b>{closed_count}</b> позиций
+💰 Общий PnL: <b>${total_pnl:+.2f}</b>
+                """.strip()
+
+                if failed_count > 0:
+                    text += f"\n\n⚠️ Не удалось закрыть: {failed_count} позиций"
+
+                if details:
+                    text += "\n\n<b>Детали:</b>"
+                    for detail in details[:5]:  # Показываем первые 5
+                        symbol = detail.get("symbol", "?")
+                        pnl = detail.get("pnl", 0.0)
+                        text += f"\n  • {symbol}: ${pnl:+.2f}"
+
+                    if len(details) > 5:
+                        text += f"\n  ... и ещё {len(details) - 5}"
+
+                self._send_message(text)
+            else:
+                error_msg = result.get("error", "Unknown error")
+                self._send_message(f"❌ <b>ОШИБКА</b>\n\n{error_msg}")
+
+        except Exception as e:
+            logger.error(f"[TelegramNotifier] Error executing closeall: {e}", exc_info=True)
+            self._send_message(f"❌ <b>ОШИБКА ЗАКРЫТИЯ</b>\n\n{str(e)[:200]}")
+
+    def _handle_closeall_cancel(self):
+        """Обработка отмены закрытия всех позиций"""
+        logger.info("[TelegramNotifier] User cancelled closeall")
+        self._send_message("❌ <b>ОТМЕНЕНО</b>\n\nЗакрытие всех позиций отменено.")
 
     def _handle_ai_message(self, message: str, user_id: str):
         """
