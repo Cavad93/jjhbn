@@ -221,7 +221,8 @@ class BinanceTradingBot:
                 self.bot_context_collector = BotContextCollector(
                     position_manager=self.position_manager,
                     capital_tracker=self.capital_tracker if paper_mode else None,
-                    config=config
+                    config=config,
+                    exchange=self.exchange  # ✅ Передаём exchange для получения текущих цен
                 )
 
                 # AI Assistant

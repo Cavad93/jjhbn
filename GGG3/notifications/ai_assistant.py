@@ -190,16 +190,18 @@ class BotContextCollector:
     - Ошибках и предупреждениях
     """
 
-    def __init__(self, position_manager, capital_tracker, config):
+    def __init__(self, position_manager, capital_tracker, config, exchange=None):
         """
         Args:
             position_manager: PositionManager instance
             capital_tracker: CapitalTracker instance
             config: Bot configuration
+            exchange: Exchange instance для получения текущих цен (опционально)
         """
         self.position_manager = position_manager
         self.capital_tracker = capital_tracker
         self.config = config
+        self.exchange = exchange
 
         logger.debug("[BotContextCollector] Initialized")
 
@@ -226,12 +228,14 @@ class BotContextCollector:
         return context
 
     def _collect_positions(self) -> Dict[str, Any]:
-        """Сбор информации о позициях"""
+        """Сбор информации о позициях с текущими ценами и PnL"""
         open_positions = self.position_manager.get_all_open()
 
         positions_data = []
+        total_unrealized_pnl = 0.0
+
         for pos in open_positions:
-            positions_data.append({
+            pos_data = {
                 "symbol": pos.symbol,
                 "direction": pos.direction,
                 "entry_price": pos.entry_price,
@@ -244,12 +248,39 @@ class BotContextCollector:
                 "p_meta": pos.entry_snapshot.get("p_meta", 0.0),
                 "ev": pos.entry_snapshot.get("selected_ev", 0.0),
                 "metadata": pos.metadata
-            })
+            }
+
+            # Получаем текущую цену и вычисляем нереализованный PnL
+            if self.exchange:
+                try:
+                    ticker = self.exchange.get_ticker(pos.symbol)
+                    current_price = ticker.get('lastPrice', pos.entry_price)
+
+                    # Вычисляем нереализованный PnL
+                    pnl_usdt, pnl_pct = pos.calculate_pnl(current_price)
+
+                    pos_data["current_price"] = current_price
+                    pos_data["unrealized_pnl"] = pnl_usdt
+                    pos_data["unrealized_pnl_pct"] = pnl_pct
+
+                    total_unrealized_pnl += pnl_usdt
+                except Exception as e:
+                    logger.warning(f"[BotContextCollector] Failed to get current price for {pos.symbol}: {e}")
+                    pos_data["current_price"] = None
+                    pos_data["unrealized_pnl"] = None
+                    pos_data["unrealized_pnl_pct"] = None
+            else:
+                pos_data["current_price"] = None
+                pos_data["unrealized_pnl"] = None
+                pos_data["unrealized_pnl_pct"] = None
+
+            positions_data.append(pos_data)
 
         return {
             "open": positions_data,
             "count": len(positions_data),
-            "total_value": sum(p["position_value"] for p in positions_data)
+            "total_value": sum(p["position_value"] for p in positions_data),
+            "total_unrealized_pnl": total_unrealized_pnl
         }
 
     def _collect_trades(self) -> Dict[str, Any]:
