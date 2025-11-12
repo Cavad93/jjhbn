@@ -227,7 +227,7 @@ class BotContextCollector:
 
     def _collect_positions(self) -> Dict[str, Any]:
         """Сбор информации о позициях"""
-        open_positions = self.position_manager.get_open_positions()
+        open_positions = self.position_manager.get_all_open()
 
         positions_data = []
         for pos in open_positions:
@@ -254,11 +254,11 @@ class BotContextCollector:
 
     def _collect_trades(self) -> Dict[str, Any]:
         """Сбор истории сделок"""
-        closed_positions = self.position_manager.get_closed_positions()
+        closed_positions = self.position_manager.get_recent_closed(limit=AIAssistantConfig.MAX_TRADES_IN_CONTEXT)
 
         # Последние N сделок
         recent_trades = []
-        for pos in closed_positions[-AIAssistantConfig.MAX_TRADES_IN_CONTEXT:]:
+        for pos in closed_positions:
             recent_trades.append({
                 "symbol": pos.symbol,
                 "direction": pos.direction,
@@ -292,16 +292,28 @@ class BotContextCollector:
 
     def _collect_capital(self) -> Dict[str, Any]:
         """Сбор информации о капитале"""
-        equity = self.capital_tracker.get_total_equity()
-        free = self.capital_tracker.get_free_capital()
-        locked = self.capital_tracker.get_locked_capital()
-        reserve = self.capital_tracker.reserve_fund
+        # Получаем последний snapshot
+        latest_snapshot = self.capital_tracker.get_latest_snapshot()
+
+        if not latest_snapshot:
+            return {
+                "total_equity": 0.0,
+                "free_capital": 0.0,
+                "locked_capital": 0.0,
+                "reserve_fund": 0.0,
+                "changes": {}
+            }
+
+        equity = latest_snapshot.get("total_equity", 0.0)
+        free = latest_snapshot.get("free_balance", 0.0)
+        locked = latest_snapshot.get("locked_in_positions", 0.0)
+        reserve = latest_snapshot.get("reserve_fund", 0.0)
 
         # Изменения за периоды
         changes = {}
         for period_name, hours in [("1h", 1), ("24h", 24), ("7d", 168), ("30d", 720)]:
-            change_data = self.capital_tracker.get_capital_change(hours)
-            if change_data:
+            change_data = self.capital_tracker.get_change_over_period(equity, hours)
+            if change_data and change_data.get("available"):
                 changes[period_name] = {
                     "absolute": change_data["absolute"],
                     "percent": change_data["percent"],
@@ -318,18 +330,18 @@ class BotContextCollector:
 
     def _collect_statistics(self) -> Dict[str, Any]:
         """Сбор торговой статистики"""
-        stats = self.position_manager.get_statistics()
+        stats = self.position_manager.get_pnl_summary()
 
         return {
             "total_trades": stats.get("total_trades", 0),
             "win_rate": stats.get("win_rate", 0.0),
-            "total_pnl": stats.get("total_realized_pnl", 0.0),
+            "total_pnl": stats.get("total_pnl", 0.0),
             "avg_win": stats.get("avg_win", 0.0),
             "avg_loss": stats.get("avg_loss", 0.0),
-            "best_trade": stats.get("best_trade", 0.0),
-            "worst_trade": stats.get("worst_trade", 0.0),
-            "sharpe_ratio": stats.get("sharpe_ratio", 0.0),
-            "max_drawdown": stats.get("max_drawdown", 0.0)
+            "best_trade": stats.get("max_win", 0.0),
+            "worst_trade": stats.get("max_loss", 0.0),
+            "sharpe_ratio": 0.0,  # Not calculated by PositionManager
+            "max_drawdown": 0.0   # Not calculated by PositionManager
         }
 
     def _collect_modes(self) -> Dict[str, Any]:
