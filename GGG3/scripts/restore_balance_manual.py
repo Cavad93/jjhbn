@@ -60,6 +60,7 @@ def restore_manual_balance(balance: float):
         "positions": {},
         "orders": {},
         "trades_history": [],
+        "closed_positions": [],  # Required by PaperExchange
         "leverage": 1,
         "timestamp": datetime.utcnow().timestamp(),
         "_restored_manually": True,

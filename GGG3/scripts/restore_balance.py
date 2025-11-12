@@ -159,6 +159,7 @@ def restore_balance_from_capital_tracker():
         "positions": {},  # Позиции управляются PositionManager отдельно
         "orders": {},
         "trades_history": [],
+        "closed_positions": [],  # Required by PaperExchange
         "leverage": 1,
         "timestamp": latest_time,
         "_restored_from_capital_tracker": True,
