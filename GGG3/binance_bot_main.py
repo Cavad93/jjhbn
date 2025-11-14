@@ -1329,27 +1329,35 @@ class BinanceTradingBot:
 
                 # ПРАВИЛЬНЫЙ расчет капитала ПОСЛЕ открытия позиции
                 if self.paper_mode:
-                    # Для PaperExchange используем get_equity() - он УЖЕ учитывает unrealized PnL
-                    current_equity = self.exchange.get_equity()
+                    # Для детализации в уведомлениях и логах
+                    current_free_balance = self.exchange.get_balance('USDT')
+
+                    # ФЬЮЧЕРСЫ: Вычисляем нереализованный PnL всех открытых позиций
+                    total_unrealized_pnl = 0.0
+                    for pos in self.position_manager.get_all_open():
+                        try:
+                            ticker = self.exchange.get_ticker(pos.symbol)
+                            current_price = ticker['lastPrice']
+                            pnl_usdt, _ = pos.calculate_pnl(current_price)
+                            total_unrealized_pnl += pnl_usdt
+                        except Exception as e:
+                            logger.warning(f"Failed to calculate PnL for {pos.symbol}: {e}")
+                            continue
 
                     # Резервный фонд
                     current_reserve = self.reinvestment.reserve_fund if self.reinvestment else 0.0
 
-                    # Общий капитал = Equity (баланс + unrealized PnL) + Резерв
-                    actual_total_equity = current_equity + current_reserve
+                    # Общий капитал = баланс + unrealized PnL + резерв (правильная формула для фьючерсов)
+                    actual_total_equity = current_free_balance + total_unrealized_pnl + current_reserve
 
-                    # Для детализации в уведомлениях и логах
-                    current_free_balance = self.exchange.get_balance('USDT')
-
-                    # ФЬЮЧЕРСЫ: Используем используемую маржу, а не unrealized PnL
-                    # locked_in_positions теперь показывает реальную заблокированную маржу
+                    # Используемая маржа (для информации в уведомлениях)
                     locked_in_positions = self.exchange.get_used_margin(leverage=config.LEVERAGE)
 
-                    # Записываем snapshot
+                    # Записываем snapshot с правильными данными для фьючерсов
                     if self.capital_tracker:
                         self.capital_tracker.record_snapshot(
                             free_balance=current_free_balance,
-                            locked_in_positions=locked_in_positions,
+                            unrealized_pnl=total_unrealized_pnl,
                             reserve_fund=current_reserve,
                             num_open_positions=len(self.position_manager.get_all_open())
                         )
@@ -1460,20 +1468,31 @@ class BinanceTradingBot:
         # Это решает проблему "дырявых" snapshot'ов когда позиции не открываются часами
         if self.paper_mode and self.capital_tracker:
             try:
-                current_equity = self.exchange.get_equity()
-                current_reserve = self.reinvestment.reserve_fund if self.reinvestment else 0.0
                 current_free_balance = self.exchange.get_balance('USDT')
+                current_reserve = self.reinvestment.reserve_fund if self.reinvestment else 0.0
 
-                # ФЬЮЧЕРСЫ: Используем используемую маржу, а не unrealized PnL
-                locked_in_positions = self.exchange.get_used_margin(leverage=config.LEVERAGE)
+                # ФЬЮЧЕРСЫ: Вычисляем нереализованный PnL всех открытых позиций
+                total_unrealized_pnl = 0.0
+                for pos in self.position_manager.get_all_open():
+                    try:
+                        ticker = self.exchange.get_ticker(pos.symbol)
+                        current_price = ticker['lastPrice']
+                        pnl_usdt, _ = pos.calculate_pnl(current_price)
+                        total_unrealized_pnl += pnl_usdt
+                    except Exception as e:
+                        logger.warning(f"Failed to calculate PnL for {pos.symbol}: {e}")
+                        continue
+
+                # Общий капитал = баланс + unrealized PnL + резерв
+                current_equity = current_free_balance + total_unrealized_pnl + current_reserve
 
                 self.capital_tracker.record_snapshot(
                     free_balance=current_free_balance,
-                    locked_in_positions=locked_in_positions,
+                    unrealized_pnl=total_unrealized_pnl,
                     reserve_fund=current_reserve,
                     num_open_positions=len(self.position_manager.get_all_open())
                 )
-                logger.debug(f"Heartbeat snapshot recorded: equity=${current_equity + current_reserve:.2f}")
+                logger.debug(f"Heartbeat snapshot recorded: equity=${current_equity:.2f}")
             except Exception as e:
                 logger.warning(f"Failed to record heartbeat snapshot: {e}")
 
@@ -1824,9 +1843,10 @@ class BinanceTradingBot:
                 else:
                     current_reserve = 0.0
 
-                # КРИТИЧНО: total_equity должен включать locked_in_positions!
-                # Иначе расчёт изменений будет неправильным (snapshot включает locked_in_positions)
-                total_equity = current_free_balance + locked_in_positions + current_reserve
+                # ФЬЮЧЕРСЫ: Правильная формула для фьючерсной торговли
+                # При открытии позиции баланс НЕ меняется, только блокируется маржа
+                # Капитал = баланс + нереализованный PnL + резерв
+                total_equity = current_free_balance + total_unrealized_pnl + current_reserve
 
             except Exception as e:
                 logger.error(f"Error getting balance: {e}")

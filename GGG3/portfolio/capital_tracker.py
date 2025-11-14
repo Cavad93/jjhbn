@@ -71,26 +71,29 @@ class CapitalTracker:
     def record_snapshot(
         self,
         free_balance: float,
-        locked_in_positions: float,
+        unrealized_pnl: float,
         reserve_fund: float,
         num_open_positions: int = 0
     ):
         """
         Записывает snapshot капитала
 
+        ФЬЮЧЕРСЫ: Для фьючерсной торговли баланс НЕ меняется при открытии позиции.
+        Общий капитал = баланс + нереализованный PnL + резервный фонд
+
         Args:
-            free_balance: Свободный баланс
-            locked_in_positions: Заблокировано в позициях
+            free_balance: Текущий баланс (не меняется при открытии фьючерсов)
+            unrealized_pnl: Нереализованный PnL от всех открытых позиций
             reserve_fund: Резервный фонд
             num_open_positions: Количество открытых позиций
         """
-        total_equity = free_balance + locked_in_positions + reserve_fund
+        total_equity = free_balance + unrealized_pnl + reserve_fund
 
         snapshot = {
             'timestamp': time.time(),
             'datetime': datetime.utcnow().isoformat() + 'Z',  # UTC время с маркером Z
             'free_balance': free_balance,
-            'locked_in_positions': locked_in_positions,
+            'unrealized_pnl': unrealized_pnl,
             'reserve_fund': reserve_fund,
             'total_equity': total_equity,
             'num_open_positions': num_open_positions
@@ -318,7 +321,7 @@ if __name__ == "__main__":
     # Record snapshot
     tracker.record_snapshot(
         free_balance=500.0,
-        locked_in_positions=300.0,
+        unrealized_pnl=50.0,  # Нереализованный PnL от открытых позиций
         reserve_fund=50.0,
         num_open_positions=5
     )

@@ -330,14 +330,14 @@ class BotContextCollector:
             return {
                 "total_equity": 0.0,
                 "free_capital": 0.0,
-                "locked_capital": 0.0,
+                "unrealized_pnl": 0.0,
                 "reserve_fund": 0.0,
                 "changes": {}
             }
 
         equity = latest_snapshot.get("total_equity", 0.0)
         free = latest_snapshot.get("free_balance", 0.0)
-        locked = latest_snapshot.get("locked_in_positions", 0.0)
+        unrealized_pnl = latest_snapshot.get("unrealized_pnl", 0.0)
         reserve = latest_snapshot.get("reserve_fund", 0.0)
 
         # Изменения за периоды
@@ -354,7 +354,7 @@ class BotContextCollector:
         return {
             "total_equity": equity,
             "free_capital": free,
-            "locked_capital": locked,
+            "unrealized_pnl": unrealized_pnl,
             "reserve_fund": reserve,
             "changes": changes
         }
@@ -420,7 +420,7 @@ class BotContextCollector:
         # Капитал
         capital = context['capital']
         lines.append(f"CAPITAL: Total=${capital['total_equity']:,.2f}, Free=${capital['free_capital']:,.2f}, "
-                    f"Locked=${capital['locked_capital']:,.2f}")
+                    f"Unrealized PnL=${capital['unrealized_pnl']:+,.2f}")
         if capital['changes']:
             lines.append("Changes:")
             for period, data in capital['changes'].items():
