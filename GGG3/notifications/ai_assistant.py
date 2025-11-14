@@ -409,11 +409,19 @@ class BotContextCollector:
         # Позиции
         positions = context['positions']
         lines.append(f"OPEN POSITIONS: {positions['count']}")
+        if positions['count'] > 0:
+            lines.append(f"Total Unrealized PnL: ${positions.get('total_unrealized_pnl', 0.0):+,.2f}")
         for i, pos in enumerate(positions['open'], 1):
             lines.append(
                 f"{i}. {pos['symbol']} {pos['direction']} @ ${pos['entry_price']:.4f} "
                 f"(value=${pos['position_value']:.2f}, TP=${pos['tp_price']:.4f}, SL=${pos['sl_price']:.4f})"
             )
+            # Добавляем текущую цену и нереализованный PnL
+            if pos.get('current_price') is not None and pos.get('unrealized_pnl') is not None:
+                lines.append(
+                    f"   Current: ${pos['current_price']:.4f} | "
+                    f"Unrealized PnL: ${pos['unrealized_pnl']:+,.2f} ({pos['unrealized_pnl_pct']:+.2f}%)"
+                )
             lines.append(f"   META p_up={pos['p_meta']:.3f}, EV={pos['ev']:.4f}")
         lines.append("")
 
