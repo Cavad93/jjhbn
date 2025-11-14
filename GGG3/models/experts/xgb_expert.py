@@ -155,7 +155,8 @@ class XGBoostExpert:
             'reg_lambda': self.reg_lambda,
             'seed': self.random_state,
             'tree_method': 'hist',
-            'verbosity': 0
+            'verbosity': 0,
+            'base_score': 0.5  # Явно устанавливаем для binary:logistic
         }
 
         self.model = xgb.train(
@@ -244,7 +245,8 @@ class XGBoostExpert:
             'reg_lambda': self.reg_lambda,
             'seed': self.random_state,
             'tree_method': 'hist',
-            'verbosity': 0
+            'verbosity': 0,
+            'base_score': 0.5  # Явно устанавливаем для binary:logistic
         }
 
         # Ограничиваем количество новых деревьев чтобы не превысить лимит

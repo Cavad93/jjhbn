@@ -486,6 +486,7 @@ class BinanceTradingBot:
 
         retrained_count = 0
         skipped_count = 0
+        error_count = 0
 
         for pos in self.position_manager.closed_positions:
             # Получаем entry_snapshot с features
@@ -521,10 +522,11 @@ class BinanceTradingBot:
                     retrained_count += 1
                 except Exception as e:
                     logger.error(f"Error retraining experts on {pos.symbol}: {e}")
+                    error_count += 1
             else:
                 skipped_count += 1
 
-        logger.info(f"[ExpertsRetraining] Completed: {retrained_count} positions used, {skipped_count} skipped (no features)")
+        logger.info(f"[ExpertsRetraining] Completed: {retrained_count} positions used, {skipped_count} skipped (no features), {error_count} errors")
 
         # Логируем обновлённое состояние моделей
         if retrained_count > 0:
