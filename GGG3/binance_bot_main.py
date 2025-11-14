@@ -296,6 +296,11 @@ class BinanceTradingBot:
         # Восстанавливаем статистику из истории закрытых позиций
         self._restore_expert_stats()
 
+        # Переобучаем ML модели на исторических данных (если есть закрытые позиции с features)
+        if paper_mode and len(self.position_manager.closed_positions) > 0:
+            print("\n  Retraining ML models on historical closed positions...")
+            self._retrain_experts_from_history()
+
         # Track last trade time for adaptive threshold
         self.last_trade_time = None
 
@@ -470,6 +475,63 @@ class BinanceTradingBot:
 
         wins = sum(1 for p in closed if p.pnl > 0)
         return wins / len(closed)
+
+    def _retrain_experts_from_history(self):
+        """
+        Переобучает ML экспертов на истории закрытых позиций
+
+        Использует сохранённые features из entry_snapshot для обучения моделей.
+        """
+        logger.info("[ExpertsRetraining] Re-training ML experts from closed positions history...")
+
+        retrained_count = 0
+        skipped_count = 0
+
+        for pos in self.position_manager.closed_positions:
+            # Получаем entry_snapshot с features
+            snapshot = getattr(pos, 'entry_snapshot', {}) if hasattr(pos, 'entry_snapshot') else {}
+
+            # ИСПРАВЛЕНИЕ: Используем правильный ключ 'features_68d'
+            features = snapshot.get('features_68d')
+
+            if features is not None and hasattr(features, 'reshape'):
+                # Определяем фактический результат (цена выросла или упала)
+                if pos.direction == 'LONG':
+                    price_went_up = pos.pnl > 0
+                else:  # SHORT
+                    price_went_up = pos.pnl < 0  # SHORT: убыток означает цена выросла
+
+                y_outcome = np.array([price_went_up])
+                features_2d = features.reshape(1, -1) if features.ndim == 1 else features
+
+                # Обучаем все эксперты
+                try:
+                    if 'xgb' in self.experts and self.experts['xgb'] is not None:
+                        self.experts['xgb'].partial_fit(features_2d, y_outcome, n_new_trees=2, max_total_trees=200)
+
+                    if 'rf' in self.experts and self.experts['rf'] is not None:
+                        self.experts['rf'].partial_fit(features_2d, y_outcome)
+
+                    if 'arf' in self.experts and self.experts['arf'] is not None:
+                        self.experts['arf'].partial_fit(features_2d, y_outcome)
+
+                    if 'nn' in self.experts and self.experts['nn'] is not None:
+                        self.experts['nn'].partial_fit(features_2d, y_outcome, n_epochs=1)
+
+                    retrained_count += 1
+                except Exception as e:
+                    logger.error(f"Error retraining experts on {pos.symbol}: {e}")
+            else:
+                skipped_count += 1
+
+        logger.info(f"[ExpertsRetraining] Completed: {retrained_count} positions used, {skipped_count} skipped (no features)")
+
+        # Логируем обновлённое состояние моделей
+        if retrained_count > 0:
+            logger.info(f"[ExpertsRetraining] XGBoost: {self.experts['xgb'].train_samples} samples")
+            logger.info(f"[ExpertsRetraining] RandomForest/ARF: {self.experts['rf'].train_samples} samples")
+            logger.info(f"[ExpertsRetraining] AdaptiveRF: {self.experts['arf'].train_samples} samples")
+            logger.info(f"[ExpertsRetraining] NeuralNet: {self.experts['nn'].train_epochs} epochs")
 
     def _restore_expert_stats(self):
         """
@@ -1625,7 +1687,8 @@ class BinanceTradingBot:
                 logger.debug(f"META.record_result() called for {position.symbol}: y_up={y_up}, context={reg_ctx}")
 
                 # ✅ ONLINE LEARNING: Train all experts with real outcome
-                features = snapshot.get('features')
+                # ИСПРАВЛЕНИЕ: Используем правильный ключ 'features_68d' (не 'features')
+                features = snapshot.get('features_68d')
                 if features is not None and hasattr(features, 'reshape'):
                     features_2d = features.reshape(1, -1) if features.ndim == 1 else features
                     y_outcome = np.array([y_up])
