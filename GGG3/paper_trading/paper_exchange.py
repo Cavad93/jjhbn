@@ -1071,6 +1071,89 @@ class PaperExchange:
         empty_df['timestamp'] = empty_df.index
         return empty_df
 
+    def get_ohlcv_batch(
+        self,
+        requests: List[tuple],
+        max_workers: int = 10
+    ) -> Dict[str, Dict[str, 'pd.DataFrame']]:
+        """
+        ✅ ОПТИМИЗАЦИЯ: Параллельное получение OHLCV для нескольких пар
+
+        Использует ThreadPoolExecutor для одновременных запросов к Binance API.
+        Ускоряет скрининг ~300 монет в 5-10 раз.
+
+        Args:
+            requests: Список кортежей (symbol, timeframe, limit)
+                     Например: [
+                         ('BTCUSDT', '5m', 200),
+                         ('BTCUSDT', '15m', 200),
+                         ('ETHUSDT', '5m', 200),
+                         ...
+                     ]
+            max_workers: Максимум параллельных запросов (default: 10)
+                        Не ставьте >20 чтобы не нарваться на rate limit
+
+        Returns:
+            Dict[symbol, Dict[timeframe, DataFrame]]
+            Например: {
+                'BTCUSDT': {
+                    '5m': DataFrame(...),
+                    '15m': DataFrame(...),
+                },
+                'ETHUSDT': {
+                    '5m': DataFrame(...),
+                }
+            }
+
+        Performance:
+            - Синхронно: 400 монет × 4 TF × 50ms = ~80 секунд
+            - Параллельно (10 workers): ~8-10 секунд (ускорение 8-10x)
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        print(f"[PaperExchange] 📥 Batch OHLCV request: {len(requests)} requests with {max_workers} workers")
+
+        results = {}
+        failed_requests = []
+
+        def fetch_single(symbol, timeframe, limit):
+            """Внутренняя функция для одного запроса"""
+            try:
+                return (symbol, timeframe, self.get_ohlcv(symbol, timeframe, limit))
+            except Exception as e:
+                print(f"[PaperExchange] ⚠️  Failed batch request {symbol} {timeframe}: {e}")
+                return (symbol, timeframe, None)
+
+        # Параллельное выполнение запросов
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Создаём futures
+            future_to_req = {
+                executor.submit(fetch_single, sym, tf, lim): (sym, tf)
+                for sym, tf, lim in requests
+            }
+
+            # Собираем результаты по мере выполнения
+            for future in as_completed(future_to_req):
+                symbol, timeframe, df = future.result()
+
+                if df is not None and len(df) > 0:
+                    # Инициализируем dict для символа только если есть успешные данные
+                    if symbol not in results:
+                        results[symbol] = {}
+                    results[symbol][timeframe] = df
+                else:
+                    failed_requests.append((symbol, timeframe))
+
+        # Логирование результатов
+        success_count = sum(len(tfs) for tfs in results.values())
+        total_count = len(requests)
+        print(f"[PaperExchange] ✅ Batch complete: {success_count}/{total_count} successful")
+
+        if failed_requests:
+            print(f"[PaperExchange] ⚠️  Failed {len(failed_requests)} requests")
+
+        return results
+
     def get_statistics(self) -> dict:
         """
         Возвращает статистику по торговле
