@@ -1044,14 +1044,12 @@ def analyze_and_rank_top20(
         # ════════════════════════════════════════════════════════════════
         direction = opp.get('direction', 'LONG')
 
-        # Для LONG: p_up должна быть > threshold
-        # Для SHORT: p_down (1 - p_up) должна быть > threshold
-        if direction == 'LONG':
-            confidence = opp['p_up']
-            passes_threshold = confidence > p_threshold
-        else:  # SHORT
-            confidence = 1 - opp['p_up']  # p_down
-            passes_threshold = confidence > p_threshold
+        # ВАЖНО: opp['p_up'] уже содержит ПРАВИЛЬНУЮ вероятность для направления:
+        # - Для LONG: p_up = вероятность роста цены
+        # - Для SHORT: p_up = вероятность падения цены (уже преобразована coin_selector)
+        # Поэтому НЕ нужно инвертировать для SHORT!
+        confidence = opp['p_up']
+        passes_threshold = confidence > p_threshold
 
         # ════════════════════════════════════════════════════════════════
         # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Логика фильтрации ИЛИ, а не И
