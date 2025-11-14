@@ -5,6 +5,7 @@ Paper Trading Exchange Module
 """
 
 import json
+import os
 import time
 import uuid
 from typing import Dict, List, Optional
@@ -1153,7 +1154,10 @@ class PaperExchange:
 
     def save_state(self, filepath: str = "paper_exchange_state.json"):
         """
-        Сохраняет состояние биржи в JSON файл
+        Сохраняет состояние биржи в JSON файл с атомарной записью
+
+        Использует временный файл для предотвращения повреждения данных
+        при прерывании процесса (например, Ctrl+C)
 
         Args:
             filepath: Путь к файлу для сохранения
@@ -1171,15 +1175,51 @@ class PaperExchange:
             'saved_datetime': datetime.now().isoformat()
         }
 
-        with open(filepath, 'w') as f:
-            json.dump(state, f, indent=2)
+        # Создаём директорию если её нет
+        directory = os.path.dirname(filepath)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
 
-        print(f"[PaperExchange] State saved to {filepath}")
+        # Создаём резервную копию существующего файла
+        if os.path.exists(filepath):
+            backup_path = filepath + '.backup'
+            try:
+                import shutil
+                shutil.copy2(filepath, backup_path)
+            except Exception as e:
+                print(f"[PaperExchange] Warning: Failed to create backup: {e}")
+
+        # Атомарная запись через временный файл
+        temp_filepath = filepath + '.tmp'
+        try:
+            # Записываем во временный файл
+            with open(temp_filepath, 'w') as f:
+                json.dump(state, f, indent=2)
+                f.flush()  # Принудительно сбрасываем буфер
+                os.fsync(f.fileno())  # Синхронизируем с диском
+
+            # Атомарно переименовываем (заменяем старый файл)
+            # В большинстве ОС rename() - атомарная операция
+            os.replace(temp_filepath, filepath)
+
+            print(f"[PaperExchange] State saved to {filepath}")
+
+        except Exception as e:
+            print(f"[PaperExchange] ERROR: Failed to save state: {e}")
+            # Удаляем временный файл если он остался
+            if os.path.exists(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except:
+                    pass
+            raise
 
     @classmethod
     def load_state(cls, filepath: str = "paper_exchange_state.json") -> 'PaperExchange':
         """
-        Загружает состояние биржи из JSON файла
+        Загружает состояние биржи из JSON файла с автоматическим восстановлением из backup
+
+        Если основной файл повреждён, автоматически пытается загрузить из резервной копии
 
         Args:
             filepath: Путь к файлу состояния
@@ -1187,8 +1227,44 @@ class PaperExchange:
         Returns:
             PaperExchange: Восстановленный экземпляр биржи
         """
-        with open(filepath, 'r') as f:
-            state = json.load(f)
+        state = None
+        loaded_from = filepath
+        backup_path = filepath + '.backup'
+
+        # Пытаемся загрузить из основного файла
+        try:
+            with open(filepath, 'r') as f:
+                state = json.load(f)
+            loaded_from = filepath
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            print(f"[PaperExchange] ⚠️  Failed to load from {filepath}: {e}")
+
+            # Пытаемся загрузить из резервной копии
+            if os.path.exists(backup_path):
+                print(f"[PaperExchange] 🔄 Trying to restore from backup: {backup_path}")
+                try:
+                    with open(backup_path, 'r') as f:
+                        state = json.load(f)
+                    loaded_from = backup_path
+                    print(f"[PaperExchange] ✅ Successfully restored from backup!")
+
+                    # Восстанавливаем основной файл из backup
+                    try:
+                        import shutil
+                        shutil.copy2(backup_path, filepath)
+                        print(f"[PaperExchange] ✅ Main state file restored from backup")
+                    except Exception as restore_error:
+                        print(f"[PaperExchange] ⚠️  Could not restore main file: {restore_error}")
+
+                except (json.JSONDecodeError, Exception) as backup_error:
+                    print(f"[PaperExchange] ❌ Backup is also corrupted: {backup_error}")
+                    raise Exception(f"Both main and backup files are corrupted") from e
+            else:
+                print(f"[PaperExchange] ❌ No backup file found at {backup_path}")
+                raise
+
+        if state is None:
+            raise Exception("Failed to load state from any source")
 
         # Создаем новый экземпляр
         exchange = cls(initial_capital=state['initial_capital'])
@@ -1202,7 +1278,7 @@ class PaperExchange:
         exchange.slippage = state.get('slippage', 0.0005)
         exchange.commission = state.get('commission', 0.001)
 
-        print(f"[PaperExchange] State loaded from {filepath}")
+        print(f"[PaperExchange] State loaded from {loaded_from}")
         print(f"[PaperExchange] Balance: {exchange.balance:.2f} USDT, "
               f"Open positions: {len(exchange.positions)}, "
               f"Active orders: {len(exchange.orders)}")
