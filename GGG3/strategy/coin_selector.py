@@ -520,12 +520,16 @@ class CoinSelector:
                     ev = ev_long
                     tp_price = entry_price + tp_mult * atr_value
                     sl_price = entry_price - sl_mult * atr_value
+                    # Для LONG: используем вероятность роста
+                    p_success = p_up
 
                 elif ev_short > self.min_ev_threshold and ev_short > ev_long:
                     direction = 'SHORT'
                     ev = ev_short
                     tp_price = entry_price - tp_mult * atr_value
                     sl_price = entry_price + sl_mult * atr_value
+                    # Для SHORT: используем вероятность падения (1 - p_up)
+                    p_success = 1.0 - p_up
 
                 else:
                     # Нет подходящего направления с достаточным EV
@@ -542,7 +546,7 @@ class CoinSelector:
                 opportunity = {
                     'symbol': symbol,
                     'direction': direction,
-                    'p_up': p_up,
+                    'p_up': p_success,  # ✅ ИСПРАВЛЕНО: p_success = p_up для LONG, (1-p_up) для SHORT
                     'ev': ev,
                     'atr': atr_pct / 100,  # В долях
                     'atr_value': atr_value,

@@ -1113,12 +1113,10 @@ class BinanceTradingBot:
                 continue  # Уже открыта
 
             # Проверяем порог
-            if opp['direction'] == 'LONG':
-                if opp['p_up'] <= p_threshold:
-                    continue
-            else:  # SHORT
-                if opp['p_up'] >= (1 - p_threshold):
-                    continue
+            # ✅ ИСПРАВЛЕНО: p_up теперь уже инвертирован для SHORT в coin_selector
+            # Поэтому проверка одинакова для обоих направлений
+            if opp['p_up'] <= p_threshold:
+                continue
 
             # Проверяем лимит позиций (ночью меньше)
             current_positions = len(self.position_manager.get_all_open())
