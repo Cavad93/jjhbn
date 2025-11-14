@@ -872,6 +872,9 @@ class BinanceTradingBot:
             try:
                 current_time = time.time()
 
+                # Обновляем активность в начале каждой итерации
+                self._update_activity()
+
                 # ═══════════════════════════════════════════════════
                 # КАЖДЫЕ 4 ЧАСА: Обновление портфеля
                 # ═══════════════════════════════════════════════════
@@ -1452,6 +1455,8 @@ class BinanceTradingBot:
         3. Проверяет timeout
         4. Обучает модели на закрытых позициях
         """
+        # Обновляем активность для watchdog
+        self._update_activity()
 
         for position in list(self.position_manager.get_all_open()):
 
