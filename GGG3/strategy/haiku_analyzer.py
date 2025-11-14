@@ -419,25 +419,34 @@ class HaikuAnalyzer:
 
 Task: Check each coin for RED FLAGS, POSITIVE CATALYSTS, and SENTIMENT.
 
-RED FLAGS (score < 0.4):
-- SEC lawsuits/investigations
-- Hacks, exploits, rug pulls
-- Delistings announced
-- Major FUD from reliable sources
+⚠️ CRITICAL: First verify news RELEVANCE before scoring!
+- IGNORE news that doesn't mention the coin's name or project
+- IGNORE generic crypto market news unless it specifically impacts this coin
+- IGNORE unrelated news (politics, emails, unrelated companies)
+- ONLY use news that is DIRECTLY about this specific cryptocurrency
 
-POSITIVE CATALYSTS (score > 0.6):
-- Major partnerships announced
-- New exchange listings
-- Protocol upgrades/milestones
-- Institutional adoption news
+RED FLAGS (score < 0.4) - ONLY if news is RELEVANT:
+- SEC lawsuits/investigations targeting THIS coin
+- Hacks, exploits, rug pulls of THIS protocol
+- Delistings announced for THIS coin
+- Major FUD from reliable sources about THIS project
 
-NEUTRAL (0.4-0.6): No significant news
+POSITIVE CATALYSTS (score > 0.6) - ONLY if news is RELEVANT:
+- Major partnerships announced for THIS project
+- New exchange listings for THIS coin
+- Protocol upgrades/milestones for THIS blockchain
+- Institutional adoption news about THIS asset
+
+NEUTRAL (0.4-0.6):
+- No relevant news found
+- Irrelevant news (ignore it)
+- Mixed signals
 
 SENTIMENT ANALYSIS (-1.0 to +1.0):
-- Analyze overall market sentiment from news
+- Analyze overall market sentiment from RELEVANT news only
 - -1.0: Very bearish (panic, fear, massive FUD)
 - -0.5: Bearish (negative news, concerns)
--  0.0: Neutral (mixed or no clear sentiment)
+-  0.0: Neutral (mixed, irrelevant, or no clear sentiment)
 - +0.5: Bullish (positive news, optimism)
 - +1.0: Very bullish (euphoria, major hype)
 
