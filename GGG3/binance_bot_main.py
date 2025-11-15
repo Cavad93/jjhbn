@@ -574,10 +574,19 @@ class BinanceTradingBot:
 
             # Базовая логика (основано на финальном решении)
             # ВАЖНО: p_meta в snapshot - это предсказание от BASE логики (ужасное название!)
+            # ⚠️ КРИТИЧНО: Для SHORT позиций p_meta содержит вероятность ПАДЕНИЯ (не роста!)
             p_base = snapshot.get('p_meta', 0.5) if snapshot else 0.5
             if 'base' in self.expert_stats:
-                # ✅ ИСПРАВЛЕНИЕ: Логика одинакова для LONG и SHORT, т.к. price_went_up уже учитывает направление
-                base_was_right = (p_base > 0.5 and price_went_up) or (p_base <= 0.5 and not price_went_up)
+                # ✅ ИСПРАВЛЕНИЕ: Учитываем направление позиции
+                # - Для LONG: p_base = вероятность роста
+                # - Для SHORT: p_base = вероятность падения (нужна другая логика проверки)
+                if pos.direction == 'LONG':
+                    # Для LONG: предсказал рост (>0.5) и цена выросла, ИЛИ предсказал падение (<=0.5) и цена упала
+                    base_was_right = (p_base > 0.5 and price_went_up) or (p_base <= 0.5 and not price_went_up)
+                else:  # SHORT
+                    # Для SHORT: p_base это вероятность ПАДЕНИЯ, поэтому логика инвертирована
+                    # Предсказал падение (>0.5) и цена упала (not price_went_up), ИЛИ предсказал рост (<=0.5) и цена выросла
+                    base_was_right = (p_base > 0.5 and not price_went_up) or (p_base <= 0.5 and price_went_up)
 
                 self.expert_stats['base']['total'] += 1
                 if base_was_right:
@@ -1635,10 +1644,19 @@ class BinanceTradingBot:
 
                 # Обновляем статистику BASE логики (основано на финальном решении)
                 # ВАЖНО: p_meta в snapshot - это предсказание от BASE логики (ужасное название!)
+                # ⚠️ КРИТИЧНО: Для SHORT позиций p_meta содержит вероятность ПАДЕНИЯ (не роста!)
                 p_base = snapshot.get('p_meta', 0.5)  # Финальное предсказание базовой логики
                 if 'base' in self.expert_stats:
-                    # ✅ ИСПРАВЛЕНИЕ: Логика одинакова для LONG и SHORT, т.к. price_went_up уже учитывает направление
-                    base_was_right = (p_base > 0.5 and price_went_up) or (p_base <= 0.5 and not price_went_up)
+                    # ✅ ИСПРАВЛЕНИЕ: Учитываем направление позиции
+                    # - Для LONG: p_base = вероятность роста
+                    # - Для SHORT: p_base = вероятность падения (нужна другая логика проверки)
+                    if position.direction == 'LONG':
+                        # Для LONG: предсказал рост (>0.5) и цена выросла, ИЛИ предсказал падение (<=0.5) и цена упала
+                        base_was_right = (p_base > 0.5 and price_went_up) or (p_base <= 0.5 and not price_went_up)
+                    else:  # SHORT
+                        # Для SHORT: p_base это вероятность ПАДЕНИЯ, поэтому логика инвертирована
+                        # Предсказал падение (>0.5) и цена упала (not price_went_up), ИЛИ предсказал рост (<=0.5) и цена выросла
+                        base_was_right = (p_base > 0.5 and not price_went_up) or (p_base <= 0.5 and price_went_up)
 
                     self.expert_stats['base']['total'] += 1
                     if base_was_right:
