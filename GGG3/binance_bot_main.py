@@ -1750,6 +1750,80 @@ class BinanceTradingBot:
                         except Exception as e:
                             logger.error(f"Error training NeuralNetwork: {e}")
 
+                    # ✅ Отправляем уведомление об обучении моделей
+                    if config.TELEGRAM_ALERT_TYPES.get('model_training', True):
+                        try:
+                            outcome = 'win' if position.pnl > 0 else 'loss'
+
+                            # Собираем статистику всех моделей
+                            models_data = {}
+
+                            # BASE
+                            if 'base' in self.expert_stats:
+                                base_stats = self.expert_stats['base']
+                                models_data['base'] = {
+                                    'win_rate': base_stats['wins'] / base_stats['total'] if base_stats['total'] > 0 else 0.0,
+                                    'total': base_stats['total']
+                                }
+
+                            # XGBoost
+                            if 'xgb' in self.experts and self.experts['xgb'] is not None:
+                                xgb_stats = self.expert_stats.get('xgb', {})
+                                models_data['xgb'] = {
+                                    'samples': self.experts['xgb'].train_samples,
+                                    'trees': self.experts['xgb'].model.num_boosted_rounds() if hasattr(self.experts['xgb'], 'model') else 0,
+                                    'win_rate': xgb_stats['wins'] / xgb_stats['total'] if xgb_stats.get('total', 0) > 0 else 0.0,
+                                    'total': xgb_stats.get('total', 0)
+                                }
+
+                            # RandomForest
+                            if 'rf' in self.experts and self.experts['rf'] is not None:
+                                rf_stats = self.expert_stats.get('rf', {})
+                                models_data['rf'] = {
+                                    'samples': self.experts['rf'].train_samples,
+                                    'win_rate': rf_stats['wins'] / rf_stats['total'] if rf_stats.get('total', 0) > 0 else 0.0,
+                                    'total': rf_stats.get('total', 0)
+                                }
+
+                            # AdaptiveRF
+                            if 'arf' in self.experts and self.experts['arf'] is not None:
+                                arf_stats = self.expert_stats.get('arf', {})
+                                models_data['arf'] = {
+                                    'samples': self.experts['arf'].train_samples,
+                                    'win_rate': arf_stats['wins'] / arf_stats['total'] if arf_stats.get('total', 0) > 0 else 0.0,
+                                    'total': arf_stats.get('total', 0)
+                                }
+
+                            # NeuralNet
+                            if 'nn' in self.experts and self.experts['nn'] is not None:
+                                nn_stats = self.expert_stats.get('nn', {})
+                                models_data['nn'] = {
+                                    'epochs': self.experts['nn'].train_epochs,
+                                    'win_rate': nn_stats['wins'] / nn_stats['total'] if nn_stats.get('total', 0) > 0 else 0.0,
+                                    'total': nn_stats.get('total', 0)
+                                }
+
+                            # META
+                            if self.meta is not None:
+                                meta_stats = self.expert_stats.get('meta', {})
+                                models_data['meta'] = {
+                                    'mode': self.meta.mode,
+                                    'samples': self.meta.total_samples if hasattr(self.meta, 'total_samples') else 0,
+                                    'win_rate': meta_stats['wins'] / meta_stats['total'] if meta_stats.get('total', 0) > 0 else 0.0,
+                                    'total': meta_stats.get('total', 0)
+                                }
+
+                            training_data = {
+                                'symbol': position.symbol,
+                                'outcome': outcome,
+                                'total_trades': self.total_closed_trades,
+                                'models': models_data
+                            }
+
+                            self.telegram.notify_models_trained(training_data)
+                        except Exception as e:
+                            logger.error(f"Error sending training notification: {e}")
+
                     # Периодическое сохранение всех моделей (каждые 5 сделок)
                     if self.total_closed_trades % 5 == 0:
                         try:

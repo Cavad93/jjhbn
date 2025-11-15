@@ -477,6 +477,7 @@ TELEGRAM_ALERT_TYPES = {
     # Обучение
     'online_learning': False,     # Online learning (может быть шумно)
     'model_retrained': False,     # Модель переобучена (может быть шумно)
+    'model_training': True,       # Уведомление об обучении моделей после каждой позиции
 
     # Статистика
     'daily_summary': True,        # Ежедневная сводка

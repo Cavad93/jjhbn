@@ -577,6 +577,104 @@ UTC 23:00 - 07:00
 
         self._send_message(text)
 
+    def notify_models_trained(self, training_data: Dict):
+        """
+        Уведомление об обучении всех моделей после закрытия позиции
+
+        Args:
+            training_data: Данные об обучении:
+                - symbol: Символ закрытой позиции
+                - outcome: win/loss
+                - total_trades: Общее количество закрытых позиций
+                - models: Dict с информацией о каждой модели:
+                    {
+                        'xgb': {'samples': 5, 'trees': 10, 'win_rate': 0.6},
+                        'rf': {'samples': 5, 'win_rate': 0.6},
+                        ...
+                    }
+        """
+        symbol = training_data.get('symbol', 'UNKNOWN')
+        outcome = training_data.get('outcome', 'UNKNOWN')
+        total_trades = training_data.get('total_trades', 0)
+        models = training_data.get('models', {})
+
+        outcome_emoji = "✅" if outcome == 'win' else "❌"
+
+        text = f"""
+🧠 <b>МОДЕЛИ ОБУЧИЛИСЬ</b>
+
+{outcome_emoji} Позиция: <b>{symbol}</b> ({outcome})
+📊 Всего сделок: <b>{total_trades}</b>
+
+<b>Статистика моделей:</b>
+        """.strip()
+
+        # BASE логика
+        if 'base' in models:
+            base = models['base']
+            wr = base.get('win_rate', 0.0)
+            total = base.get('total', 0)
+            text += f"\n\n  <b>BASE</b>"
+            text += f"\n  • Win Rate: {wr:.1%} ({total} сделок)"
+
+        # XGBoost
+        if 'xgb' in models:
+            xgb = models['xgb']
+            samples = xgb.get('samples', 0)
+            trees = xgb.get('trees', 0)
+            wr = xgb.get('win_rate', 0.0)
+            total = xgb.get('total', 0)
+            text += f"\n\n  <b>XGBoost</b>"
+            text += f"\n  • Samples: {samples}"
+            text += f"\n  • Trees: {trees}"
+            text += f"\n  • Win Rate: {wr:.1%} ({total} сделок)"
+
+        # RandomForest
+        if 'rf' in models:
+            rf = models['rf']
+            samples = rf.get('samples', 0)
+            wr = rf.get('win_rate', 0.0)
+            total = rf.get('total', 0)
+            text += f"\n\n  <b>RandomForest</b>"
+            text += f"\n  • Samples: {samples}"
+            text += f"\n  • Win Rate: {wr:.1%} ({total} сделок)"
+
+        # AdaptiveRF
+        if 'arf' in models:
+            arf = models['arf']
+            samples = arf.get('samples', 0)
+            wr = arf.get('win_rate', 0.0)
+            total = arf.get('total', 0)
+            text += f"\n\n  <b>AdaptiveRF</b>"
+            text += f"\n  • Samples: {samples}"
+            text += f"\n  • Win Rate: {wr:.1%} ({total} сделок)"
+
+        # NeuralNet
+        if 'nn' in models:
+            nn = models['nn']
+            epochs = nn.get('epochs', 0)
+            wr = nn.get('win_rate', 0.0)
+            total = nn.get('total', 0)
+            text += f"\n\n  <b>NeuralNet</b>"
+            text += f"\n  • Total Epochs: {epochs}"
+            text += f"\n  • Win Rate: {wr:.1%} ({total} сделок)"
+
+        # META
+        if 'meta' in models:
+            meta = models['meta']
+            mode = meta.get('mode', 'UNKNOWN')
+            samples = meta.get('samples', 0)
+            wr = meta.get('win_rate', 0.0)
+            total = meta.get('total', 0)
+            text += f"\n\n  <b>META ({mode})</b>"
+            text += f"\n  • Samples: {samples}"
+            if total > 0:
+                text += f"\n  • Win Rate: {wr:.1%} ({total} сделок)"
+
+        text += f"\n\n⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+
+        self._send_message(text)
+
     # ========================================================================
     # ERROR NOTIFICATIONS
     # ========================================================================
