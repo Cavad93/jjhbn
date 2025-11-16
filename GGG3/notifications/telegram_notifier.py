@@ -846,6 +846,45 @@ Telegram уведомления работают корректно!
             except requests.exceptions.Timeout:
                 # Это нормально для long polling
                 continue
+            except requests.exceptions.HTTPError as e:
+                # Обработка HTTP 409 Conflict (конфликт getUpdates)
+                if e.response.status_code == 409:
+                    logger.error("=" * 80)
+                    logger.error("❌ TELEGRAM BOT CONFLICT ERROR (HTTP 409)")
+                    logger.error("=" * 80)
+                    logger.error("Возможные причины:")
+                    logger.error("  1. Бот уже запущен (другая копия работает)")
+                    logger.error("  2. Установлен webhook (конфликтует с long polling)")
+                    logger.error("  3. Предыдущий процесс не завершился корректно")
+                    logger.error("")
+                    logger.error("Решение:")
+                    logger.error("  1. Остановите все копии бота")
+                    logger.error("  2. Удалите webhook командой:")
+                    logger.error(f"     curl -X POST https://api.telegram.org/bot{self.bot_token}/deleteWebhook")
+                    logger.error("  3. Перезапустите бота")
+                    logger.error("=" * 80)
+
+                    # Пытаемся автоматически удалить webhook
+                    try:
+                        logger.info("Пытаюсь автоматически удалить webhook...")
+                        webhook_url = f"https://api.telegram.org/bot{self.bot_token}/deleteWebhook"
+                        webhook_response = requests.get(webhook_url, timeout=10)
+                        if webhook_response.ok:
+                            logger.info("✓ Webhook успешно удален, повторяю попытку через 5 сек...")
+                            time.sleep(5)
+                            continue
+                        else:
+                            logger.error(f"Не удалось удалить webhook: {webhook_response.text}")
+                    except Exception as webhook_error:
+                        logger.error(f"Ошибка при удалении webhook: {webhook_error}")
+
+                    # Останавливаем listener чтобы не спамить логи
+                    logger.error("Останавливаю command listener из-за неразрешимого конфликта")
+                    self.command_thread_running = False
+                    break
+                else:
+                    logger.error(f"HTTP Error in command listener loop: {e}", exc_info=True)
+                    time.sleep(5)
             except Exception as e:
                 logger.error(f"Error in command listener loop: {e}", exc_info=True)
                 time.sleep(5)
