@@ -576,8 +576,26 @@ class PaperTradingBot:
         self.config.INITIAL_CAPITAL = initial_capital
         self.config.MAX_POSITIONS = max_positions
 
-        # Paper Exchange
-        self.exchange = PaperExchange(initial_capital=initial_capital)
+        # Paper Exchange - загружаем сохраненное состояние или создаем новую
+        Config.create_dirs()  # Убеждаемся что директории существуют
+
+        state_file = self.config.DATA_DIR / 'paper_exchange_state.json'
+
+        if state_file.exists():
+            try:
+                logger.info(f"Loading saved exchange state from {state_file}...")
+                self.exchange = PaperExchange.load_state(str(state_file))
+                logger.info(f"✓ Exchange state loaded successfully!")
+                logger.info(f"  Balance: {self.exchange.get_balance():.2f} USDT")
+                logger.info(f"  Equity: {self.exchange.get_equity():.2f} USDT")
+                logger.info(f"  Open positions: {len(self.exchange.get_open_positions())}")
+            except Exception as e:
+                logger.warning(f"Failed to load saved state: {e}")
+                logger.info(f"Creating new exchange with initial capital {initial_capital} USDT...")
+                self.exchange = PaperExchange(initial_capital=initial_capital)
+        else:
+            logger.info(f"No saved state found. Creating new exchange with initial capital {initial_capital} USDT...")
+            self.exchange = PaperExchange(initial_capital=initial_capital)
 
         # Models
         self.models_manager = ModelsManager(self.config.MODELS_DIR)
