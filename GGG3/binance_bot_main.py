@@ -133,6 +133,7 @@ class BinanceTradingBot:
         if paper_mode:
             # Попытка загрузить существующее состояние Paper Exchange
             state_file = 'data/paper_exchange_state.json'
+            capital_history = 'data/capital_history.json'
             if os.path.exists(state_file):
                 try:
                     self.exchange = PaperExchange.load_state(state_file)
@@ -140,11 +141,47 @@ class BinanceTradingBot:
                     print(f"  Mode: 📄 PAPER TRADING (Loaded: ${balance:.2f} USDT)")
                 except Exception as e:
                     print(f"  ⚠️  Failed to load Paper Exchange state: {e}")
+                    # 👉 Автовосстановление из capital_history.json (берём total_equity)
+                    try:
+                        with open(capital_history, 'r', encoding='utf-8') as f:
+                            payload = json.load(f)
+                        hist = payload.get('history') or []
+                        last = hist[-1] if hist else {}
+                        equity = last.get('total_equity')
+                        if equity is None:
+                            fb = float(last.get('free_balance', 0.0))
+                            upnl = float(last.get('unrealized_pnl', 0.0))
+                            reserve = float(last.get('reserve_fund', 0.0))
+                            equity = fb + upnl + reserve
+                        self.exchange = PaperExchange(initial_capital=float(equity))
+                        self.exchange.balance = float(equity)
+                        self.exchange.save_state(state_file)
+                        print(f"  Mode: 📄 PAPER TRADING (Recovered: ${equity:.2f})")
+                    except Exception as e2:
+                        self.exchange = PaperExchange(initial_capital=config.PAPER_INITIAL_BALANCE)
+                        print(f"  Mode: 📄 PAPER TRADING (New: ${config.PAPER_INITIAL_BALANCE})")
+                        print(f"  ⚠️  Recovery from capital_history failed: {e2}")
+            else:
+                # Нет state-файла — пробуем capital_history.json
+                try:
+                    with open(capital_history, 'r', encoding='utf-8') as f:
+                        payload = json.load(f)
+                    hist = payload.get('history') or []
+                    last = hist[-1] if hist else {}
+                    equity = last.get('total_equity')
+                    if equity is None:
+                        fb = float(last.get('free_balance', 0.0))
+                        upnl = float(last.get('unrealized_pnl', 0.0))
+                        reserve = float(last.get('reserve_fund', 0.0))
+                        equity = fb + upnl + reserve
+                    self.exchange = PaperExchange(initial_capital=float(equity))
+                    self.exchange.balance = float(equity)
+                    self.exchange.save_state(state_file)
+                    print(f"  Mode: 📄 PAPER TRADING (Recovered: ${equity:.2f})")
+                except Exception as e:
                     self.exchange = PaperExchange(initial_capital=config.PAPER_INITIAL_BALANCE)
                     print(f"  Mode: 📄 PAPER TRADING (New: ${config.PAPER_INITIAL_BALANCE})")
-            else:
-                self.exchange = PaperExchange(initial_capital=config.PAPER_INITIAL_BALANCE)
-                print(f"  Mode: 📄 PAPER TRADING (New: ${config.PAPER_INITIAL_BALANCE})")
+                    print(f"  ⚠️  Recovery from capital_history failed: {e}")
         else:
             self.exchange = BinanceClient(
                 api_key=config.BINANCE_API_KEY,

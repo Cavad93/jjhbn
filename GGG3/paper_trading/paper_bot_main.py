@@ -591,11 +591,17 @@ class PaperTradingBot:
                 logger.info(f"  Open positions: {len(self.exchange.get_open_positions())}")
             except Exception as e:
                 logger.warning(f"Failed to load saved state: {e}")
-                logger.info(f"Creating new exchange with initial capital {initial_capital} USDT...")
-                self.exchange = PaperExchange(initial_capital=initial_capital)
+                # 👉 Авто-восстановление из capital_history.json (берём total_equity)
+                self.exchange = self._recover_exchange_from_capital_history(prefer_total_equity=True)
+                if self.exchange is None:
+                    logger.info(f"Creating new exchange with initial capital {initial_capital} USDT...")
+                    self.exchange = PaperExchange(initial_capital=initial_capital)
         else:
-            logger.info(f"No saved state found. Creating new exchange with initial capital {initial_capital} USDT...")
-            self.exchange = PaperExchange(initial_capital=initial_capital)
+            # Нет файла состояния — пробуем восстановить из capital_history.json
+            self.exchange = self._recover_exchange_from_capital_history(prefer_total_equity=True)
+            if self.exchange is None:
+                logger.info(f"No saved state found. Creating new exchange with initial capital {initial_capital} USDT...")
+                self.exchange = PaperExchange(initial_capital=initial_capital)
 
         # Models
         self.models_manager = ModelsManager(self.config.MODELS_DIR)
@@ -950,6 +956,52 @@ class PaperTradingBot:
 
         # Сохраняем состояние exchange
         self.exchange.save_state(str(self.config.DATA_DIR / 'paper_exchange_state.json'))
+
+    def _recover_exchange_from_capital_history(self, prefer_total_equity: bool = True) -> Optional[PaperExchange]:
+        """Пытается восстановить PaperExchange из data/capital_history.json.
+        Возвращает PaperExchange или None, если восстановление невозможно.
+        """
+        try:
+            # Кандидаты путей: <repo>/data/capital_history.json и <repo>/paper_trading/data/capital_history.json
+            root_data = Path(__file__).parent.parent / 'data' / 'capital_history.json'
+            local_data = self.config.DATA_DIR / 'capital_history.json'
+            src = next((p for p in (root_data, local_data) if p.exists()), None)
+            if not src:
+                logger.warning("No capital_history.json found for recovery")
+                return None
+
+            with open(src, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            history = payload.get('history') or []
+            if not history:
+                logger.warning("capital_history.json has no 'history'")
+                return None
+
+            last = history[-1]
+            if prefer_total_equity:
+                equity = last.get('total_equity')
+                if equity is None:
+                    fb = float(last.get('free_balance', 0.0))
+                    upnl = float(last.get('unrealized_pnl', 0.0))
+                    reserve = float(last.get('reserve_fund', 0.0))
+                    equity = fb + upnl + reserve
+            else:
+                equity = last.get('free_balance')
+
+            if equity is None:
+                logger.warning("capital_history.json lacks usable equity values")
+                return None
+
+            ex = PaperExchange(initial_capital=float(equity))
+            ex.balance = float(equity)  # считаем, что позиции потеряны → всё в кэше
+            # сразу сохраняем восстановленное состояние, чтобы следующий старт его увидел
+            state_file = self.config.DATA_DIR / 'paper_exchange_state.json'
+            ex.save_state(str(state_file))
+            logger.info(f"Recovered PaperExchange from capital_history.json with balance={ex.balance:.2f}")
+            return ex
+        except Exception as e:
+            logger.error(f"Recovery from capital_history.json failed: {e}")
+            return None
 
     def run(self):
         """Главный цикл бота"""
