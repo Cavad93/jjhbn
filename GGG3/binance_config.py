@@ -303,6 +303,35 @@ NIGHT_MODE_MAX_POSITIONS = 5  # Максимум 5 позиций ночью
 SECTOR_DIVERSIFICATION = True
 MAX_POSITIONS_PER_SECTOR = 3  # Максимум 3 позиции на сектор
 
+# ============================================================================
+# 10. PERFORMANCE ANALYTICS
+# ============================================================================
+
+# Performance Tracking
+PERFORMANCE_ANALYTICS_ENABLED = True
+PERFORMANCE_HISTORY_DIR = 'data/performance'  # Директория для сохранения истории
+
+# Окна анализа (количество сделок)
+PERFORMANCE_WINDOWS = {
+    'short': 50,    # Краткосрочная производительность (основное окно)
+    'medium': 100,  # Среднесрочная
+    'long': 200,    # Долгосрочная
+    'all': None     # Все сделки с момента запуска
+}
+
+# Настройки уведомлений
+PERFORMANCE_NOTIFICATIONS_ENABLED = True
+PERFORMANCE_NOTIFY_ON_MILESTONES = True      # Уведомления при 50, 100, 200, 500 сделках
+PERFORMANCE_NOTIFY_ON_STATUS_CHANGE = True   # Уведомления при смене статуса
+PERFORMANCE_NOTIFY_PERIODIC = True           # Периодические уведомления (раз в час)
+PERFORMANCE_PERIODIC_INTERVAL_HOURS = 1      # Интервал периодических уведомлений
+
+# Минимальное количество сделок для начала анализа
+PERFORMANCE_MIN_TRADES = 50
+
+# Уровень доверия для доверительного интервала
+PERFORMANCE_CONFIDENCE_LEVEL = 0.90  # 90%
+
 # Определение секторов
 SECTORS = {
     'LAYER1': ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'DOTUSDT', 'SOLUSDT', 'AVAXUSDT'],

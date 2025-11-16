@@ -84,6 +84,10 @@ from paper_trading.paper_exchange import PaperExchange
 from notifications.telegram_notifier import TelegramNotifier
 from notifications.ai_assistant import AITradingAssistant, BotContextCollector
 
+# Analytics
+from analytics.performance_tracker import PerformanceTracker, TradeStats
+from analytics.performance_notifier import PerformanceNotifier
+
 # Logging
 logging.basicConfig(
     level=config.LOG_LEVEL,
@@ -303,6 +307,27 @@ class BinanceTradingBot:
 
         # Track last trade time for adaptive threshold
         self.last_trade_time = None
+
+        # ════════════════════════════════════════════════════════════════════════
+        # PERFORMANCE ANALYTICS
+        # ════════════════════════════════════════════════════════════════════════
+        if config.PERFORMANCE_ANALYTICS_ENABLED:
+            print("\n  Initializing performance analytics...")
+            self.performance_tracker = PerformanceTracker(
+                windows=config.PERFORMANCE_WINDOWS,
+                history_dir=config.PERFORMANCE_HISTORY_DIR,
+                enable_history=True
+            )
+            self.performance_notifier = PerformanceNotifier(telegram_notifier=self.telegram)
+
+            # Загружаем историю сделок из закрытых позиций
+            loaded_count = self._load_historical_trades()
+            print(f"    ✓ Performance Tracker initialized")
+            print(f"    ✓ Loaded {loaded_count} historical trades")
+        else:
+            self.performance_tracker = None
+            self.performance_notifier = None
+            print("\n  Performance Analytics: Disabled")
 
         # ════════════════════════════════════════════════════════════════════════
         # WATCHDOG: Защита от зависаний
@@ -645,6 +670,39 @@ class BinanceTradingBot:
                 'total': stats['total']
             }
         return win_rates
+
+    def _load_historical_trades(self) -> int:
+        """
+        Загружает историю сделок из закрытых позиций в Performance Tracker
+
+        Returns:
+            Количество загруженных сделок
+        """
+        if not self.performance_tracker:
+            return 0
+
+        count = 0
+        for pos in self.position_manager.closed_positions:
+            if pos.status == 'CLOSED' and hasattr(pos, 'exit_time'):
+                try:
+                    trade_stats = TradeStats(
+                        symbol=pos.symbol,
+                        direction=pos.direction,
+                        entry_price=pos.entry_price,
+                        exit_price=pos.exit_price,
+                        pnl=pos.pnl,
+                        pnl_pct=pos.pnl_pct,
+                        exit_reason=pos.exit_reason,
+                        entry_time=pos.entry_time,
+                        exit_time=pos.exit_time,
+                        duration_hours=(pos.exit_time - pos.entry_time).total_seconds() / 3600
+                    )
+                    self.performance_tracker.add_trade(trade_stats)
+                    count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to load historical trade {pos.symbol}: {e}")
+
+        return count
 
     def _maybe_calibrate_base_weights(self):
         """
@@ -1897,6 +1955,38 @@ class BinanceTradingBot:
 
         # Проверяем нужна ли калибровка BASE весов
         self._maybe_calibrate_base_weights()
+
+        # ════════════════════════════════════════════════════════════════
+        # PERFORMANCE ANALYTICS: Отслеживаем сделку и отправляем уведомления
+        # ════════════════════════════════════════════════════════════════
+        if self.performance_tracker and self.performance_notifier:
+            try:
+                # Создаем TradeStats для сделки
+                trade_stats = TradeStats(
+                    symbol=position.symbol,
+                    direction=position.direction,
+                    entry_price=position.entry_price,
+                    exit_price=exit_price,
+                    pnl=position.pnl,
+                    pnl_pct=position.pnl_pct,
+                    exit_reason=exit_reason,
+                    entry_time=position.entry_time,
+                    exit_time=position.exit_time,
+                    duration_hours=duration
+                )
+
+                # Добавляем сделку в трекер
+                self.performance_tracker.add_trade(trade_stats)
+
+                # Получаем метрики для всех окон
+                all_metrics = self.performance_tracker.get_all_metrics()
+
+                # Проверяем нужно ли отправлять уведомление
+                if all_metrics:
+                    self.performance_notifier.notify_all_windows(all_metrics)
+
+            except Exception as e:
+                logger.error(f"Error in performance analytics: {e}", exc_info=True)
 
         # Сбрасываем trailing stop
         self.trailing_stop.reset_position(position.symbol)
