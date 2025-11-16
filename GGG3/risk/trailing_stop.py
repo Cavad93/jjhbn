@@ -27,36 +27,44 @@ class TrailingStopManager:
     Активация:
     - Когда прибыль достигает TRAILING_STOP_ACTIVATION_PCT
 
-    Trailing:
-    - SL подтягивается на расстоянии TRAILING_STOP_DISTANCE_PCT от текущей цены
+    Trailing (два режима):
+    1. Процентный (legacy): SL подтягивается на расстоянии distance_pct от пиковой цены
+    2. ATR-based (рекомендуется): SL подтягивается на расстоянии (ATR * distance_atr_mult) от пиковой цены
     """
 
     def __init__(
         self,
         enabled: bool = None,
         activation_pct: float = None,
-        distance_pct: float = None
+        distance_pct: float = None,
+        distance_atr_mult: float = None
     ):
         """
         Args:
             enabled: Включить trailing stop (default from config)
             activation_pct: Процент прибыли для активации (default from config)
-            distance_pct: Расстояние trailing stop от цены (default from config)
+            distance_pct: Расстояние trailing stop в % (default from config, legacy mode)
+            distance_atr_mult: Множитель ATR для расстояния trailing stop (default from config)
+                              Если задан, используется вместо distance_pct (ATR-based mode)
         """
         self.enabled = enabled if enabled is not None else config.TRAILING_STOP_ENABLED
         self.activation_pct = activation_pct if activation_pct is not None else config.TRAILING_STOP_ACTIVATION_PCT
         self.distance_pct = distance_pct if distance_pct is not None else config.TRAILING_STOP_DISTANCE_PCT
 
+        # ATR-based trailing (приоритет над процентным)
+        self.distance_atr_mult = distance_atr_mult if distance_atr_mult is not None else getattr(config, 'TRAILING_STOP_DISTANCE_ATR_MULT', None)
+
         # Отслеживание максимальной/минимальной цены для каждой позиции
         self._peak_prices = {}  # symbol -> peak_price
 
-    def check_trailing_stop(self, position, current_price: float) -> Optional[float]:
+    def check_trailing_stop(self, position, current_price: float, atr: float = None) -> Optional[float]:
         """
         Проверяет, нужно ли обновить SL для trailing stop
 
         Args:
-            position: Position объект
+            position: Position объект (должен иметь atr_value если atr не передан)
             current_price: Текущая цена
+            atr: Значение ATR (опционально, если не передано - берется из position.atr_value)
 
         Returns:
             new_sl_price: Новый уровень SL, если нужно обновить
@@ -84,13 +92,30 @@ class TrailingStopManager:
         if symbol not in self._peak_prices:
             self._peak_prices[symbol] = current_price
 
+        # Определяем режим: ATR-based или процентный
+        use_atr_mode = self.distance_atr_mult is not None
+
+        if use_atr_mode:
+            # ATR-based режим: получаем ATR
+            if atr is None:
+                # Пытаемся взять ATR из позиции
+                atr = getattr(position, 'atr_value', None)
+                if atr is None:
+                    # Fallback: используем процентный режим
+                    use_atr_mode = False
+
         if direction == 'LONG':
             # Для LONG: отслеживаем максимальную цену
             if current_price > self._peak_prices[symbol]:
                 self._peak_prices[symbol] = current_price
 
-            # Рассчитываем новый SL (ниже максимальной цены на distance_pct)
-            new_sl = self._peak_prices[symbol] * (1 - self.distance_pct / 100)
+            # Рассчитываем новый SL
+            if use_atr_mode:
+                # ATR-based: SL = peak_price - (ATR * multiplier)
+                new_sl = self._peak_prices[symbol] - (atr * self.distance_atr_mult)
+            else:
+                # Процентный: SL = peak_price * (1 - distance_pct/100)
+                new_sl = self._peak_prices[symbol] * (1 - self.distance_pct / 100)
 
             # Обновляем SL только если он выше текущего
             # Trailing stop МОЖЕТ и ДОЛЖЕН поднимать SL выше entry_price для защиты прибыли
@@ -102,8 +127,13 @@ class TrailingStopManager:
             if current_price < self._peak_prices[symbol]:
                 self._peak_prices[symbol] = current_price
 
-            # Рассчитываем новый SL (выше минимальной цены на distance_pct)
-            new_sl = self._peak_prices[symbol] * (1 + self.distance_pct / 100)
+            # Рассчитываем новый SL
+            if use_atr_mode:
+                # ATR-based: SL = peak_price + (ATR * multiplier)
+                new_sl = self._peak_prices[symbol] + (atr * self.distance_atr_mult)
+            else:
+                # Процентный: SL = peak_price * (1 + distance_pct/100)
+                new_sl = self._peak_prices[symbol] * (1 + self.distance_pct / 100)
 
             # Обновляем SL только если он ниже текущего
             # Trailing stop МОЖЕТ и ДОЛЖЕН опускать SL ниже entry_price для защиты прибыли в SHORT

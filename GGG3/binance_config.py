@@ -284,8 +284,9 @@ phase_memory_cap = 20000  # Максимум примеров на каждую 
 
 # Trailing Stop Loss
 TRAILING_STOP_ENABLED = True
-TRAILING_STOP_ACTIVATION_PCT = 2.0  # Активация при 2% прибыли
-TRAILING_STOP_DISTANCE_PCT = 1.0    # Trailing на расстоянии 1%
+TRAILING_STOP_ACTIVATION_PCT = 3.0      # Активация при 3% прибыли (увеличено с 2% для лучшего R:R)
+TRAILING_STOP_DISTANCE_PCT = 1.0        # Trailing на расстоянии 1% (legacy mode, не используется если включен ATR mode)
+TRAILING_STOP_DISTANCE_ATR_MULT = 1.0   # ATR-based trailing: расстояние = ATR × 1.0 (РЕКОМЕНДУЕТСЯ)
 
 # Black Swan Protection (защита от резких обвалов)
 BLACK_SWAN_PROTECTION = True

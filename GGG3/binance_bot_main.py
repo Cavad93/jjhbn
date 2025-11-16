@@ -1495,7 +1495,7 @@ class BinanceTradingBot:
                             self.close_position(position, 'SL', position.sl_price)
                             continue
 
-                # Проверяем trailing stop
+                # Проверяем trailing stop (ATR берется автоматически из position.atr_value)
                 new_sl = self.trailing_stop.check_trailing_stop(position, current_price)
                 if new_sl is not None:
                     print(f"[{position.symbol}] Trailing stop: SL {position.sl_price:.2f} → {new_sl:.2f}")
