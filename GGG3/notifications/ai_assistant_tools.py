@@ -288,7 +288,8 @@ class AIAssistantTools:
                     "tp_price": pos.tp_price,
                     "sl_price": pos.sl_price,
                     "current_pnl_pct": round(pnl_pct, 2),
-                    "size": pos.size,
+                    "amount": pos.amount,
+                    "position_value": pos.position_value,
                     "atr_value": getattr(pos, 'atr_value', None)
                 }
 
@@ -332,7 +333,8 @@ class AIAssistantTools:
                 "entry_time": position.entry_time.isoformat() if hasattr(position.entry_time, 'isoformat') else str(position.entry_time),
                 "tp_price": position.tp_price,
                 "sl_price": position.sl_price,
-                "size": position.size,
+                "amount": position.amount,
+                "position_value": position.position_value,
                 "atr_value": getattr(position, 'atr_value', None),
             }
 
@@ -350,11 +352,11 @@ class AIAssistantTools:
 
             # Результат (для закрытых)
             if position.status == 'CLOSED':
-                details["close_price"] = position.close_price
-                details["close_time"] = position.close_time.isoformat() if hasattr(position.close_time, 'isoformat') else str(position.close_time)
-                details["close_reason"] = position.close_reason
+                details["exit_price"] = position.exit_price
+                details["exit_time"] = position.exit_time.isoformat() if hasattr(position.exit_time, 'isoformat') else str(position.exit_time)
+                details["exit_reason"] = position.exit_reason
                 details["pnl"] = position.pnl
-                details["pnl_percent"] = position.pnl_percent
+                details["pnl_pct"] = position.pnl_pct
 
             return json.dumps(details, indent=2, ensure_ascii=False)
 
@@ -386,12 +388,12 @@ class AIAssistantTools:
                     "symbol": pos.symbol,
                     "direction": pos.direction,
                     "entry_price": pos.entry_price,
-                    "close_price": pos.close_price,
+                    "exit_price": pos.exit_price,
                     "entry_time": pos.entry_time.isoformat() if hasattr(pos.entry_time, 'isoformat') else str(pos.entry_time),
-                    "close_time": pos.close_time.isoformat() if hasattr(pos.close_time, 'isoformat') else str(pos.close_time),
-                    "close_reason": pos.close_reason,
+                    "exit_time": pos.exit_time.isoformat() if hasattr(pos.exit_time, 'isoformat') else str(pos.exit_time),
+                    "exit_reason": pos.exit_reason,
                     "pnl": round(pos.pnl, 2),
-                    "pnl_percent": round(pos.pnl_percent, 2),
+                    "pnl_pct": round(pos.pnl_pct, 2),
                     "result": "WIN" if pos.pnl > 0 else "LOSS"
                 }
                 result.append(pos_data)
@@ -445,7 +447,7 @@ class AIAssistantTools:
                 }
 
                 if pos.status == 'CLOSED':
-                    pos_data["pnl_percent"] = round(pos.pnl_percent, 2)
+                    pos_data["pnl_pct"] = round(pos.pnl_pct, 2)
                     pos_data["result"] = "WIN" if pos.pnl > 0 else "LOSS"
 
                 result.append(pos_data)

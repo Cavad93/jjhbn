@@ -243,7 +243,8 @@ class BinanceTradingBot:
             print(f"  Reinvestment: Enabled (50% profit → reserve)")
 
             # Capital tracker (отслеживание изменений за периоды)
-            self.capital_tracker = CapitalTracker()
+            capital_history_path = str(Path(__file__).parent / 'data' / 'capital_history.json')
+            self.capital_tracker = CapitalTracker(state_file=capital_history_path)
             print(f"  Capital tracker: Enabled")
         else:
             self.reinvestment = None
