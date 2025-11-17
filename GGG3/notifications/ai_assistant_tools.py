@@ -270,7 +270,8 @@ class AIAssistantTools:
             result = []
             for pos in open_positions:
                 # Базовая информация
-                current_price = self.bot.exchange.get_price(pos.symbol)
+                ticker = self.bot.exchange.get_ticker(pos.symbol)
+                current_price = ticker['lastPrice']
                 entry_price = pos.entry_price
 
                 if pos.direction == 'LONG':
@@ -656,7 +657,8 @@ class AIAssistantTools:
                 # Средний PnL
                 pnl_values = []
                 for pos in open_positions:
-                    current_price = self.bot.exchange.get_price(pos.symbol)
+                    ticker = self.bot.exchange.get_ticker(pos.symbol)
+                    current_price = ticker['lastPrice']
                     entry_price = pos.entry_price
                     if pos.direction == 'LONG':
                         pnl_pct = ((current_price - entry_price) / entry_price) * 100
@@ -709,7 +711,8 @@ class AIAssistantTools:
                     prices = {}
                     for symbol in active_symbols:
                         try:
-                            prices[symbol] = self.bot.exchange.get_price(symbol)
+                            ticker = self.bot.exchange.get_ticker(symbol)
+                            prices[symbol] = ticker['lastPrice']
                         except:
                             prices[symbol] = None
                     overview["current_prices"] = prices
@@ -737,7 +740,8 @@ class AIAssistantTools:
 
             # Текущая цена
             try:
-                current_price = self.bot.exchange.get_price(symbol)
+                ticker = self.bot.exchange.get_ticker(symbol)
+                current_price = ticker['lastPrice']
                 metrics["current_price"] = current_price
             except Exception as e:
                 metrics["current_price"] = None
@@ -820,7 +824,8 @@ class AIAssistantTools:
 
                     # Текущий PnL
                     try:
-                        current_price = self.bot.exchange.get_price(symbol)
+                        ticker = self.bot.exchange.get_ticker(symbol)
+                        current_price = ticker['lastPrice']
                         entry_price = position.entry_price
                         if position.direction == 'LONG':
                             pnl_pct = ((current_price - entry_price) / entry_price) * 100
