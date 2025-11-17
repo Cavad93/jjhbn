@@ -106,6 +106,43 @@ TOOLS = [
             "type": "object",
             "properties": {}
         }
+    },
+    {
+        "name": "get_ml_models_stats",
+        "description": "Получить статистику всех ML моделей (accuracy, samples, training stats, online learning)",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "include_diversity": {
+                    "type": "boolean",
+                    "description": "Включить статистику diversity monitor",
+                    "default": True
+                }
+            }
+        }
+    },
+    {
+        "name": "get_expert_details",
+        "description": "Получить детальную информацию о конкретном ML эксперте (XGBoost, RandomForest, NeuralNet, AdaptiveRF, META)",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "expert_name": {
+                    "type": "string",
+                    "description": "Название эксперта: 'xgb', 'rf', 'arf', 'nn', 'meta'",
+                    "enum": ["xgb", "rf", "arf", "nn", "meta"]
+                }
+            },
+            "required": ["expert_name"]
+        }
+    },
+    {
+        "name": "get_expert_performance",
+        "description": "Получить статистику производительности экспертов (winrate, wins/losses по каждому эксперту)",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
     }
 ]
 
@@ -149,6 +186,12 @@ class AIAssistantTools:
                 return self._search_positions(**tool_input)
             elif tool_name == "get_bot_status":
                 return self._get_bot_status()
+            elif tool_name == "get_ml_models_stats":
+                return self._get_ml_models_stats(**tool_input)
+            elif tool_name == "get_expert_details":
+                return self._get_expert_details(**tool_input)
+            elif tool_name == "get_expert_performance":
+                return self._get_expert_performance()
             else:
                 return f"❌ Unknown tool: {tool_name}"
 
@@ -389,6 +432,144 @@ class AIAssistantTools:
             }
 
             return json.dumps(status, indent=2, ensure_ascii=False)
+
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+
+    def _get_ml_models_stats(self, include_diversity: bool = True) -> str:
+        """Получить статистику всех ML моделей"""
+        import json
+
+        try:
+            stats = {
+                "experts": {},
+                "meta": {},
+                "diversity": {} if include_diversity else None
+            }
+
+            # Статистика экспертов
+            if hasattr(self.bot, 'experts') and self.bot.experts:
+                for name, expert in self.bot.experts.items():
+                    if expert is not None:
+                        expert_stats = {
+                            "trained": expert.is_trained if hasattr(expert, 'is_trained') else True,
+                            "samples": expert.train_samples if hasattr(expert, 'train_samples') else "N/A",
+                            "type": type(expert).__name__
+                        }
+
+                        # Дополнительные метрики если доступны
+                        if hasattr(expert, 'train_accuracy'):
+                            expert_stats["accuracy"] = round(expert.train_accuracy, 4)
+                        if hasattr(expert, 'n_estimators'):
+                            expert_stats["n_estimators"] = expert.n_estimators
+
+                        stats["experts"][name] = expert_stats
+
+            # Статистика META модели
+            if hasattr(self.bot, 'meta') and self.bot.meta is not None:
+                meta = self.bot.meta
+                stats["meta"] = {
+                    "trained": meta.is_trained if hasattr(meta, 'is_trained') else True,
+                    "samples": meta.train_samples if hasattr(meta, 'train_samples') else "N/A",
+                    "type": type(meta).__name__
+                }
+                if hasattr(meta, 'train_accuracy'):
+                    stats["meta"]["accuracy"] = round(meta.train_accuracy, 4)
+
+            # Diversity Monitor
+            if include_diversity and hasattr(self.bot, 'diversity_monitor'):
+                monitor = self.bot.diversity_monitor
+                stats["diversity"] = {
+                    "enabled": True,
+                    "window_size": getattr(monitor, 'window_size', "N/A"),
+                    "current_metrics": getattr(monitor, 'current_metrics', {})
+                }
+
+            return json.dumps(stats, indent=2, ensure_ascii=False)
+
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+
+    def _get_expert_details(self, expert_name: str) -> str:
+        """Получить детальную информацию об эксперте"""
+        import json
+
+        try:
+            expert = None
+
+            # Поиск эксперта
+            if expert_name == "meta":
+                expert = getattr(self.bot, 'meta', None)
+            elif hasattr(self.bot, 'experts') and self.bot.experts:
+                expert = self.bot.experts.get(expert_name)
+
+            if expert is None:
+                return f"❌ Эксперт '{expert_name}' не найден"
+
+            # Собираем детали
+            details = {
+                "name": expert_name,
+                "type": type(expert).__name__,
+                "trained": expert.is_trained if hasattr(expert, 'is_trained') else True,
+                "samples": expert.train_samples if hasattr(expert, 'train_samples') else "N/A"
+            }
+
+            # Специфичные для типа метрики
+            if hasattr(expert, 'train_accuracy'):
+                details["train_accuracy"] = round(expert.train_accuracy, 4)
+
+            if hasattr(expert, 'n_estimators'):
+                details["n_estimators"] = expert.n_estimators
+
+            if hasattr(expert, 'max_depth'):
+                details["max_depth"] = expert.max_depth
+
+            if hasattr(expert, 'learning_rate'):
+                details["learning_rate"] = expert.learning_rate
+
+            if hasattr(expert, 'random_state'):
+                details["random_state"] = expert.random_state
+
+            # Параметры NeuralNet
+            if hasattr(expert, 'n_epochs'):
+                details["n_epochs"] = expert.n_epochs
+
+            if hasattr(expert, 'hidden_dim'):
+                details["hidden_dim"] = expert.hidden_dim
+
+            # Adaptive RF специфичные
+            if hasattr(expert, 'n_forests'):
+                details["n_forests"] = expert.n_forests
+
+            return json.dumps(details, indent=2, ensure_ascii=False)
+
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+
+    def _get_expert_performance(self) -> str:
+        """Получить статистику производительности экспертов"""
+        import json
+
+        try:
+            if not hasattr(self.bot, 'expert_stats'):
+                return "❌ Статистика экспертов недоступна"
+
+            performance = {}
+
+            for expert_name, stats in self.bot.expert_stats.items():
+                total = stats.get('total', 0)
+                wins = stats.get('wins', 0)
+                losses = stats.get('losses', 0)
+                winrate = (wins / total * 100) if total > 0 else 0
+
+                performance[expert_name] = {
+                    "wins": wins,
+                    "losses": losses,
+                    "total": total,
+                    "winrate": round(winrate, 2)
+                }
+
+            return json.dumps(performance, indent=2, ensure_ascii=False)
 
         except Exception as e:
             return f"❌ Error: {str(e)}"

@@ -503,10 +503,19 @@ Your capabilities:
 - Provide insights based on historical data
 
 **IMPORTANT: You have access to tools to retrieve data ON DEMAND:**
+
+Positions & Trading:
 - get_open_positions: List of all open positions with entry data
 - get_position_details: Detailed info about specific position (entry_snapshot, signals, conditions)
 - get_closed_positions: History of closed positions with results
 - search_positions: Search positions by criteria (symbol, date, status)
+
+ML Models & Learning:
+- get_ml_models_stats: Statistics of all ML models (accuracy, samples, training stats, diversity)
+- get_expert_details: Detailed info about specific expert (XGBoost, RandomForest, NeuralNet, etc.)
+- get_expert_performance: Performance stats for each expert (winrate, wins/losses)
+
+Bot Status:
 - get_bot_status: Overall bot status (balance, equity, winrate, models)
 
 **Always use tools instead of relying on stale context data!** This saves tokens and ensures fresh information.
