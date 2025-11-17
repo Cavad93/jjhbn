@@ -615,9 +615,17 @@ Communication style:
 
         for round_num in range(max_tool_rounds):
             # Проверяем stop_reason
+            logger.debug(f"[AITradingAssistant] Round {round_num}: stop_reason={response.stop_reason}, content_blocks={len(response.content)}")
+
             if response.stop_reason == "end_turn":
-                # Обычный текстовый ответ
-                return response.content[0].text
+                # Обычный текстовый ответ - ищем текстовый блок
+                text_blocks = [block.text for block in response.content if hasattr(block, 'text')]
+                if text_blocks:
+                    logger.info(f"[AITradingAssistant] Returning text response ({len(text_blocks[0])} chars)")
+                    return text_blocks[0]
+                else:
+                    logger.warning(f"[AITradingAssistant] end_turn but no text block found! content={response.content}")
+                    return "⚠️ Получен ответ без текста"
 
             elif response.stop_reason == "tool_use":
                 # Claude хочет вызвать инструмент(ы)
