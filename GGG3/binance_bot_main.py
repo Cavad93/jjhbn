@@ -1433,6 +1433,8 @@ class BinanceTradingBot:
                 'ml_predictions': opportunity.get('ml_predictions', {}),  # ML предсказания для META
                 'meta_context': opportunity.get('context', {}),  # ✅ СОХРАНЯЕМ РЕАЛЬНЫЕ КОНТЕКСТНЫЕ ФИЧИ
                 'p_meta': opportunity['p_up'],
+                'ev': opportunity['ev'],  # ✅ Expected Value для AI Assistant
+                'direction': direction,  # ✅ LONG/SHORT для AI Assistant
                 'phase': opportunity.get('phase', 0),  # Фаза рынка
                 'timestamp': time.time(),
                 'context': opportunity.get('context', {}),  # ✅ Дублируем для совместимости
