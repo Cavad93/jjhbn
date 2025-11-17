@@ -346,7 +346,7 @@ class AIAssistantTools:
                     "predictions": snapshot.get("predictions"),
                     "ev": snapshot.get("ev"),
                     "direction": snapshot.get("direction"),
-                    "features_count": len(snapshot.get("features", [])),
+                    "features_count": len(snapshot.get("features_68d", [])),
                     # Фичи не включаем чтобы не засорять (68 значений)
                 }
 
