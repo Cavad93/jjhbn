@@ -271,6 +271,7 @@ class BinanceTradingBot:
                 # AI Assistant
                 self.ai_assistant = AITradingAssistant(
                     api_key=config.ANTHROPIC_API_KEY,
+                    bot_instance=self,  # ✅ Передаём экземпляр бота для инструментов
                     context_collector=self.bot_context_collector
                 )
 

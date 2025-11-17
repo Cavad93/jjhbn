@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""
+AI Assistant Tools - Инструменты для поиска данных бота
+
+Позволяет AI ассистенту запрашивать данные по требованию вместо
+постоянной отправки всего контекста (экономия токенов).
+
+Доступные инструменты:
+1. get_open_positions - список открытых позиций
+2. get_position_details - детали конкретной позиции
+3. get_closed_positions - история закрытых позиций
+4. search_positions - поиск позиций по критериям
+5. get_bot_status - общий статус бота
+"""
+
+import logging
+from typing import Dict, List, Optional, Any
+from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# TOOL DEFINITIONS (для Claude API)
+# ============================================================================
+
+TOOLS = [
+    {
+        "name": "get_open_positions",
+        "description": "Получить список всех открытых позиций с данными на момент входа (entry price, p_up, EV, ATR, current PnL)",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "include_details": {
+                    "type": "boolean",
+                    "description": "Включить полные детали (entry_snapshot, signals)",
+                    "default": False
+                }
+            }
+        }
+    },
+    {
+        "name": "get_position_details",
+        "description": "Получить детальную информацию о конкретной позиции (entry_snapshot, индикаторы, причина открытия, рыночные условия)",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "Символ позиции (например, BTCUSDT)"
+                }
+            },
+            "required": ["symbol"]
+        }
+    },
+    {
+        "name": "get_closed_positions",
+        "description": "Получить историю закрытых позиций с результатами",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Количество последних позиций",
+                    "default": 10
+                },
+                "result_filter": {
+                    "type": "string",
+                    "description": "Фильтр по результату: 'WIN', 'LOSS', или 'ALL'",
+                    "enum": ["WIN", "LOSS", "ALL"],
+                    "default": "ALL"
+                }
+            }
+        }
+    },
+    {
+        "name": "search_positions",
+        "description": "Поиск позиций по различным критериям (символ, дата, статус, результат)",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbol_pattern": {
+                    "type": "string",
+                    "description": "Паттерн символа (например, 'BTC*', 'ETH*')"
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Статус позиции",
+                    "enum": ["open", "closed", "all"]
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": "Дата начала поиска (ISO format: 2025-11-17)"
+                },
+                "date_to": {
+                    "type": "string",
+                    "description": "Дата окончания поиска (ISO format)"
+                }
+            }
+        }
+    },
+    {
+        "name": "get_bot_status",
+        "description": "Получить общий статус бота (баланс, equity, количество позиций, winrate, статистика моделей)",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    }
+]
+
+
+# ============================================================================
+# TOOL EXECUTOR
+# ============================================================================
+
+class AIAssistantTools:
+    """Исполнитель инструментов для AI ассистента"""
+
+    def __init__(self, bot_instance):
+        """
+        Args:
+            bot_instance: Экземпляр TradingBot с доступом к позициям и состоянию
+        """
+        self.bot = bot_instance
+        logger.info("[AIAssistantTools] Initialized with bot instance")
+
+    def execute_tool(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
+        """
+        Выполняет инструмент и возвращает результат в текстовом формате
+
+        Args:
+            tool_name: Название инструмента
+            tool_input: Параметры инструмента
+
+        Returns:
+            str: Результат выполнения (JSON-строка или текст)
+        """
+        try:
+            logger.info(f"[AIAssistantTools] Executing tool: {tool_name} with input: {tool_input}")
+
+            if tool_name == "get_open_positions":
+                return self._get_open_positions(**tool_input)
+            elif tool_name == "get_position_details":
+                return self._get_position_details(**tool_input)
+            elif tool_name == "get_closed_positions":
+                return self._get_closed_positions(**tool_input)
+            elif tool_name == "search_positions":
+                return self._search_positions(**tool_input)
+            elif tool_name == "get_bot_status":
+                return self._get_bot_status()
+            else:
+                return f"❌ Unknown tool: {tool_name}"
+
+        except Exception as e:
+            logger.error(f"[AIAssistantTools] Error executing {tool_name}: {e}", exc_info=True)
+            return f"❌ Error executing {tool_name}: {str(e)}"
+
+    # ========================================================================
+    # TOOL IMPLEMENTATIONS
+    # ========================================================================
+
+    def _get_open_positions(self, include_details: bool = False) -> str:
+        """Получить открытые позиции"""
+        import json
+
+        try:
+            open_positions = self.bot.position_manager.get_all_open()
+
+            if not open_positions:
+                return "📊 Нет открытых позиций"
+
+            result = []
+            for pos in open_positions:
+                # Базовая информация
+                current_price = self.bot.exchange.get_price(pos.symbol)
+                entry_price = pos.entry_price
+
+                if pos.direction == 'LONG':
+                    pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                else:  # SHORT
+                    pnl_pct = ((entry_price - current_price) / entry_price) * 100
+
+                pos_data = {
+                    "symbol": pos.symbol,
+                    "direction": pos.direction,
+                    "entry_price": entry_price,
+                    "current_price": current_price,
+                    "entry_time": pos.entry_time.isoformat() if hasattr(pos.entry_time, 'isoformat') else str(pos.entry_time),
+                    "tp_price": pos.tp_price,
+                    "sl_price": pos.sl_price,
+                    "current_pnl_pct": round(pnl_pct, 2),
+                    "size": pos.size,
+                    "atr_value": getattr(pos, 'atr_value', None)
+                }
+
+                # Данные из entry_snapshot
+                if include_details and hasattr(pos, 'entry_snapshot') and pos.entry_snapshot:
+                    snapshot = pos.entry_snapshot
+                    pos_data["p_up"] = snapshot.get("predictions", {}).get("p_up")
+                    pos_data["ev"] = snapshot.get("ev")
+                    pos_data["expert_predictions"] = snapshot.get("predictions", {})
+
+                result.append(pos_data)
+
+            return json.dumps(result, indent=2, ensure_ascii=False)
+
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+
+    def _get_position_details(self, symbol: str) -> str:
+        """Получить детали позиции"""
+        import json
+
+        try:
+            # Ищем в открытых
+            open_positions = self.bot.position_manager.get_all_open()
+            position = next((p for p in open_positions if p.symbol == symbol), None)
+
+            if not position:
+                # Ищем в закрытых
+                closed_positions = self.bot.position_manager.get_all_closed()
+                position = next((p for p in closed_positions if p.symbol == symbol), None)
+
+            if not position:
+                return f"❌ Позиция {symbol} не найдена"
+
+            # Полная информация
+            details = {
+                "symbol": position.symbol,
+                "direction": position.direction,
+                "status": position.status,
+                "entry_price": position.entry_price,
+                "entry_time": position.entry_time.isoformat() if hasattr(position.entry_time, 'isoformat') else str(position.entry_time),
+                "tp_price": position.tp_price,
+                "sl_price": position.sl_price,
+                "size": position.size,
+                "atr_value": getattr(position, 'atr_value', None),
+            }
+
+            # Entry snapshot (причина открытия, сигналы, индикаторы)
+            if hasattr(position, 'entry_snapshot') and position.entry_snapshot:
+                snapshot = position.entry_snapshot
+                details["entry_snapshot"] = {
+                    "timestamp": snapshot.get("timestamp"),
+                    "predictions": snapshot.get("predictions"),
+                    "ev": snapshot.get("ev"),
+                    "direction": snapshot.get("direction"),
+                    "features_count": len(snapshot.get("features", [])),
+                    # Фичи не включаем чтобы не засорять (68 значений)
+                }
+
+            # Результат (для закрытых)
+            if position.status == 'CLOSED':
+                details["close_price"] = position.close_price
+                details["close_time"] = position.close_time.isoformat() if hasattr(position.close_time, 'isoformat') else str(position.close_time)
+                details["close_reason"] = position.close_reason
+                details["pnl"] = position.pnl
+                details["pnl_percent"] = position.pnl_percent
+
+            return json.dumps(details, indent=2, ensure_ascii=False)
+
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+
+    def _get_closed_positions(self, limit: int = 10, result_filter: str = "ALL") -> str:
+        """Получить закрытые позиции"""
+        import json
+
+        try:
+            closed_positions = self.bot.position_manager.get_all_closed()
+
+            if not closed_positions:
+                return "📊 Нет закрытых позиций"
+
+            # Фильтруем по результату
+            if result_filter == "WIN":
+                closed_positions = [p for p in closed_positions if p.pnl > 0]
+            elif result_filter == "LOSS":
+                closed_positions = [p for p in closed_positions if p.pnl <= 0]
+
+            # Берем последние N
+            closed_positions = closed_positions[-limit:]
+
+            result = []
+            for pos in closed_positions:
+                pos_data = {
+                    "symbol": pos.symbol,
+                    "direction": pos.direction,
+                    "entry_price": pos.entry_price,
+                    "close_price": pos.close_price,
+                    "entry_time": pos.entry_time.isoformat() if hasattr(pos.entry_time, 'isoformat') else str(pos.entry_time),
+                    "close_time": pos.close_time.isoformat() if hasattr(pos.close_time, 'isoformat') else str(pos.close_time),
+                    "close_reason": pos.close_reason,
+                    "pnl": round(pos.pnl, 2),
+                    "pnl_percent": round(pos.pnl_percent, 2),
+                    "result": "WIN" if pos.pnl > 0 else "LOSS"
+                }
+                result.append(pos_data)
+
+            return json.dumps(result, indent=2, ensure_ascii=False)
+
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+
+    def _search_positions(self, symbol_pattern: Optional[str] = None,
+                         status: str = "all",
+                         date_from: Optional[str] = None,
+                         date_to: Optional[str] = None) -> str:
+        """Поиск позиций по критериям"""
+        import json
+        import fnmatch
+
+        try:
+            # Собираем все позиции
+            positions = []
+            if status in ["open", "all"]:
+                positions.extend(self.bot.position_manager.get_all_open())
+            if status in ["closed", "all"]:
+                positions.extend(self.bot.position_manager.get_all_closed())
+
+            # Фильтр по символу
+            if symbol_pattern:
+                positions = [p for p in positions if fnmatch.fnmatch(p.symbol, symbol_pattern)]
+
+            # Фильтр по дате
+            if date_from:
+                date_from_dt = datetime.fromisoformat(date_from)
+                positions = [p for p in positions if p.entry_time >= date_from_dt]
+
+            if date_to:
+                date_to_dt = datetime.fromisoformat(date_to)
+                positions = [p for p in positions if p.entry_time <= date_to_dt]
+
+            if not positions:
+                return "📊 Позиции не найдены по заданным критериям"
+
+            # Форматируем результат
+            result = []
+            for pos in positions:
+                pos_data = {
+                    "symbol": pos.symbol,
+                    "direction": pos.direction,
+                    "status": pos.status,
+                    "entry_time": pos.entry_time.isoformat() if hasattr(pos.entry_time, 'isoformat') else str(pos.entry_time),
+                    "entry_price": pos.entry_price,
+                }
+
+                if pos.status == 'CLOSED':
+                    pos_data["pnl_percent"] = round(pos.pnl_percent, 2)
+                    pos_data["result"] = "WIN" if pos.pnl > 0 else "LOSS"
+
+                result.append(pos_data)
+
+            return json.dumps(result, indent=2, ensure_ascii=False)
+
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+
+    def _get_bot_status(self) -> str:
+        """Получить общий статус бота"""
+        import json
+
+        try:
+            # Баланс и equity
+            balance = self.bot.exchange.get_balance() if hasattr(self.bot.exchange, 'get_balance') else "N/A"
+            equity = self.bot.exchange.get_equity() if hasattr(self.bot.exchange, 'get_equity') else "N/A"
+
+            # Позиции
+            open_positions = self.bot.position_manager.get_all_open()
+            closed_positions = self.bot.position_manager.get_all_closed()
+
+            # Статистика
+            wins = sum(1 for p in closed_positions if p.pnl > 0)
+            losses = sum(1 for p in closed_positions if p.pnl <= 0)
+            total_closed = len(closed_positions)
+            winrate = (wins / total_closed * 100) if total_closed > 0 else 0
+
+            status = {
+                "timestamp": datetime.now().isoformat(),
+                "balance": balance,
+                "equity": equity,
+                "open_positions_count": len(open_positions),
+                "closed_positions_count": total_closed,
+                "winrate": round(winrate, 2),
+                "wins": wins,
+                "losses": losses,
+                "paper_mode": getattr(self.bot, 'paper_mode', False)
+            }
+
+            return json.dumps(status, indent=2, ensure_ascii=False)
+
+        except Exception as e:
+            return f"❌ Error: {str(e)}"

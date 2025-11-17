@@ -4,7 +4,7 @@ AI Trading Assistant - Claude Sonnet 4.5 Interactive Chat
 
 Возможности:
 - Интерактивный чат с ботом через Telegram
-- Полный контекст о состоянии бота (позиции, сделки, капитал, модели)
+- Инструменты для поиска данных по требованию (экономия токенов!)
 - Анализ решений и объяснение действий бота
 - Диагностика проблем и рекомендации
 - Prompt caching для экономии ~90% токенов
@@ -18,7 +18,7 @@ AI Trading Assistant - Claude Sonnet 4.5 Interactive Chat
 - "Какая модель работает лучше всего?"
 
 Автор: Claude Code
-Дата: 2025-11-12
+Дата: 2025-11-17
 """
 
 import os
@@ -36,6 +36,9 @@ try:
 except ImportError:
     Anthropic = None
     logging.warning("anthropic not installed. Run: pip install anthropic")
+
+# AI Assistant Tools
+from notifications.ai_assistant_tools import AIAssistantTools, TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -499,11 +502,20 @@ Your capabilities:
 - Answer questions about capital, PnL, models, and strategies
 - Provide insights based on historical data
 
+**IMPORTANT: You have access to tools to retrieve data ON DEMAND:**
+- get_open_positions: List of all open positions with entry data
+- get_position_details: Detailed info about specific position (entry_snapshot, signals, conditions)
+- get_closed_positions: History of closed positions with results
+- search_positions: Search positions by criteria (symbol, date, status)
+- get_bot_status: Overall bot status (balance, equity, winrate, models)
+
+**Always use tools instead of relying on stale context data!** This saves tokens and ensures fresh information.
+
 Guidelines:
 - Be concise and clear (Telegram messages should be short)
 - Use emojis sparingly and only when appropriate
-- Always base answers on the provided bot context
-- If you don't have enough data, say so
+- **Use tools to get specific data when needed** (don't guess from context)
+- If you don't have enough data, use tools to get it
 - Provide specific numbers and references when available
 - Be helpful and proactive in identifying issues
 
@@ -516,13 +528,15 @@ Communication style:
     def __init__(
         self,
         api_key: Optional[str] = None,
+        bot_instance = None,  # Экземпляр бота для инструментов
         context_collector: Optional[BotContextCollector] = None,
         cache_dir: str = AIAssistantConfig.CACHE_DIR
     ):
         """
         Args:
             api_key: Anthropic API key
-            context_collector: BotContextCollector instance
+            bot_instance: TradingBot instance для доступа к данным
+            context_collector: BotContextCollector instance (legacy, можно заменить инструментами)
             cache_dir: Directory for caching
         """
         if Anthropic is None:
@@ -534,6 +548,14 @@ Communication style:
 
         self.client = Anthropic(api_key=self.api_key)
         self.context_collector = context_collector
+
+        # Инициализируем инструменты если bot_instance доступен
+        self.tools_executor = None
+        if bot_instance is not None:
+            self.tools_executor = AIAssistantTools(bot_instance)
+            logger.info("[AITradingAssistant] Tools enabled")
+        else:
+            logger.warning("[AITradingAssistant] No bot_instance - tools disabled")
 
         # Кэш
         self.cache_dir = Path(cache_dir)
@@ -561,6 +583,103 @@ Communication style:
                 logger.info(f"[AITradingAssistant] Loaded {len(self.sessions)} sessions")
             except Exception as e:
                 logger.warning(f"[AITradingAssistant] Failed to load sessions: {e}")
+
+    def _process_response(self, response, user_messages: List[Dict], session) -> str:
+        """
+        Обрабатывает ответ от Claude (может содержать tool_use)
+
+        Args:
+            response: Response от Claude API
+            user_messages: История сообщений
+            session: Сессия пользователя
+
+        Returns:
+            str: Финальный текстовый ответ
+        """
+        max_tool_rounds = 5  # Максимум раундов tool calls
+        current_messages = user_messages.copy()
+
+        for round_num in range(max_tool_rounds):
+            # Проверяем stop_reason
+            if response.stop_reason == "end_turn":
+                # Обычный текстовый ответ
+                return response.content[0].text
+
+            elif response.stop_reason == "tool_use":
+                # Claude хочет вызвать инструмент(ы)
+                if self.tools_executor is None:
+                    logger.warning("[AITradingAssistant] tool_use requested but tools not available")
+                    return "⚠️ Инструменты недоступны"
+
+                logger.info(f"[AITradingAssistant] Tool use round {round_num + 1}")
+
+                # Добавляем ответ Claude с tool_use в историю
+                current_messages.append({
+                    "role": "assistant",
+                    "content": response.content
+                })
+
+                # Выполняем все tool_use из ответа
+                tool_results = []
+                for content_block in response.content:
+                    if content_block.type == "tool_use":
+                        tool_name = content_block.name
+                        tool_input = content_block.input
+                        tool_use_id = content_block.id
+
+                        logger.info(f"[AITradingAssistant] Executing tool: {tool_name}")
+
+                        # Выполняем инструмент
+                        tool_result = self.tools_executor.execute_tool(tool_name, tool_input)
+
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": tool_result
+                        })
+
+                # Добавляем результаты инструментов
+                current_messages.append({
+                    "role": "user",
+                    "content": tool_results
+                })
+
+                # Отправляем обратно в Claude
+                try:
+                    system_message = self.SYSTEM_PROMPT
+                    response = self.client.messages.create(
+                        model=AIAssistantConfig.MODEL_ID,
+                        max_tokens=AIAssistantConfig.MAX_TOKENS,
+                        temperature=AIAssistantConfig.MODEL_TEMPERATURE,
+                        system=[{"type": "text", "text": system_message, "cache_control": {"type": "ephemeral"}}],
+                        tools=TOOLS if self.tools_executor else None,
+                        messages=current_messages
+                    )
+
+                    # Обновляем статистику для tool round
+                    usage = response.usage
+                    session.update_stats(
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        getattr(usage, 'cache_read_input_tokens', 0)
+                    )
+
+                except Exception as e:
+                    logger.error(f"[AITradingAssistant] Error in tool round: {e}", exc_info=True)
+                    return f"❌ Ошибка при обработке инструмента: {str(e)[:100]}"
+
+            else:
+                # Неожиданный stop_reason
+                logger.warning(f"[AITradingAssistant] Unexpected stop_reason: {response.stop_reason}")
+                # Пытаемся извлечь текст
+                text_blocks = [block for block in response.content if hasattr(block, 'text')]
+                if text_blocks:
+                    return text_blocks[0].text
+                return "⚠️ Получен неожиданный ответ от AI"
+
+        # Достигли лимита раундов
+        logger.warning("[AITradingAssistant] Max tool rounds reached")
+        return "⚠️ Превышен лимит вызовов инструментов (что-то пошло не так)"
 
     def _save_sessions(self):
         """Сохранение сессий"""
@@ -717,25 +836,31 @@ Communication style:
             system_message = messages[0]["content"] if messages and messages[0].get("role") == "system" else self.SYSTEM_PROMPT
             user_messages = [msg for msg in messages if msg.get("role") != "system"]
 
-            response = self.client.messages.create(
-                model=AIAssistantConfig.MODEL_ID,
-                max_tokens=AIAssistantConfig.MAX_TOKENS,
-                temperature=AIAssistantConfig.MODEL_TEMPERATURE,
-                system=[
+            # Добавляем tools если доступны
+            api_params = {
+                "model": AIAssistantConfig.MODEL_ID,
+                "max_tokens": AIAssistantConfig.MAX_TOKENS,
+                "temperature": AIAssistantConfig.MODEL_TEMPERATURE,
+                "system": [
                     {
                         "type": "text",
                         "text": system_message,
                         "cache_control": {"type": "ephemeral"}  # Кэшируем системный промпт
                     }
                 ],
-                messages=user_messages
-            )
+                "messages": user_messages
+            }
+
+            if self.tools_executor is not None:
+                api_params["tools"] = TOOLS
+
+            response = self.client.messages.create(**api_params)
 
             elapsed = time.time() - start_time
             logger.info(f"[AITradingAssistant] Response received in {elapsed:.2f}s")
 
-            # Извлекаем ответ
-            assistant_message = response.content[0].text
+            # Обрабатываем ответ (может быть текст или tool_use)
+            assistant_message = self._process_response(response, user_messages, session)
 
             # Обновляем статистику
             usage = response.usage
