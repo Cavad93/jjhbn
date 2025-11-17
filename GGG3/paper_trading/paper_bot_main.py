@@ -771,7 +771,10 @@ class PaperTradingBot:
                 amount=position_size,
                 tp_price=tp_price,
                 sl_price=sl_price,
-                metadata={'entry_snapshot': entry_snapshot}
+                metadata={
+                    'entry_snapshot': entry_snapshot,
+                    'atr_value': atr  # ✅ Сохраняем ATR для trailing stop
+                }
             )
 
             logger.info(f"  ✓ Position opened: {position['id']}")

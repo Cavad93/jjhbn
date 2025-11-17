@@ -62,9 +62,9 @@ class TrailingStopManager:
         Проверяет, нужно ли обновить SL для trailing stop
 
         Args:
-            position: Position объект (должен иметь atr_value если atr не передан)
+            position: Position объект или dict (должен иметь atr_value если atr не передан)
             current_price: Текущая цена
-            atr: Значение ATR (опционально, если не передано - берется из position.atr_value)
+            atr: Значение ATR (опционально, если не передано - берется из position.atr_value или metadata)
 
         Returns:
             new_sl_price: Новый уровень SL, если нужно обновить
@@ -73,10 +73,16 @@ class TrailingStopManager:
         if not self.enabled:
             return None
 
-        symbol = position.symbol
-        direction = position.direction
-        entry_price = position.entry_price
-        current_sl = position.sl_price
+        # Универсальный доступ к полям (работает с Position объектом и dict)
+        def get_field(obj, field):
+            if isinstance(obj, dict):
+                return obj.get(field)
+            return getattr(obj, field, None)
+
+        symbol = get_field(position, 'symbol')
+        direction = get_field(position, 'direction')
+        entry_price = get_field(position, 'entry_price')
+        current_sl = get_field(position, 'sl_price')
 
         # Рассчитываем текущую прибыль (в процентах)
         if direction == 'LONG':
@@ -98,8 +104,15 @@ class TrailingStopManager:
         if use_atr_mode:
             # ATR-based режим: получаем ATR
             if atr is None:
-                # Пытаемся взять ATR из позиции
+                # Пытаемся взять ATR из позиции (объект Position)
                 atr = getattr(position, 'atr_value', None)
+
+                # Если не нашли, пробуем взять из metadata (для PaperExchange dict)
+                if atr is None and isinstance(position, dict):
+                    metadata = position.get('metadata', {})
+                    atr = metadata.get('atr_value')
+
+                # Если всё ещё None - fallback к процентному режиму
                 if atr is None:
                     # Fallback: используем процентный режим
                     use_atr_mode = False
