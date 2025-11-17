@@ -19,6 +19,7 @@ Usage:
 
 import sys
 import os
+import json  # ← нужно для Recovery из capital_history.json
 from pathlib import Path
 import time
 from datetime import datetime
@@ -132,8 +133,8 @@ class BinanceTradingBot:
         # Binance client / Paper Exchange
         if paper_mode:
             # Попытка загрузить существующее состояние Paper Exchange
-            state_file = 'data/paper_exchange_state.json'
-            capital_history = 'data/capital_history.json'
+            state_file = str(Path(__file__).parent / 'data' / 'paper_exchange_state.json')
+            capital_history = str(Path(__file__).parent / 'data' / 'capital_history.json')
             if os.path.exists(state_file):
                 try:
                     self.exchange = PaperExchange.load_state(state_file)
