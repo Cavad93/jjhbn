@@ -515,6 +515,11 @@ ML Models & Learning:
 - get_expert_details: Detailed info about specific expert (XGBoost, RandomForest, NeuralNet, etc.)
 - get_expert_performance: Performance stats for each expert (winrate, wins/losses)
 
+Market Data:
+- get_market_overview: Market overview with volatility, active symbols, top positions
+- get_symbol_metrics: Detailed metrics for specific symbol (price, ATR, volatility)
+- get_active_symbols: List of active symbols with their statuses
+
 Bot Status:
 - get_bot_status: Overall bot status (balance, equity, winrate, models)
 

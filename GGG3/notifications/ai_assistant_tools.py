@@ -6,11 +6,23 @@ AI Assistant Tools - Инструменты для поиска данных б�
 постоянной отправки всего контекста (экономия токенов).
 
 Доступные инструменты:
+
+Positions & Trading:
 1. get_open_positions - список открытых позиций
 2. get_position_details - детали конкретной позиции
 3. get_closed_positions - история закрытых позиций
 4. search_positions - поиск позиций по критериям
 5. get_bot_status - общий статус бота
+
+ML Models & Learning:
+6. get_ml_models_stats - статистика всех ML моделей
+7. get_expert_details - детали конкретного эксперта
+8. get_expert_performance - производительность экспертов
+
+Market Data:
+9. get_market_overview - обзор рынка (волатильность, топ позиции)
+10. get_symbol_metrics - метрики для конкретного символа
+11. get_active_symbols - список активных символов
 """
 
 import logging
@@ -143,6 +155,42 @@ TOOLS = [
             "type": "object",
             "properties": {}
         }
+    },
+    {
+        "name": "get_market_overview",
+        "description": "Получить обзор рынка: активные символы, общая волатильность, фаза рынка, топ прибыльные/убыточные позиции",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "include_prices": {
+                    "type": "boolean",
+                    "description": "Включить текущие цены активных символов",
+                    "default": True
+                }
+            }
+        }
+    },
+    {
+        "name": "get_symbol_metrics",
+        "description": "Получить детальные метрики для конкретного символа (цена, ATR, волатильность, momentum)",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {
+                    "type": "string",
+                    "description": "Символ (например, BTCUSDT)"
+                }
+            },
+            "required": ["symbol"]
+        }
+    },
+    {
+        "name": "get_active_symbols",
+        "description": "Получить список всех активных символов бота с их статусами (есть ли позиции, в watchlist, etc.)",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
     }
 ]
 
@@ -192,6 +240,12 @@ class AIAssistantTools:
                 return self._get_expert_details(**tool_input)
             elif tool_name == "get_expert_performance":
                 return self._get_expert_performance()
+            elif tool_name == "get_market_overview":
+                return self._get_market_overview(**tool_input)
+            elif tool_name == "get_symbol_metrics":
+                return self._get_symbol_metrics(**tool_input)
+            elif tool_name == "get_active_symbols":
+                return self._get_active_symbols()
             else:
                 return f"❌ Unknown tool: {tool_name}"
 
@@ -570,6 +624,223 @@ class AIAssistantTools:
                 }
 
             return json.dumps(performance, indent=2, ensure_ascii=False)
+
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+
+    def _get_market_overview(self, include_prices: bool = True) -> str:
+        """Получить обзор рынка"""
+        import json
+
+        try:
+            overview = {
+                "timestamp": datetime.now().isoformat(),
+                "active_symbols": [],
+                "market_stats": {},
+                "top_positions": {}
+            }
+
+            # Получаем все открытые позиции
+            open_positions = self.bot.position_manager.get_all_open()
+
+            if open_positions:
+                # Активные символы
+                active_symbols = list(set(p.symbol for p in open_positions))
+                overview["active_symbols"] = active_symbols
+
+                # Статистика по позициям
+                total_positions = len(open_positions)
+                long_count = sum(1 for p in open_positions if p.direction == 'LONG')
+                short_count = sum(1 for p in open_positions if p.direction == 'SHORT')
+
+                # Средний PnL
+                pnl_values = []
+                for pos in open_positions:
+                    current_price = self.bot.exchange.get_price(pos.symbol)
+                    entry_price = pos.entry_price
+                    if pos.direction == 'LONG':
+                        pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                    else:
+                        pnl_pct = ((entry_price - current_price) / entry_price) * 100
+                    pnl_values.append(pnl_pct)
+
+                avg_pnl = sum(pnl_values) / len(pnl_values) if pnl_values else 0
+
+                # Средний ATR (волатильность)
+                atr_values = [getattr(p, 'atr_value', None) for p in open_positions]
+                atr_values = [a for a in atr_values if a is not None]
+                avg_atr = sum(atr_values) / len(atr_values) if atr_values else None
+
+                overview["market_stats"] = {
+                    "total_positions": total_positions,
+                    "long_positions": long_count,
+                    "short_positions": short_count,
+                    "avg_pnl_percent": round(avg_pnl, 2),
+                    "avg_atr": round(avg_atr, 4) if avg_atr else None
+                }
+
+                # Топ прибыльные и убыточные
+                positions_with_pnl = list(zip(open_positions, pnl_values))
+                positions_with_pnl.sort(key=lambda x: x[1], reverse=True)
+
+                if len(positions_with_pnl) >= 3:
+                    top_profitable = [
+                        {"symbol": p.symbol, "pnl_pct": round(pnl, 2)}
+                        for p, pnl in positions_with_pnl[:3]
+                    ]
+                    top_losing = [
+                        {"symbol": p.symbol, "pnl_pct": round(pnl, 2)}
+                        for p, pnl in positions_with_pnl[-3:]
+                    ]
+                else:
+                    top_profitable = [
+                        {"symbol": p.symbol, "pnl_pct": round(pnl, 2)}
+                        for p, pnl in positions_with_pnl
+                    ]
+                    top_losing = []
+
+                overview["top_positions"] = {
+                    "most_profitable": top_profitable,
+                    "most_losing": top_losing
+                }
+
+                # Текущие цены (опционально)
+                if include_prices:
+                    prices = {}
+                    for symbol in active_symbols:
+                        try:
+                            prices[symbol] = self.bot.exchange.get_price(symbol)
+                        except:
+                            prices[symbol] = None
+                    overview["current_prices"] = prices
+
+            else:
+                overview["market_stats"] = {
+                    "total_positions": 0,
+                    "message": "Нет открытых позиций"
+                }
+
+            return json.dumps(overview, indent=2, ensure_ascii=False)
+
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+
+    def _get_symbol_metrics(self, symbol: str) -> str:
+        """Получить метрики для конкретного символа"""
+        import json
+
+        try:
+            metrics = {
+                "symbol": symbol,
+                "timestamp": datetime.now().isoformat()
+            }
+
+            # Текущая цена
+            try:
+                current_price = self.bot.exchange.get_price(symbol)
+                metrics["current_price"] = current_price
+            except Exception as e:
+                metrics["current_price"] = None
+                metrics["price_error"] = str(e)
+
+            # Проверяем есть ли позиция по этому символу
+            open_positions = self.bot.position_manager.get_all_open()
+            position = next((p for p in open_positions if p.symbol == symbol), None)
+
+            if position:
+                metrics["has_position"] = True
+                metrics["position_direction"] = position.direction
+                metrics["entry_price"] = position.entry_price
+
+                # ATR
+                atr = getattr(position, 'atr_value', None)
+                if atr:
+                    metrics["atr"] = atr
+                    # Волатильность как процент от цены
+                    metrics["volatility_pct"] = round((atr / position.entry_price) * 100, 2)
+
+                # Текущий PnL
+                if current_price:
+                    if position.direction == 'LONG':
+                        pnl_pct = ((current_price - position.entry_price) / position.entry_price) * 100
+                    else:
+                        pnl_pct = ((position.entry_price - current_price) / position.entry_price) * 100
+                    metrics["current_pnl_pct"] = round(pnl_pct, 2)
+
+                # Entry snapshot (если есть)
+                if hasattr(position, 'entry_snapshot') and position.entry_snapshot:
+                    snapshot = position.entry_snapshot
+                    metrics["entry_conditions"] = {
+                        "p_up": snapshot.get("predictions", {}).get("p_up"),
+                        "ev": snapshot.get("ev"),
+                        "timestamp": snapshot.get("timestamp")
+                    }
+            else:
+                metrics["has_position"] = False
+
+                # Пытаемся получить ATR из недавних данных (если доступно)
+                # Примечание: в текущей архитектуре ATR вычисляется только при открытии позиции
+                # Здесь мы можем только сказать что позиции нет
+                metrics["message"] = f"Нет открытой позиции по {symbol}"
+
+            return json.dumps(metrics, indent=2, ensure_ascii=False)
+
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+
+    def _get_active_symbols(self) -> str:
+        """Получить список активных символов"""
+        import json
+
+        try:
+            # Символы из открытых позиций
+            open_positions = self.bot.position_manager.get_all_open()
+            open_symbols = set(p.symbol for p in open_positions)
+
+            # Символы из watchlist (если есть)
+            watchlist_symbols = set()
+            if hasattr(self.bot, 'symbol_watchlist') and self.bot.symbol_watchlist:
+                watchlist_symbols = set(self.bot.symbol_watchlist)
+
+            # Все уникальные символы
+            all_symbols = open_symbols | watchlist_symbols
+
+            symbols_data = []
+            for symbol in sorted(all_symbols):
+                symbol_info = {
+                    "symbol": symbol,
+                    "has_open_position": symbol in open_symbols,
+                    "in_watchlist": symbol in watchlist_symbols
+                }
+
+                # Если есть позиция - добавляем детали
+                if symbol in open_symbols:
+                    position = next(p for p in open_positions if p.symbol == symbol)
+                    symbol_info["direction"] = position.direction
+
+                    # Текущий PnL
+                    try:
+                        current_price = self.bot.exchange.get_price(symbol)
+                        entry_price = position.entry_price
+                        if position.direction == 'LONG':
+                            pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                        else:
+                            pnl_pct = ((entry_price - current_price) / entry_price) * 100
+                        symbol_info["current_pnl_pct"] = round(pnl_pct, 2)
+                    except:
+                        symbol_info["current_pnl_pct"] = None
+
+                symbols_data.append(symbol_info)
+
+            result = {
+                "timestamp": datetime.now().isoformat(),
+                "total_symbols": len(symbols_data),
+                "symbols_with_positions": len(open_symbols),
+                "watchlist_symbols": len(watchlist_symbols),
+                "symbols": symbols_data
+            }
+
+            return json.dumps(result, indent=2, ensure_ascii=False)
 
         except Exception as e:
             return f"❌ Error: {str(e)}"

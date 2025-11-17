@@ -97,6 +97,87 @@ AI отвечает: 500 токенов
 - Winrate, wins, losses
 - Paper mode status
 
+### 6. **get_ml_models_stats**
+Статистика всех ML моделей
+
+```json
+{
+  "include_diversity": true  // Включить diversity monitor
+}
+```
+
+**Возвращает:**
+- Все эксперты (xgb, rf, arf, nn)
+- Trained status, samples, accuracy
+- META model статистика
+- Diversity monitor метрики
+
+### 7. **get_expert_details**
+Детали конкретного эксперта
+
+```json
+{
+  "expert_name": "xgb"  // 'xgb', 'rf', 'arf', 'nn', 'meta'
+}
+```
+
+**Возвращает:**
+- Тип модели, trained status
+- Параметры (n_estimators, max_depth, learning_rate, etc.)
+- Train accuracy, samples
+
+### 8. **get_expert_performance**
+Производительность экспертов
+
+```json
+{}  // Без параметров
+```
+
+**Возвращает:**
+- Wins, losses, total, winrate для каждого эксперта
+
+### 9. **get_market_overview**
+Обзор рынка
+
+```json
+{
+  "include_prices": true  // Включить текущие цены
+}
+```
+
+**Возвращает:**
+- Активные символы
+- Статистика (total/long/short позиций, avg PnL, avg ATR)
+- Топ прибыльные/убыточные позиции
+- Текущие цены (опционально)
+
+### 10. **get_symbol_metrics**
+Метрики для конкретного символа
+
+```json
+{
+  "symbol": "BTCUSDT"
+}
+```
+
+**Возвращает:**
+- Текущая цена
+- ATR, волатильность %
+- Информация о позиции (если открыта)
+- Entry conditions (p_up, EV, timestamp)
+
+### 11. **get_active_symbols**
+Список активных символов
+
+```json
+{}  // Без параметров
+```
+
+**Возвращает:**
+- Все символы с позициями или в watchlist
+- Направление, current PnL для каждого
+- Статус (has_position, in_watchlist)
+
 ## 🎭 Примеры использования
 
 ### Пример 1: Узнать о конкретной позиции
