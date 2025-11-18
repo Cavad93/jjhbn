@@ -130,6 +130,10 @@ class TrailingStopManager:
                 # Процентный: SL = peak_price * (1 - distance_pct/100)
                 new_sl = self._peak_prices[symbol] * (1 - self.distance_pct / 100)
 
+            # КРИТИЧЕСКИ ВАЖНО: новый SL не должен быть ниже точки входа!
+            # Трейлинг-стоп предназначен для защиты прибыли, а не создания убытков
+            new_sl = max(new_sl, entry_price)
+
             # Обновляем SL только если он выше текущего
             # Trailing stop МОЖЕТ и ДОЛЖЕН поднимать SL выше entry_price для защиты прибыли
             if new_sl > current_sl:
@@ -147,6 +151,10 @@ class TrailingStopManager:
             else:
                 # Процентный: SL = peak_price * (1 + distance_pct/100)
                 new_sl = self._peak_prices[symbol] * (1 + self.distance_pct / 100)
+
+            # КРИТИЧЕСКИ ВАЖНО: новый SL не должен быть выше точки входа!
+            # Трейлинг-стоп предназначен для защиты прибыли, а не создания убытков
+            new_sl = min(new_sl, entry_price)
 
             # Обновляем SL только если он ниже текущего
             # Trailing stop МОЖЕТ и ДОЛЖЕН опускать SL ниже entry_price для защиты прибыли в SHORT
