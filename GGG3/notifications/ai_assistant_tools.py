@@ -396,6 +396,27 @@ class AIAssistantTools:
                     "pnl_pct": round(pos.pnl_pct, 2),
                     "result": "WIN" if pos.pnl > 0 else "LOSS"
                 }
+
+                # Добавляем данные о предсказаниях экспертов из entry_snapshot
+                if hasattr(pos, 'entry_snapshot') and pos.entry_snapshot:
+                    snapshot = pos.entry_snapshot
+                    predictions = snapshot.get("predictions", {})
+                    if predictions:
+                        # Добавляем предсказания всех экспертов
+                        pos_data["expert_predictions"] = {
+                            "xgb": predictions.get("p_xgb"),
+                            "rf": predictions.get("p_rf"),
+                            "arf": predictions.get("p_arf"),
+                            "nn": predictions.get("p_nn"),
+                            "base": predictions.get("p_base"),
+                            "meta": predictions.get("p_meta")
+                        }
+                        # Также добавляем какой эксперт "победил" (имел самое высокое предсказание)
+                        valid_predictions = {k: v for k, v in predictions.items() if v is not None and k.startswith('p_')}
+                        if valid_predictions:
+                            best_expert = max(valid_predictions.items(), key=lambda x: x[1])
+                            pos_data["best_expert"] = best_expert[0].replace('p_', '')  # xgb, rf, etc.
+
                 result.append(pos_data)
 
             return json.dumps(result, indent=2, ensure_ascii=False)

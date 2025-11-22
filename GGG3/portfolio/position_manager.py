@@ -498,6 +498,15 @@ class PositionManager:
             'SHORT': short_count
         }
 
+    def get_all_closed(self) -> List[Position]:
+        """
+        Возвращает все закрытые позиции
+
+        Returns:
+            Список всех закрытых позиций
+        """
+        return self.closed_positions
+
     def get_recent_closed(self, limit: int = 10) -> List[Position]:
         """
         Возвращает последние закрытые позиции
