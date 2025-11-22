@@ -548,9 +548,18 @@ class AIAssistantTools:
                 meta = self.bot.meta
                 stats["meta"] = {
                     "trained": meta.is_trained if hasattr(meta, 'is_trained') else True,
-                    "samples": meta.train_samples if hasattr(meta, 'train_samples') else "N/A",
+                    "samples": meta.train_samples if hasattr(meta, 'train_samples') else 0,
                     "type": type(meta).__name__
                 }
+
+                # Дополнительные метрики для SimplifiedEnsembleMETA
+                if hasattr(meta, 'mode'):
+                    stats["meta"]["mode"] = meta.mode  # SHADOW/ACTIVE
+                if hasattr(meta, 'status'):
+                    status = meta.status()
+                    stats["meta"]["wr_shadow"] = status.get("wr_shadow", "N/A")
+                    stats["meta"]["wr_active"] = status.get("wr_active", "N/A")
+
                 if hasattr(meta, 'train_accuracy'):
                     stats["meta"]["accuracy"] = round(meta.train_accuracy, 4)
 
@@ -589,8 +598,19 @@ class AIAssistantTools:
                 "name": expert_name,
                 "type": type(expert).__name__,
                 "trained": expert.is_trained if hasattr(expert, 'is_trained') else True,
-                "samples": expert.train_samples if hasattr(expert, 'train_samples') else "N/A"
+                "samples": expert.train_samples if hasattr(expert, 'train_samples') else 0
             }
+
+            # Специфичные метрики для META
+            if expert_name == "meta":
+                if hasattr(expert, 'mode'):
+                    details["mode"] = expert.mode
+                if hasattr(expert, 'status'):
+                    status = expert.status()
+                    details["wr_shadow"] = status.get("wr_shadow", "N/A")
+                    details["wr_active"] = status.get("wr_active", "N/A")
+                    details["n_shadow"] = status.get("n_shadow", "0")
+                    details["n_active"] = status.get("n_active", "0")
 
             # Специфичные для типа метрики
             if hasattr(expert, 'train_accuracy'):

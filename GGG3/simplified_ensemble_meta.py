@@ -576,6 +576,21 @@ class SimplifiedEnsembleMETA:
             return None
         return ensemble.get_feature_importance()
 
+    @property
+    def total_samples(self) -> int:
+        """Возвращает общее количество увиденных примеров (для совместимости с binance_bot_main.py и AI Assistant)"""
+        return sum(self.seen_ph.values())
+
+    @property
+    def train_samples(self) -> int:
+        """Alias для total_samples (для совместимости с AI Assistant)"""
+        return self.total_samples
+
+    @property
+    def is_trained(self) -> bool:
+        """Возвращает True если хотя бы одна фаза обучена (для совместимости с AI Assistant)"""
+        return any(ens.n_trained > 0 for ens in self.ensembles.values())
+
     # ========== СОХРАНЕНИЕ/ЗАГРУЗКА ==========
 
     def _save(self):
