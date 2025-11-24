@@ -39,7 +39,7 @@ class AITradingConfig:
     CHECK_POSITIONS_INTERVAL_MINUTES = 60  # Каждый час
 
     # ===== COIN SELECTION =====
-    TOP_COINS_TO_ANALYZE = 8  # AI выбирает топ-8 для детального анализа (reduced to avoid rate limits)
+    TOP_COINS_TO_ANALYZE = 20  # AI выбирает топ-20 для детального анализа
 
     # Фильтры для первичного скрининга
     MIN_24H_VOLUME_USD = 10_000_000  # $10M минимум
