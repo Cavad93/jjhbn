@@ -7,6 +7,8 @@ AI Tools - Инструменты для Sonnet 4.5 Trading Agent
 import sys
 import os
 import json
+import requests
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 import numpy as np
@@ -123,17 +125,17 @@ TOOLS = [
     },
     {
         "name": "search_fundamental_info",
-        "description": "Search the internet for fundamental information about a cryptocurrency: news, events, developments, partnerships. Use this to understand the broader context beyond technical analysis.",
+        "description": "Search for fundamental information about a cryptocurrency from CryptoCompare news API and CoinGecko trending data. Returns: recent news articles (titles, sources, dates), sentiment analysis (positive/negative/neutral with score), trending status on CoinGecko, and a summary. Use this to filter out coins with negative news or identify coins with positive catalysts.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Search query (e.g., 'Bitcoin recent news', 'Ethereum Shanghai upgrade')"
+                    "description": "Search query (e.g., 'Bitcoin recent news', 'Ethereum upgrade', 'Solana developments')"
                 },
                 "coin_name": {
                     "type": "string",
-                    "description": "Cryptocurrency name or symbol for context (e.g., 'Bitcoin', 'BTC')"
+                    "description": "Cryptocurrency name or symbol (e.g., 'Bitcoin', 'BTC', 'BTCUSDT'). Used to filter news and check trending status."
                 }
             },
             "required": ["query"]
@@ -647,8 +649,12 @@ class AIToolsExecutor:
 
     def _search_fundamental_info(self, query: str, coin_name: str = "") -> Dict[str, Any]:
         """
-        Search for fundamental information
-        Note: This is a placeholder - actual implementation would use WebSearch
+        Search for fundamental information using crypto news APIs
+
+        Sources:
+        - CryptoCompare News API (free, no key required)
+        - CoinGecko trending coins
+        - Sentiment analysis from keywords
         """
         # Budget check
         if self.search_count >= self.config.MAX_SEARCH_QUERIES_PER_DAY:
@@ -660,14 +666,277 @@ class AIToolsExecutor:
 
         self.search_count += 1
 
-        # Placeholder response
-        return {
+        results = {
             "query": query,
             "coin_name": coin_name,
-            "note": "Fundamental search placeholder - implement WebSearch integration",
             "searches_used": self.search_count,
-            "suggestion": "Focus on technical analysis for now, fundamental search will be added"
+            "news": [],
+            "sentiment": "neutral",
+            "trending": False,
+            "sources_checked": []
         }
+
+        try:
+            # 1. Get latest crypto news from CryptoCompare (free API)
+            news_data = self._fetch_cryptocompare_news(coin_name or query)
+            if news_data:
+                results["news"] = news_data["articles"][:5]  # Top 5 news
+                results["sources_checked"].append("CryptoCompare")
+
+            # 2. Check if coin is trending on CoinGecko
+            trending_data = self._fetch_coingecko_trending(coin_name)
+            if trending_data:
+                results["trending"] = trending_data["is_trending"]
+                results["trending_rank"] = trending_data.get("rank")
+                results["sources_checked"].append("CoinGecko")
+
+            # 3. Analyze sentiment from news headlines
+            if results["news"]:
+                results["sentiment"] = self._analyze_sentiment(results["news"])
+                results["sentiment_score"] = self._calculate_sentiment_score(results["news"])
+
+            # 4. Summary
+            results["summary"] = self._generate_fundamental_summary(results)
+
+        except Exception as e:
+            results["error"] = f"Search failed: {str(e)}"
+            results["note"] = "Partial results may be available"
+
+        return results
+
+    def _fetch_cryptocompare_news(self, coin_name: str, limit: int = 10) -> Optional[Dict]:
+        """
+        Fetch latest news from CryptoCompare API (free, no key required)
+        """
+        try:
+            # CryptoCompare news endpoint (public, no auth)
+            url = "https://min-api.cryptocompare.com/data/v2/news/"
+            params = {
+                "lang": "EN",
+                "sortOrder": "latest"
+            }
+
+            # Add coin filter if provided
+            if coin_name:
+                # Try to get coin symbol (BTC, ETH, etc)
+                coin_symbol = self._extract_coin_symbol(coin_name)
+                if coin_symbol:
+                    params["categories"] = coin_symbol
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            response.raise_for_status()
+
+            data = response.json()
+
+            if data.get("Response") == "Success" and data.get("Data"):
+                articles = []
+                for item in data["Data"][:limit]:
+                    articles.append({
+                        "title": item.get("title", ""),
+                        "source": item.get("source", ""),
+                        "published": datetime.fromtimestamp(item.get("published_on", 0)).isoformat(),
+                        "url": item.get("url", ""),
+                        "categories": item.get("categories", ""),
+                        "body_preview": item.get("body", "")[:200] + "..." if item.get("body") else ""
+                    })
+
+                return {"articles": articles, "total": len(articles)}
+
+        except Exception as e:
+            print(f"[Warning] CryptoCompare news fetch failed: {e}")
+            return None
+
+    def _fetch_coingecko_trending(self, coin_name: str) -> Optional[Dict]:
+        """
+        Check if coin is trending on CoinGecko (free API)
+        """
+        try:
+            url = "https://api.coingecko.com/api/v3/search/trending"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+
+            data = response.json()
+
+            if "coins" in data:
+                coin_symbol = self._extract_coin_symbol(coin_name).lower()
+
+                for idx, coin in enumerate(data["coins"]):
+                    coin_item = coin.get("item", {})
+                    symbol = coin_item.get("symbol", "").lower()
+                    name = coin_item.get("name", "").lower()
+
+                    if coin_symbol in symbol or coin_symbol in name:
+                        return {
+                            "is_trending": True,
+                            "rank": idx + 1,
+                            "name": coin_item.get("name"),
+                            "symbol": coin_item.get("symbol"),
+                            "market_cap_rank": coin_item.get("market_cap_rank")
+                        }
+
+            return {"is_trending": False}
+
+        except Exception as e:
+            print(f"[Warning] CoinGecko trending fetch failed: {e}")
+            return None
+
+    def _extract_coin_symbol(self, coin_name: str) -> str:
+        """
+        Extract coin symbol from name or trading pair
+        Examples: BTCUSDT -> BTC, Bitcoin -> BTC, ETH -> ETH
+        """
+        coin_name = coin_name.upper()
+
+        # Common mappings
+        mappings = {
+            "BITCOIN": "BTC",
+            "ETHEREUM": "ETH",
+            "BINANCE": "BNB",
+            "CARDANO": "ADA",
+            "SOLANA": "SOL",
+            "RIPPLE": "XRP",
+            "POLKADOT": "DOT",
+            "DOGECOIN": "DOGE",
+            "AVALANCHE": "AVAX",
+            "POLYGON": "MATIC",
+            "CHAINLINK": "LINK"
+        }
+
+        if coin_name in mappings:
+            return mappings[coin_name]
+
+        # Remove USDT, BUSD, etc
+        for suffix in ["USDT", "BUSD", "USDC", "USD", "BTC", "ETH"]:
+            if coin_name.endswith(suffix):
+                return coin_name[:-len(suffix)]
+
+        # If short (2-5 chars), probably already a symbol
+        if 2 <= len(coin_name) <= 5:
+            return coin_name
+
+        return coin_name[:4]  # Take first 4 chars as fallback
+
+    def _analyze_sentiment(self, articles: List[Dict]) -> str:
+        """
+        Analyze sentiment from news articles using keyword analysis
+        """
+        positive_keywords = [
+            "bullish", "surge", "rally", "gain", "profit", "breakthrough",
+            "partnership", "adoption", "upgrade", "positive", "growth",
+            "milestone", "success", "win", "launch", "innovation"
+        ]
+
+        negative_keywords = [
+            "bearish", "crash", "drop", "loss", "scam", "hack", "ban",
+            "regulation", "lawsuit", "decline", "fail", "warning", "risk",
+            "concern", "investigation", "fraud", "dump"
+        ]
+
+        positive_count = 0
+        negative_count = 0
+
+        for article in articles:
+            title = article.get("title", "").lower()
+            body = article.get("body_preview", "").lower()
+            text = f"{title} {body}"
+
+            for keyword in positive_keywords:
+                if keyword in text:
+                    positive_count += 1
+
+            for keyword in negative_keywords:
+                if keyword in text:
+                    negative_count += 1
+
+        if positive_count > negative_count * 1.5:
+            return "positive"
+        elif negative_count > positive_count * 1.5:
+            return "negative"
+        else:
+            return "neutral"
+
+    def _calculate_sentiment_score(self, articles: List[Dict]) -> float:
+        """
+        Calculate sentiment score from -1.0 (very negative) to 1.0 (very positive)
+        """
+        positive_keywords = [
+            "bullish", "surge", "rally", "gain", "profit", "breakthrough",
+            "partnership", "adoption", "upgrade", "positive", "growth"
+        ]
+
+        negative_keywords = [
+            "bearish", "crash", "drop", "loss", "scam", "hack", "ban",
+            "regulation", "lawsuit", "decline", "fail", "warning"
+        ]
+
+        total_score = 0
+        count = 0
+
+        for article in articles:
+            title = article.get("title", "").lower()
+            body = article.get("body_preview", "").lower()
+            text = f"{title} {body}"
+
+            score = 0
+            for keyword in positive_keywords:
+                if keyword in text:
+                    score += 1
+
+            for keyword in negative_keywords:
+                if keyword in text:
+                    score -= 1
+
+            total_score += score
+            count += 1
+
+        if count == 0:
+            return 0.0
+
+        # Normalize to -1.0 to 1.0
+        avg_score = total_score / count
+        return max(-1.0, min(1.0, avg_score / 3))
+
+    def _generate_fundamental_summary(self, results: Dict) -> str:
+        """
+        Generate human-readable summary of fundamental analysis
+        """
+        parts = []
+
+        # News summary
+        if results.get("news"):
+            news_count = len(results["news"])
+            parts.append(f"Found {news_count} recent news articles")
+
+        # Sentiment
+        sentiment = results.get("sentiment", "neutral")
+        sentiment_score = results.get("sentiment_score", 0)
+
+        if sentiment == "positive":
+            parts.append(f"Overall sentiment: POSITIVE (score: {sentiment_score:.2f})")
+        elif sentiment == "negative":
+            parts.append(f"Overall sentiment: NEGATIVE (score: {sentiment_score:.2f})")
+        else:
+            parts.append(f"Overall sentiment: NEUTRAL (score: {sentiment_score:.2f})")
+
+        # Trending
+        if results.get("trending"):
+            rank = results.get("trending_rank", "")
+            parts.append(f"Currently TRENDING on CoinGecko (rank #{rank})")
+
+        # Sources
+        sources = results.get("sources_checked", [])
+        if sources:
+            parts.append(f"Sources: {', '.join(sources)}")
+
+        return ". ".join(parts) if parts else "No significant fundamental data found"
 
     def _get_historical_decisions(self, symbol: Optional[str] = None,
                                    outcome: str = "all", limit: int = 20,
