@@ -15,11 +15,11 @@ class AITradingConfig:
     # ===== AI MODEL =====
     AI_MODEL = "claude-sonnet-4-5-20250929"
     AI_TEMPERATURE = 0.7  # Баланс между креативностью и консистентностью
-    AI_MAX_TOKENS = 8000
+    AI_MAX_TOKENS = 4096  # Reduced to minimize token usage
 
     # ===== TRADING PARAMETERS =====
     MAX_POSITIONS = 10
-    MIN_POSITIONS = 3  # Минимальное количество позиций для поддержания
+    MIN_POSITIONS = 2  # Минимальное количество позиций для поддержания (reduced to avoid rate limits)
 
     # Размер позиции (% от капитала)
     MIN_POSITION_SIZE_PCT = 1.0   # 1%
@@ -39,7 +39,7 @@ class AITradingConfig:
     CHECK_POSITIONS_INTERVAL_MINUTES = 60  # Каждый час
 
     # ===== COIN SELECTION =====
-    TOP_COINS_TO_ANALYZE = 20  # AI выбирает топ-20 для детального анализа
+    TOP_COINS_TO_ANALYZE = 8  # AI выбирает топ-8 для детального анализа (reduced to avoid rate limits)
 
     # Фильтры для первичного скрининга
     MIN_24H_VOLUME_USD = 10_000_000  # $10M минимум
@@ -170,12 +170,14 @@ CONSTRAINTS:
 - Total exposure: max {cls.MAX_TOTAL_EXPOSURE_PCT}% of capital
 - Mandatory TP/SL for every position (Risk:Reward >= {cls.MIN_RISK_REWARD_RATIO}:1)
 - Decisions made once per {cls.DECISION_INTERVAL_HOURS}h
+- **API EFFICIENCY**: Minimize tool calls - batch requests when possible, avoid redundant analysis
+- **Rate Limits**: Stay within API limits (30k tokens/min) - be concise and focused
 
 DECISION PROCESS:
 1. MARKET SCREENING: Analyze ~400 trading pairs
    - Filter by volume (>${cls.MIN_24H_VOLUME_USD/1e6}M USD), volatility ({cls.MIN_VOLATILITY_PCT}-{cls.MAX_VOLATILITY_PCT}%)
    - Exclude blacklist and stablecoins
-   - Select top-{cls.TOP_COINS_TO_ANALYZE} candidates using YOUR adaptive criteria
+   - Select EXACTLY top-{cls.TOP_COINS_TO_ANALYZE} candidates (DO NOT EXCEED THIS LIMIT)
 
 2. DEEP ANALYSIS (for each top-{cls.TOP_COINS_TO_ANALYZE}):
    - Technical analysis: Use indicators across {', '.join(cls.TIMEFRAMES)} timeframes
