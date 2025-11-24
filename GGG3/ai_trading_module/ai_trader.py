@@ -584,6 +584,19 @@ Now proceed with your analysis and decisions.
                     f"Duration: {(decision.exit_time - decision.timestamp).total_seconds() / 3600:.1f}h"
                 )
 
+            # Save exchange state after closing position (for paper trading)
+            if self.config.PAPER_TRADING and hasattr(self.exchange, 'save_state'):
+                try:
+                    state_file = os.path.join(
+                        os.path.dirname(os.path.dirname(__file__)),
+                        "ai_trading_module",
+                        "data",
+                        "ai_paper_exchange_state.json"
+                    )
+                    self.exchange.save_state(state_file)
+                except Exception as e:
+                    print(f"[Warning] Failed to save exchange state: {e}")
+
     def _check_emergency_conditions(self, portfolio: Dict) -> bool:
         """Check for emergency stop conditions"""
         # Check drawdown

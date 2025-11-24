@@ -48,14 +48,41 @@ def setup_logging(config: AITradingConfig):
     )
 
 
-def create_exchange(paper_mode: bool):
+def create_exchange(paper_mode: bool, initial_capital: float):
     """Create exchange client"""
     if paper_mode:
         print("[Setup] Using Paper Trading Exchange")
-        # Load or create paper exchange with separate state for AI module
-        state_file = "/home/user/jjhbn/GGG3/ai_trading_module/data/paper_exchange_state.json"
-        exchange = PaperExchange(initial_balance=1000.0, state_file=state_file)
-        exchange.load_state()
+
+        # Separate state file for AI module
+        state_file = os.path.join(
+            os.path.dirname(__file__),
+            "ai_trading_module",
+            "data",
+            "ai_paper_exchange_state.json"
+        )
+
+        # Try to load existing state
+        if os.path.exists(state_file):
+            try:
+                print(f"[Setup] Loading existing state from {state_file}")
+                exchange = PaperExchange.load_state(state_file)
+                print(f"[Setup] Restored balance: ${exchange.balance:.2f}")
+                return exchange
+            except Exception as e:
+                print(f"[Warning] Failed to load state: {e}")
+                print(f"[Setup] Creating new exchange with initial capital ${initial_capital}")
+        else:
+            print(f"[Setup] No existing state found, creating new exchange")
+
+        # Create new exchange
+        exchange = PaperExchange(initial_capital=initial_capital)
+
+        # Save initial state
+        try:
+            exchange.save_state(state_file)
+        except Exception as e:
+            print(f"[Warning] Failed to save initial state: {e}")
+
         return exchange
     else:
         print("[Setup] Using Live Binance Exchange")
@@ -210,7 +237,7 @@ def main():
 
     # Create exchange
     try:
-        exchange = create_exchange(paper_mode)
+        exchange = create_exchange(paper_mode, config.INITIAL_CAPITAL)
     except Exception as e:
         print(f"[ERROR] Failed to create exchange: {e}")
         sys.exit(1)
@@ -259,6 +286,22 @@ def main():
         if telegram:
             telegram.send_message(f"🚨 AI Trader Critical Error:\n{e}")
         sys.exit(1)
+    finally:
+        # Save exchange state on shutdown
+        if paper_mode and hasattr(exchange, 'save_state'):
+            try:
+                state_file = os.path.join(
+                    os.path.dirname(__file__),
+                    "ai_trading_module",
+                    "data",
+                    "ai_paper_exchange_state.json"
+                )
+                print(f"\n[Shutdown] Saving exchange state to {state_file}...")
+                exchange.save_state(state_file)
+                print(f"[Shutdown] Final balance: ${exchange.balance:.2f}")
+                print(f"[Shutdown] State saved successfully")
+            except Exception as e:
+                print(f"[Error] Failed to save exchange state: {e}")
 
 
 if __name__ == "__main__":
