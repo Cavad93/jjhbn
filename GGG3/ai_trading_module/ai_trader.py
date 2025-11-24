@@ -5,11 +5,17 @@ AI Trader - Autonomous Trading Agent using Claude Sonnet 4.5
 """
 import sys
 import os
+import io
 import json
 import time
+import threading
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 import anthropic
+
+# Setup logger
+logger = logging.getLogger(__name__)
 
 # Add parent directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -80,9 +86,17 @@ class AITrader:
             "total_api_cost_usd": 0.0
         }
 
+        # Watchdog для предотвращения зависания
+        self._last_activity = time.time()
+        self._watchdog_enabled = True
+        self._activity_lock = threading.Lock()
+        self._watchdog_thread = threading.Thread(target=self._watchdog_monitor, daemon=True)
+        self._watchdog_thread.start()
+
         print(f"[AI Trader] Initialized with ${self.config.INITIAL_CAPITAL} capital")
         print(f"[AI Trader] Model: {self.config.AI_MODEL}")
         print(f"[AI Trader] Paper Trading: {self.config.PAPER_TRADING}")
+        print(f"[AI Trader] Watchdog: Enabled")
 
     def run(self):
         """
@@ -107,27 +121,32 @@ class AITrader:
         try:
             while True:
                 current_time = datetime.now()
+                self._update_activity()  # Watchdog: update activity
 
                 # Check if it's time for daily decision cycle
                 if self._should_make_decisions(current_time):
                     print(f"\n[{current_time}] Starting daily decision cycle...")
                     self._daily_decision_cycle()
                     self.last_decision_time = current_time
+                    self._update_activity()  # Watchdog: after decisions
 
                 # Check positions periodically
                 if self._should_check_positions(current_time):
                     print(f"\n[{current_time}] Checking positions...")
                     self._check_and_close_positions()
                     self.last_position_check_time = current_time
+                    self._update_activity()  # Watchdog: after position check
 
                 # Sleep for a minute
                 time.sleep(60)
 
         except KeyboardInterrupt:
             print("\n\nAI Trader stopped by user")
+            self._watchdog_enabled = False  # Stop watchdog
             self._send_shutdown_report()
         except Exception as e:
             print(f"\n\nCritical error: {e}")
+            self._watchdog_enabled = False  # Stop watchdog
             if self.telegram:
                 self.telegram.send_message(f"🚨 AI Trader Error: {e}")
             raise
@@ -409,8 +428,8 @@ Now proceed with your analysis and decisions.
             symbol = position_params['symbol']
             direction = position_params['direction']
             size_pct = position_params['size_pct']
-            tp_price = position_params['tp_price']
-            sl_price = position_params['sl_price']
+            ai_tp_price = position_params['tp_price']
+            ai_sl_price = position_params['sl_price']
             reasoning = position_params['reasoning']
             confidence = position_params.get('confidence', 0.7)
 
@@ -421,13 +440,27 @@ Now proceed with your analysis and decisions.
             # Get market data for record
             market_data = self._get_market_snapshot(symbol)
 
+            # CRITICAL FIX: Recalculate TP/SL based on REAL entry price using ATR
+            # AI may have wrong price expectations, so we use ATR-based calculation
+            tp_price, sl_price = self._recalculate_tp_sl_from_atr(
+                symbol=symbol,
+                entry_price=entry_price,
+                direction=direction,
+                market_data=market_data,
+                ai_tp_price=ai_tp_price,
+                ai_sl_price=ai_sl_price
+            )
+
+            print(f"[TP/SL Adjustment] AI suggested TP: ${ai_tp_price:.2f}, SL: ${ai_sl_price:.2f}")
+            print(f"[TP/SL Adjustment] Recalculated TP: ${tp_price:.2f}, SL: ${sl_price:.2f} (based on entry: ${entry_price:.2f})")
+
             # Record decision
             decision_id = self.decision_manager.record_decision(
                 symbol=symbol,
                 direction=direction,
                 entry_price=entry_price,
-                tp_price=tp_price,
-                sl_price=sl_price,
+                tp_price=tp_price,  # Use recalculated TP
+                sl_price=sl_price,  # Use recalculated SL
                 size_pct=size_pct,
                 reasoning=reasoning,
                 confidence=confidence,
@@ -442,8 +475,8 @@ Now proceed with your analysis and decisions.
                 direction=direction,
                 size_pct=size_pct,
                 entry_price=entry_price,
-                tp_price=tp_price,
-                sl_price=sl_price
+                tp_price=tp_price,  # Use recalculated TP
+                sl_price=sl_price   # Use recalculated SL
             )
 
             self.stats['positions_opened'] += 1
@@ -454,6 +487,95 @@ Now proceed with your analysis and decisions.
 
         except Exception as e:
             print(f"[ERROR] Failed to open position: {e}")
+
+    def _recalculate_tp_sl_from_atr(self, symbol: str, entry_price: float,
+                                    direction: str, market_data: Dict,
+                                    ai_tp_price: float, ai_sl_price: float) -> tuple:
+        """
+        Recalculate TP/SL based on actual entry price and ATR
+
+        AI may suggest TP/SL based on wrong price expectations.
+        This method recalculates using ATR-based approach relative to actual entry.
+
+        Returns:
+            (tp_price, sl_price) tuple
+        """
+        try:
+            # Try to get ATR from market data
+            indicators = market_data.get('indicators', {})
+            atr = indicators.get('atr', {}).get('current', None)
+
+            if atr is None or atr <= 0:
+                # Fallback: calculate ATR from AI's intended distances
+                print(f"[Warning] No ATR available for {symbol}, using AI's intended distances")
+                if direction == "LONG":
+                    tp_distance_pct = (ai_tp_price - entry_price) / entry_price * 100
+                    sl_distance_pct = (entry_price - ai_sl_price) / entry_price * 100
+                else:
+                    tp_distance_pct = (entry_price - ai_tp_price) / entry_price * 100
+                    sl_distance_pct = (ai_sl_price - entry_price) / entry_price * 100
+
+                # Apply to actual entry price
+                if direction == "LONG":
+                    tp_price = entry_price * (1 + tp_distance_pct / 100)
+                    sl_price = entry_price * (1 - sl_distance_pct / 100)
+                else:
+                    tp_price = entry_price * (1 - tp_distance_pct / 100)
+                    sl_price = entry_price * (1 + sl_distance_pct / 100)
+
+            else:
+                # Use ATR-based calculation (same as main bot)
+                # TP = 2.5x ATR, SL = 1.5x ATR
+                tp_multiplier = 2.5
+                sl_multiplier = 1.5
+
+                if direction == "LONG":
+                    tp_price = entry_price + (atr * tp_multiplier)
+                    sl_price = entry_price - (atr * sl_multiplier)
+                else:  # SHORT
+                    tp_price = entry_price - (atr * tp_multiplier)
+                    sl_price = entry_price + (atr * sl_multiplier)
+
+                print(f"[ATR-based TP/SL] ATR: ${atr:.2f}, TP: {tp_multiplier}x ATR, SL: {sl_multiplier}x ATR")
+
+            # Validate bounds
+            if direction == "LONG":
+                tp_distance_pct = (tp_price - entry_price) / entry_price * 100
+                sl_distance_pct = (entry_price - sl_price) / entry_price * 100
+
+                # Ensure TP is above entry and SL is below
+                if tp_price <= entry_price:
+                    tp_price = entry_price * 1.02  # Min 2% TP
+                if sl_price >= entry_price:
+                    sl_price = entry_price * 0.98  # Min 2% SL
+            else:  # SHORT
+                tp_distance_pct = (entry_price - tp_price) / entry_price * 100
+                sl_distance_pct = (sl_price - entry_price) / entry_price * 100
+
+                # Ensure TP is below entry and SL is above
+                if tp_price >= entry_price:
+                    tp_price = entry_price * 0.98  # Min 2% TP
+                if sl_price <= entry_price:
+                    sl_price = entry_price * 1.02  # Min 2% SL
+
+            # Ensure minimum risk:reward ratio
+            rr_ratio = tp_distance_pct / sl_distance_pct if sl_distance_pct > 0 else 0
+            if rr_ratio < self.config.MIN_RISK_REWARD_RATIO:
+                # Adjust TP to meet minimum RR
+                tp_distance_pct = sl_distance_pct * self.config.MIN_RISK_REWARD_RATIO
+                if direction == "LONG":
+                    tp_price = entry_price * (1 + tp_distance_pct / 100)
+                else:
+                    tp_price = entry_price * (1 - tp_distance_pct / 100)
+
+                print(f"[TP/SL Adjustment] Adjusted TP to meet min R:R {self.config.MIN_RISK_REWARD_RATIO}")
+
+            return (tp_price, sl_price)
+
+        except Exception as e:
+            print(f"[ERROR] Failed to recalculate TP/SL: {e}")
+            # Fallback to AI's values
+            return (ai_tp_price, ai_sl_price)
 
     def _execute_on_exchange(self, symbol: str, direction: str, size_pct: float,
                             entry_price: float, tp_price: float, sl_price: float):
@@ -678,3 +800,47 @@ Now proceed with your analysis and decisions.
             f"Positions Closed: {self.stats['positions_closed']}\n"
             f"Total API Cost: ${self.stats['total_api_cost_usd']:.2f}"
         )
+
+    def _update_activity(self):
+        """Update watchdog activity timestamp"""
+        with self._activity_lock:
+            self._last_activity = time.time()
+
+    def _watchdog_monitor(self):
+        """
+        Watchdog thread - monitors for bot hanging
+
+        Если бот не проявляет активности 600 секунд (10 минут),
+        выводит предупреждение для отладки
+        """
+        TIMEOUT_SECONDS = 600  # 10 минут
+        CHECK_INTERVAL = 30    # Проверка каждые 30 сек
+
+        logger.info("[Watchdog] Monitoring started")
+
+        while self._watchdog_enabled:
+            try:
+                time.sleep(CHECK_INTERVAL)
+
+                with self._activity_lock:
+                    idle_time = time.time() - self._last_activity
+
+                if idle_time > TIMEOUT_SECONDS:
+                    logger.warning(f"[WATCHDOG] No activity for {idle_time:.0f}s - possible hang!")
+                    print(f"[WATCHDOG WARNING] No activity for {idle_time:.0f} seconds!")
+
+                    # Reset activity to avoid spam
+                    self._update_activity()
+
+                    # Send Telegram alert if available
+                    if self.telegram:
+                        self.telegram.send_message(
+                            f"⚠️ Watchdog Alert\n\n"
+                            f"No bot activity for {idle_time:.0f}s\n"
+                            f"Possible hang detected"
+                        )
+
+            except Exception as e:
+                logger.error(f"[Watchdog] Error: {e}")
+
+        logger.info("[Watchdog] Monitoring stopped")

@@ -6,6 +6,7 @@ AI Trading Module - Main Entry Point
 """
 import sys
 import os
+import io
 import argparse
 import logging
 from datetime import datetime
@@ -274,6 +275,10 @@ def main():
         for i in range(5, 0, -1):
             print(f"{i}...")
             time.sleep(1)
+
+    # Redirect stdin to prevent hanging (after user confirmation is done)
+    sys.stdin = io.StringIO('')
+    print("[Watchdog] stdin redirected to prevent hanging\n")
 
     # Run trader
     try:
