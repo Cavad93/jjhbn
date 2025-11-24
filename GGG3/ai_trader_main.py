@@ -9,6 +9,20 @@ import os
 import argparse
 import logging
 from datetime import datetime
+from pathlib import Path
+
+# Загрузка переменных окружения из .env файла (если существует)
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).parent / '.env'
+    if env_path.exists():
+        load_dotenv(env_path)
+        print(f"[Setup] Loaded environment variables from {env_path}")
+    else:
+        print(f"[Warning] .env file not found at {env_path}")
+except ImportError:
+    print("[Warning] python-dotenv not installed - using system environment variables only")
+    pass
 
 # Add GGG3 to path
 sys.path.insert(0, os.path.dirname(__file__))
@@ -110,11 +124,20 @@ def check_environment():
         print("\n[ERROR] Missing required environment variables:")
         for error in errors:
             print(f"  • {error}")
-        print("\nPlease set required environment variables:")
-        print("  export ANTHROPIC_API_KEY='your_key_here'")
-        print("\nOptional:")
-        print("  export TELEGRAM_BOT_TOKEN='your_token_here'")
-        print("  export TELEGRAM_CHAT_ID='your_chat_id_here'")
+        print("\n" + "="*80)
+        print("РЕШЕНИЕ:")
+        print("="*80)
+        print("\nОпция 1: Добавьте переменные в файл .env (в директории GGG3)")
+        print("  Создайте или отредактируйте файл GGG3/.env:")
+        print("  ANTHROPIC_API_KEY=sk-ant-your_key_here")
+        print("  TELEGRAM_BOT_TOKEN=your_token_here")
+        print("  TELEGRAM_CHAT_ID=your_chat_id_here")
+        print("\nОпция 2: Экспортируйте переменные окружения")
+        print("  Windows (PowerShell):")
+        print("    $env:ANTHROPIC_API_KEY='your_key_here'")
+        print("  Linux/Mac:")
+        print("    export ANTHROPIC_API_KEY='your_key_here'")
+        print("\n" + "="*80)
         sys.exit(1)
 
 

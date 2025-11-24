@@ -1,0 +1,10 @@
+# AI Trading Module Requirements
+
+# Core dependencies
+anthropic>=0.40.0        # Claude Sonnet 4.5 API
+python-dotenv>=1.0.0     # Load .env файла
+
+# Уже установлены в основном боте (из GGG3/requirements.txt):
+# numpy
+# pandas
+# requests

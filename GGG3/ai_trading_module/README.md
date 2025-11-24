@@ -35,10 +35,13 @@
 ### 1. Установка зависимостей
 
 ```bash
-cd /home/user/jjhbn/GGG3
+cd GGG3
 
-# Убедитесь что установлен anthropic SDK
-pip install anthropic
+# Установите зависимости для AI модуля
+pip install -r ai_trading_module/requirements.txt
+
+# Или вручную:
+pip install anthropic python-dotenv
 ```
 
 ### 2. Настройка переменных окружения

@@ -22,17 +22,18 @@
 ## 🚀 Быстрый старт
 
 ```bash
-# 1. Установите API ключ Anthropic
-export ANTHROPIC_API_KEY="your_key_here"
+# 1. Установите зависимости
+pip install anthropic python-dotenv
 
-# 2. Запустите в paper trading режиме
+# 2. Настройте .env файл в директории GGG3
+#    Добавьте: ANTHROPIC_API_KEY=your_key_here
+
+# 3. Запустите в paper trading режиме
 cd GGG3
-python3 ai_trader_main.py --paper --capital 1000
-
-# 3. Мониторьте через Telegram (опционально)
-export TELEGRAM_BOT_TOKEN="your_token"
-export TELEGRAM_CHAT_ID="your_chat_id"
+python ai_trader_main.py --paper --capital 1000
 ```
+
+📖 **Подробная инструкция:** [ai_trading_module/INSTALL.md](ai_trading_module/INSTALL.md)
 
 ---
 
