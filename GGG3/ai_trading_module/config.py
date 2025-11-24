@@ -96,7 +96,8 @@ class AITradingConfig:
     COST_PER_ANALYSIS = 1.0        # ~$1 за анализ исторических данных
 
     # ===== DATA STORAGE =====
-    DATA_DIR = "/home/user/jjhbn/GGG3/ai_trading_module/data"
+    # Use relative path to work on both Windows and Linux
+    DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
     DECISIONS_FILE = os.path.join(DATA_DIR, "decisions.json")
     POSITIONS_FILE = os.path.join(DATA_DIR, "ai_positions.json")
     STATE_FILE = os.path.join(DATA_DIR, "ai_state.json")

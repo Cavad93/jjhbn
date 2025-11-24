@@ -129,6 +129,11 @@ class AITrader:
                     self._daily_decision_cycle()
                     self.last_decision_time = current_time
                     self._update_activity()  # Watchdog: after decisions
+                else:
+                    # Show that bot is alive but waiting
+                    if self.last_decision_time:
+                        time_until_next = self._time_until_next_decision(current_time)
+                        print(f"[{current_time.strftime('%H:%M:%S')}] Waiting for next decision cycle (in {time_until_next})")
 
                 # Check positions periodically
                 if self._should_check_positions(current_time):
@@ -163,6 +168,22 @@ class AITrader:
             return time_since_last.total_seconds() >= (self.config.DECISION_INTERVAL_HOURS * 3600)
 
         return False
+
+    def _time_until_next_decision(self, current_time: datetime) -> str:
+        """Calculate time until next decision cycle"""
+        if self.last_decision_time is None:
+            return "now"
+
+        next_decision_time = self.last_decision_time + timedelta(hours=self.config.DECISION_INTERVAL_HOURS)
+        time_diff = next_decision_time - current_time
+
+        if time_diff.total_seconds() <= 0:
+            return "now"
+
+        hours = int(time_diff.total_seconds() // 3600)
+        minutes = int((time_diff.total_seconds() % 3600) // 60)
+
+        return f"{hours}h {minutes}m"
 
     def _should_check_positions(self, current_time: datetime) -> bool:
         """Check if it's time to check positions"""
@@ -721,22 +742,21 @@ Now proceed with your analysis and decisions.
 
     def _check_emergency_conditions(self, portfolio: Dict) -> bool:
         """Check for emergency stop conditions"""
+        emergency_triggered = False
+        emergency_reasons = []
+
         # Check drawdown
         total_return_pct = portfolio['total_return_pct']
         if total_return_pct < -self.config.EMERGENCY_STOP_DRAWDOWN_PCT:
+            emergency_triggered = True
+            emergency_reasons.append(f"Drawdown: {total_return_pct:.2f}%")
             print(f"[EMERGENCY] Drawdown limit reached: {total_return_pct:.2f}%")
-            if self.telegram:
-                self.telegram.send_message(
-                    f"🚨 EMERGENCY STOP\n\n"
-                    f"Drawdown: {total_return_pct:.2f}%\n"
-                    f"Trading paused"
-                )
-            return True
 
         # Check minimum capital
         if portfolio['total_equity'] < self.config.MIN_CAPITAL_TO_CONTINUE:
+            emergency_triggered = True
+            emergency_reasons.append(f"Capital below minimum: ${portfolio['total_equity']:.2f}")
             print(f"[EMERGENCY] Capital below minimum: ${portfolio['total_equity']:.2f}")
-            return True
 
         # Check consecutive losses
         recent_decisions = self.decision_manager.get_historical_decisions(
@@ -746,10 +766,33 @@ Now proceed with your analysis and decisions.
         )
 
         if len(recent_decisions) >= self.config.MAX_CONSECUTIVE_LOSSES:
-            print(f"[EMERGENCY] {self.config.MAX_CONSECUTIVE_LOSSES} consecutive losses")
-            return True
+            emergency_triggered = True
+            emergency_reasons.append(f"{len(recent_decisions)} consecutive losses in last 7 days")
+            print(f"[EMERGENCY] {len(recent_decisions)} consecutive losses detected")
+            print(f"[EMERGENCY] To reset: Delete ai_trading_module/data/decisions.json or wait 7 days")
 
-        return False
+        # Send comprehensive emergency alert
+        if emergency_triggered:
+            msg = (
+                f"🚨 EMERGENCY STOP ACTIVATED\n\n"
+                f"New positions paused due to:\n"
+                + "\n".join([f"• {reason}" for reason in emergency_reasons]) +
+                f"\n\n📊 Current Status:\n"
+                f"• Equity: ${portfolio['total_equity']:.2f}\n"
+                f"• Return: {total_return_pct:.2f}%\n"
+                f"• Open Positions: {portfolio['num_open_positions']}\n\n"
+                f"Bot will continue monitoring existing positions.\n"
+                f"To reset: Delete decisions.json or adjust config."
+            )
+
+            if self.telegram:
+                self.telegram.send_message(msg)
+
+            print("\n" + "="*80)
+            print(msg)
+            print("="*80 + "\n")
+
+        return emergency_triggered
 
     def _send_daily_report(self, ai_response: str):
         """Send daily decision report to Telegram"""
