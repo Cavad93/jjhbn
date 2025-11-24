@@ -380,15 +380,44 @@ Now proceed with your analysis and decisions.
         for iteration in range(max_iterations):
             print(f"[AI] Iteration {iteration + 1}/{max_iterations}")
 
-            # Call Claude API
-            response = self.client.messages.create(
-                model=self.config.AI_MODEL,
-                max_tokens=self.config.AI_MAX_TOKENS,
-                temperature=self.config.AI_TEMPERATURE,
-                system=system_prompt,
-                tools=TOOLS,
-                messages=messages
-            )
+            # Call Claude API with retry on rate limit
+            max_retries = 3
+            retry_count = 0
+
+            while retry_count <= max_retries:
+                try:
+                    response = self.client.messages.create(
+                        model=self.config.AI_MODEL,
+                        max_tokens=self.config.AI_MAX_TOKENS,
+                        temperature=self.config.AI_TEMPERATURE,
+                        system=system_prompt,
+                        tools=TOOLS,
+                        messages=messages
+                    )
+                    break  # Success - exit retry loop
+
+                except anthropic.RateLimitError as e:
+                    retry_count += 1
+                    if retry_count > max_retries:
+                        print(f"[ERROR] Rate limit exceeded after {max_retries} retries")
+                        raise
+
+                    wait_time = 60  # Wait 60 seconds
+                    print(f"\n[RATE LIMIT] Hit rate limit (429). Waiting {wait_time} seconds... (Retry {retry_count}/{max_retries})")
+
+                    if self.telegram:
+                        self.telegram.send_message(
+                            f"⏳ Rate Limit Hit\n\n"
+                            f"Waiting {wait_time}s before retry {retry_count}/{max_retries}"
+                        )
+
+                    # Wait and update watchdog activity
+                    for i in range(wait_time):
+                        time.sleep(1)
+                        if i % 10 == 0:  # Update activity every 10 seconds
+                            self._update_activity()
+
+                    print(f"[RATE LIMIT] Resuming after {wait_time}s wait...")
 
             self.stats['total_api_calls'] += 1
 
