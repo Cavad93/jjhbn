@@ -74,6 +74,7 @@ class AITrader:
         # State
         self.last_decision_time = None
         self.last_position_check_time = None
+        self.last_hourly_report_time = None  # For hourly portfolio reports
         self.conversation_history = []
         self.daily_api_cost = 0.0
 
@@ -111,11 +112,14 @@ class AITrader:
         print(f"{'='*80}\n")
 
         if self.telegram:
+            mode_text = "Бумажная торговля" if self.config.PAPER_TRADING else "Реальная торговля"
             self.telegram.send_message(
-                f"🤖 AI Trading Module Started\n\n"
-                f"Capital: ${self.config.INITIAL_CAPITAL}\n"
-                f"Mode: {'Paper Trading' if self.config.PAPER_TRADING else 'Live Trading'}\n"
-                f"Model: {self.config.AI_MODEL}"
+                f"🤖 *AI Трейдинг Модуль Запущен*\n\n"
+                f"💰 Капитал: ${self.config.INITIAL_CAPITAL}\n"
+                f"📊 Режим: {mode_text}\n"
+                f"🧠 Модель: {self.config.AI_MODEL}\n"
+                f"⏰ Решения: каждый день в {self.config.DECISION_TIME_UTC}:00 UTC\n"
+                f"🔍 Проверка позиций: каждую минуту"
             )
 
         try:
@@ -141,6 +145,11 @@ class AITrader:
                     self._check_and_close_positions()
                     self.last_position_check_time = current_time
                     self._update_activity()  # Watchdog: after position check
+
+                # Send hourly portfolio report (without using AI tokens)
+                if self._should_send_hourly_report(current_time):
+                    self._send_hourly_portfolio_report()
+                    self.last_hourly_report_time = current_time
 
                 # Sleep for a minute
                 time.sleep(60)
@@ -195,6 +204,17 @@ class AITrader:
 
         time_since_last = current_time - self.last_position_check_time
         return time_since_last.total_seconds() >= (self.config.CHECK_POSITIONS_INTERVAL_MINUTES * 60)
+
+    def _should_send_hourly_report(self, current_time: datetime) -> bool:
+        """Check if it's time to send hourly portfolio report"""
+        if not self.telegram:
+            return False
+
+        if self.last_hourly_report_time is None:
+            return True
+
+        time_since_last = current_time - self.last_hourly_report_time
+        return time_since_last.total_seconds() >= 3600  # Every hour (3600 seconds)
 
     def _daily_decision_cycle(self):
         """
@@ -407,8 +427,8 @@ Now proceed with your analysis and decisions.
 
                     if self.telegram:
                         self.telegram.send_message(
-                            f"⏳ Rate Limit Hit\n\n"
-                            f"Waiting {wait_time}s before retry {retry_count}/{max_retries}"
+                            f"⏳ Достигнут Лимит API\n\n"
+                            f"Ожидание {wait_time}с перед повтором {retry_count}/{max_retries}"
                         )
 
                     # Wait and update watchdog activity
@@ -747,14 +767,15 @@ Now proceed with your analysis and decisions.
 
             # Send Telegram notification
             if self.telegram and self.config.TELEGRAM_SEND_POSITION_ALERTS:
+                exit_reason_ru = "Тейк-Профит" if exit_reason == "TP" else "Стоп-Лосс" if exit_reason == "SL" else exit_reason
+                direction_emoji = "🟢" if decision.direction == "LONG" else "🔴"
                 self.telegram.send_message(
-                    f"{result_emoji} Position Closed ({exit_reason})\n\n"
-                    f"Symbol: {symbol}\n"
-                    f"Direction: {decision.direction}\n"
-                    f"Entry: ${decision.entry_price:.2f}\n"
-                    f"Exit: ${exit_price:.2f}\n"
-                    f"PnL: ${decision.pnl_usdt:.2f} ({decision.pnl_pct:.2f}%)\n"
-                    f"Duration: {(decision.exit_time - decision.timestamp).total_seconds() / 3600:.1f}h"
+                    f"{result_emoji} *Позиция Закрыта* ({exit_reason_ru})\n\n"
+                    f"{direction_emoji} *{symbol}* {decision.direction}\n"
+                    f"📥 Вход: ${decision.entry_price:.2f}\n"
+                    f"📤 Выход: ${exit_price:.2f}\n"
+                    f"💰 PnL: ${decision.pnl_usdt:+.2f} ({decision.pnl_pct:+.2f}%)\n"
+                    f"⏱ Длительность: {(decision.exit_time - decision.timestamp).total_seconds() / 3600:.1f}ч"
                 )
 
             # Save exchange state after closing position (for paper trading)
@@ -804,15 +825,15 @@ Now proceed with your analysis and decisions.
         # Send comprehensive emergency alert
         if emergency_triggered:
             msg = (
-                f"🚨 EMERGENCY STOP ACTIVATED\n\n"
-                f"New positions paused due to:\n"
+                f"🚨 *АВАРИЙНАЯ ОСТАНОВКА АКТИВИРОВАНА*\n\n"
+                f"⛔ Новые позиции приостановлены из-за:\n"
                 + "\n".join([f"• {reason}" for reason in emergency_reasons]) +
-                f"\n\n📊 Current Status:\n"
-                f"• Equity: ${portfolio['total_equity']:.2f}\n"
-                f"• Return: {total_return_pct:.2f}%\n"
-                f"• Open Positions: {portfolio['num_open_positions']}\n\n"
-                f"Bot will continue monitoring existing positions.\n"
-                f"To reset: Delete decisions.json or adjust config."
+                f"\n\n📊 *Текущий Статус:*\n"
+                f"• Капитал: ${portfolio['total_equity']:.2f}\n"
+                f"• Доходность: {total_return_pct:+.2f}%\n"
+                f"• Открытых позиций: {portfolio['num_open_positions']}\n\n"
+                f"🤖 Бот продолжит мониторинг существующих позиций.\n"
+                f"🔄 Для сброса: Удалите decisions.json или измените config."
             )
 
             if self.telegram:
@@ -832,29 +853,68 @@ Now proceed with your analysis and decisions.
         portfolio = self.decision_manager.get_portfolio_status()
         open_positions = self.decision_manager.get_open_positions()
 
-        report = f"""🤖 **AI Trading Daily Report**
+        report = f"""🤖 *Ежедневный Отчет AI Трейдера*
 
-**Portfolio Status**
-• Total Equity: ${portfolio['total_equity']:.2f}
-• Return: {portfolio['total_return_pct']:.2f}%
-• Open Positions: {portfolio['num_open_positions']}/{self.config.MAX_POSITIONS}
-• Exposure: {portfolio['exposure_pct']:.1f}%
+📊 *Состояние Портфеля*
+💰 Капитал: ${portfolio['total_equity']:.2f}
+📈 Доходность: {portfolio['total_return_pct']:+.2f}%
+📍 Открытых позиций: {portfolio['num_open_positions']}/{self.config.MAX_POSITIONS}
+⚡ Экспозиция: {portfolio['exposure_pct']:.1f}%
 
-**Decisions Made:** {self.stats['decisions_made']}
-**API Cost Today:** ${self.daily_api_cost:.2f}
+🎯 Решений принято: {self.stats['decisions_made']}
+💸 Стоимость API сегодня: ${self.daily_api_cost:.2f}
 
-**Open Positions:**
+📋 *Открытые Позиции:*
 """
 
         for pos in open_positions['positions'][:5]:  # Top 5
             pnl_emoji = "📈" if pos['unrealized_pnl_usdt'] > 0 else "📉"
+            direction_text = "LONG 🟢" if pos['direction'] == "LONG" else "SHORT 🔴"
             report += (
-                f"\n{pnl_emoji} {pos['symbol']} {pos['direction']}\n"
-                f"   PnL: ${pos['unrealized_pnl_usdt']:.2f} ({pos['unrealized_pnl_pct']:.2f}%)"
+                f"\n{pnl_emoji} *{pos['symbol']}* {direction_text}\n"
+                f"   Вход: ${pos['entry_price']:.4f}\n"
+                f"   Текущая: ${pos['current_price']:.4f}\n"
+                f"   PnL: ${pos['unrealized_pnl_usdt']:.2f} ({pos['unrealized_pnl_pct']:+.2f}%)\n"
+                f"   До TP: {pos['distance_to_tp_pct']:.1f}% | До SL: {pos['distance_to_sl_pct']:.1f}%"
             )
 
         # Add AI summary (first 500 chars)
-        report += f"\n\n**AI Summary:**\n{ai_response[:500]}..."
+        if ai_response and len(ai_response) > 0:
+            report += f"\n\n🧠 *Резюме AI:*\n{ai_response[:500]}..."
+
+        self.telegram.send_message(report)
+
+    def _send_hourly_portfolio_report(self):
+        """Send hourly portfolio status report to Telegram (без расхода токенов)"""
+        if not self.telegram:
+            return
+
+        portfolio = self.decision_manager.get_portfolio_status()
+        open_positions = self.decision_manager.get_open_positions()
+
+        # Calculate total unrealized PnL
+        total_unrealized_pnl = sum(pos['unrealized_pnl_usdt'] for pos in open_positions['positions'])
+
+        report = f"""⏰ *Ежечасный Отчет о Капитале*
+
+💰 *Общий капитал:* ${portfolio['total_equity']:.2f}
+📊 *Доходность:* {portfolio['total_return_pct']:+.2f}%
+💵 *Свободно:* ${portfolio['available_capital']:.2f}
+⚡ *Экспозиция:* {portfolio['exposure_pct']:.1f}%
+
+📍 *Позиции:* {portfolio['num_open_positions']}/{self.config.MAX_POSITIONS} открыто
+💹 *Нереализованный PnL:* ${total_unrealized_pnl:+.2f}
+"""
+
+        if open_positions['count'] > 0:
+            report += "\n📋 *Активные позиции:*\n"
+            for pos in open_positions['positions']:
+                pnl_emoji = "📈" if pos['unrealized_pnl_usdt'] > 0 else "📉"
+                direction_emoji = "🟢" if pos['direction'] == "LONG" else "🔴"
+                report += (
+                    f"\n{direction_emoji} *{pos['symbol']}* "
+                    f"{pnl_emoji} ${pos['unrealized_pnl_usdt']:+.2f} ({pos['unrealized_pnl_pct']:+.1f}%)"
+                )
 
         self.telegram.send_message(report)
 
@@ -866,12 +926,12 @@ Now proceed with your analysis and decisions.
         portfolio = self.decision_manager.get_portfolio_status()
 
         self.telegram.send_message(
-            f"🛑 AI Trader Stopped\n\n"
-            f"Final Equity: ${portfolio['total_equity']:.2f}\n"
-            f"Total Return: {portfolio['total_return_pct']:.2f}%\n"
-            f"Positions Opened: {self.stats['positions_opened']}\n"
-            f"Positions Closed: {self.stats['positions_closed']}\n"
-            f"Total API Cost: ${self.stats['total_api_cost_usd']:.2f}"
+            f"🛑 *AI Трейдер Остановлен*\n\n"
+            f"💰 Финальный капитал: ${portfolio['total_equity']:.2f}\n"
+            f"📊 Общая доходность: {portfolio['total_return_pct']:+.2f}%\n"
+            f"📍 Позиций открыто: {self.stats['positions_opened']}\n"
+            f"📍 Позиций закрыто: {self.stats['positions_closed']}\n"
+            f"💸 Общая стоимость API: ${self.stats['total_api_cost_usd']:.2f}"
         )
 
     def _update_activity(self):
@@ -908,9 +968,9 @@ Now proceed with your analysis and decisions.
                     # Send Telegram alert if available
                     if self.telegram:
                         self.telegram.send_message(
-                            f"⚠️ Watchdog Alert\n\n"
-                            f"No bot activity for {idle_time:.0f}s\n"
-                            f"Possible hang detected"
+                            f"⚠️ *Предупреждение Watchdog*\n\n"
+                            f"Нет активности бота {idle_time:.0f}с\n"
+                            f"Возможно зависание"
                         )
 
             except Exception as e:

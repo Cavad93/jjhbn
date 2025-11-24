@@ -36,7 +36,7 @@ class AITradingConfig:
     DECISION_TIME_UTC = 10        # В 10:00 UTC
 
     # Проверка закрытия позиций
-    CHECK_POSITIONS_INTERVAL_MINUTES = 60  # Каждый час
+    CHECK_POSITIONS_INTERVAL_MINUTES = 1  # Каждую минуту (без расхода токенов)
 
     # ===== COIN SELECTION =====
     TOP_COINS_TO_ANALYZE = 20  # AI выбирает топ-20 для детального анализа
