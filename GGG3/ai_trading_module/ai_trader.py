@@ -363,14 +363,14 @@ Now proceed with your analysis and decisions.
         return prompt
 
     def _call_ai_with_tools(self, user_message: str, system_prompt: str,
-                           max_iterations: int = 10) -> str:
+                           max_iterations: int = 15) -> str:
         """
         Call AI with tool support (agentic loop)
 
         Args:
             user_message: User prompt
             system_prompt: System prompt
-            max_iterations: Max tool use iterations
+            max_iterations: Max tool use iterations (increased to 15 for analyzing 20 coins)
 
         Returns:
             Final AI response text
@@ -553,7 +553,8 @@ Now proceed with your analysis and decisions.
         try:
             # Try to get ATR from market data
             indicators = market_data.get('indicators', {})
-            atr = indicators.get('atr', {}).get('current', None)
+            # ATR is stored as 'value' in indicators, not 'current'
+            atr = indicators.get('atr', {}).get('value', None)
 
             if atr is None or atr <= 0:
                 # Fallback: calculate ATR from AI's intended distances
