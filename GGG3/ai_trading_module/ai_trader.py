@@ -244,7 +244,7 @@ class AITrader:
             context = self._build_decision_context()
 
             # Ask AI to make decisions
-            print("[AI] Analyzing market and making decisions...")
+            print("[AI] Analyzing market and making decisions...", flush=True)
             start_time = time.time()
 
             response = self._call_ai_with_tools(
@@ -398,7 +398,7 @@ Now proceed with your analysis and decisions.
         messages = [{"role": "user", "content": user_message}]
 
         for iteration in range(max_iterations):
-            print(f"[AI] Iteration {iteration + 1}/{max_iterations}")
+            print(f"[AI] Iteration {iteration + 1}/{max_iterations}", flush=True)
 
             # Call Claude API with retry on rate limit
             max_retries = 3
@@ -419,11 +419,11 @@ Now proceed with your analysis and decisions.
                 except anthropic.RateLimitError as e:
                     retry_count += 1
                     if retry_count > max_retries:
-                        print(f"[ERROR] Rate limit exceeded after {max_retries} retries")
+                        print(f"[ERROR] Rate limit exceeded after {max_retries} retries", flush=True)
                         raise
 
                     wait_time = 60  # Wait 60 seconds
-                    print(f"\n[RATE LIMIT] Hit rate limit (429). Waiting {wait_time} seconds... (Retry {retry_count}/{max_retries})")
+                    print(f"\n[RATE LIMIT] Hit rate limit (429). Waiting {wait_time} seconds... (Retry {retry_count}/{max_retries})", flush=True)
 
                     if self.telegram:
                         self.telegram.send_message(
@@ -431,13 +431,17 @@ Now proceed with your analysis and decisions.
                             f"Ожидание {wait_time}с перед повтором {retry_count}/{max_retries}"
                         )
 
-                    # Wait and update watchdog activity
+                    # Wait and update watchdog activity with progress indicator
+                    print("[PROGRESS] ", end='', flush=True)
                     for i in range(wait_time):
                         time.sleep(1)
-                        if i % 10 == 0:  # Update activity every 10 seconds
-                            self._update_activity()
+                        self._update_activity()
+                        # Show progress dot every 5 seconds
+                        if i % 5 == 0:
+                            print(".", end='', flush=True)
+                    print(" Done!", flush=True)
 
-                    print(f"[RATE LIMIT] Resuming after {wait_time}s wait...")
+                    print(f"[RATE LIMIT] Resuming after {wait_time}s wait...", flush=True)
 
             self.stats['total_api_calls'] += 1
 
@@ -459,7 +463,7 @@ Now proceed with your analysis and decisions.
                 tool_results = []
                 for block in response.content:
                     if block.type == "tool_use":
-                        print(f"  [Tool] {block.name}({json.dumps(block.input, indent=2)[:100]}...)")
+                        print(f"  [Tool] {block.name}({json.dumps(block.input, indent=2)[:100]}...)", flush=True)
 
                         # Execute tool
                         result = self.tools_executor.execute_tool(block.name, block.input)
@@ -483,7 +487,7 @@ Now proceed with your analysis and decisions.
                 break
 
         # Max iterations reached
-        print(f"[WARNING] Max iterations ({max_iterations}) reached")
+        print(f"[WARNING] Max iterations ({max_iterations}) reached", flush=True)
         return "Decision process incomplete - max iterations reached"
 
     def _execute_position_opening(self, position_params: Dict, validation_result: Dict):
@@ -960,7 +964,7 @@ Now proceed with your analysis and decisions.
 
                 if idle_time > TIMEOUT_SECONDS:
                     logger.warning(f"[WATCHDOG] No activity for {idle_time:.0f}s - possible hang!")
-                    print(f"[WATCHDOG WARNING] No activity for {idle_time:.0f} seconds!")
+                    print(f"[WATCHDOG WARNING] No activity for {idle_time:.0f} seconds!", flush=True)
 
                     # Reset activity to avoid spam
                     self._update_activity()
