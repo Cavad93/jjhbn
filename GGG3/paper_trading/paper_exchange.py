@@ -1071,6 +1071,59 @@ class PaperExchange:
         empty_df['timestamp'] = empty_df.index
         return empty_df
 
+    def get_klines(self, symbol: str, timeframe: str, limit: int = 200) -> List[List]:
+        """
+        Получает klines (свечи) в формате Binance API
+
+        Wrapper вокруг get_ohlcv() для совместимости с AI Trading Module
+
+        Args:
+            symbol: Торговая пара (например 'BTCUSDT')
+            timeframe: Таймфрейм ('1m', '5m', '15m', '30m', '1h', '4h', '1d')
+            limit: Количество свечей
+
+        Returns:
+            List[List]: Список свечей в формате Binance:
+                [timestamp_ms, open, high, low, close, volume, ...]
+        """
+        try:
+            # Получаем данные через get_ohlcv
+            df = self.get_ohlcv(symbol, timeframe, limit)
+
+            if df.empty:
+                return []
+
+            # Конвертируем DataFrame в формат Binance API (list of lists)
+            klines = []
+            for idx, row in df.iterrows():
+                # Binance klines format:
+                # [timestamp_ms, open, high, low, close, volume, close_time, quote_volume, ...]
+                timestamp_ms = int(idx.timestamp() * 1000)  # Convert datetime to milliseconds
+
+                kline = [
+                    timestamp_ms,        # [0] Open time (ms)
+                    str(row['open']),    # [1] Open price
+                    str(row['high']),    # [2] High price
+                    str(row['low']),     # [3] Low price
+                    str(row['close']),   # [4] Close price
+                    str(row['volume']),  # [5] Volume
+                    timestamp_ms,        # [6] Close time (approximation)
+                    "0",                 # [7] Quote asset volume (не используется)
+                    0,                   # [8] Number of trades (не используется)
+                    "0",                 # [9] Taker buy base asset volume
+                    "0",                 # [10] Taker buy quote asset volume
+                    "0"                  # [11] Ignore
+                ]
+                klines.append(kline)
+
+            return klines
+
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error getting klines for {symbol} {timeframe}: {e}")
+            return []
+
     def get_ohlcv_batch(
         self,
         requests: List[tuple],
