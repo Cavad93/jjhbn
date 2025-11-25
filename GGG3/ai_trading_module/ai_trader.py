@@ -383,14 +383,14 @@ Now proceed with your analysis and decisions.
         return prompt
 
     def _call_ai_with_tools(self, user_message: str, system_prompt: str,
-                           max_iterations: int = 15) -> str:
+                           max_iterations: int = 25) -> str:
         """
         Call AI with tool support (agentic loop)
 
         Args:
             user_message: User prompt
             system_prompt: System prompt
-            max_iterations: Max tool use iterations (increased to 15 for analyzing 20 coins)
+            max_iterations: Max tool use iterations (increased to 25 to allow opening 5+ positions)
 
         Returns:
             Final AI response text

@@ -39,7 +39,7 @@ class AITradingConfig:
     CHECK_POSITIONS_INTERVAL_MINUTES = 1  # Каждую минуту (без расхода токенов)
 
     # ===== COIN SELECTION =====
-    TOP_COINS_TO_ANALYZE = 20  # AI выбирает топ-20 для детального анализа
+    TOP_COINS_TO_ANALYZE = 15  # AI выбирает топ-15 для детального анализа (reduced from 20 to save iterations)
 
     # Фильтры для первичного скрининга
     MIN_24H_VOLUME_USD = 10_000_000  # $10M минимум
@@ -178,6 +178,7 @@ DECISION PROCESS:
    - Filter by volume (>${cls.MIN_24H_VOLUME_USD/1e6}M USD), volatility ({cls.MIN_VOLATILITY_PCT}-{cls.MAX_VOLATILITY_PCT}%)
    - Exclude blacklist and stablecoins
    - Select EXACTLY top-{cls.TOP_COINS_TO_ANALYZE} candidates (DO NOT EXCEED THIS LIMIT)
+   - **CRITICAL**: Analyze ONLY {cls.TOP_COINS_TO_ANALYZE} coins, not more - exceeding wastes iterations
 
 2. DEEP ANALYSIS (for each top-{cls.TOP_COINS_TO_ANALYZE}):
    - Technical analysis: Use indicators across {', '.join(cls.TIMEFRAMES)} timeframes
@@ -188,6 +189,8 @@ DECISION PROCESS:
    - Determine: LONG/SHORT/SKIP
    - Set position size ({cls.MIN_POSITION_SIZE_PCT}-{cls.MAX_POSITION_SIZE_PCT}%)
    - Define TP/SL levels (validate risk:reward >= {cls.MIN_RISK_REWARD_RATIO}:1)
+   - **CRITICAL**: Once TP/SL are validated, IMMEDIATELY open_position - do NOT re-validate
+   - **EFFICIENCY**: Open multiple positions in sequence - validate once, open once per position
    - Provide detailed reasoning
 
 4. PORTFOLIO MANAGEMENT:
